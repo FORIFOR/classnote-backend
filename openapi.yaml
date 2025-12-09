@@ -1,0 +1,595 @@
+openapi: 3.0.3
+info:
+  title: GLASSNOTE-X Backend API
+  version: "0.1.0"
+  description: |
+    Backend API for GLASSNOTE-X (CLASSNOTE-X).
+    - iOS クライアント (`ClassnoteX`) から利用されることを想定
+    - Firebase ID トークンによる Bearer 認証
+    - セッション作成 → 音声アップロード用署名付きURL発行 → バッチ文字起こし → 要約生成 → 小テスト生成 → QA
+
+    Realtime streaming (WebSocket) は HTTP ではないため、OpenAPI の HTTP Paths からは外し、
+    下記のようにカスタム記述とする:
+
+    - WebSocket URL: `wss://{host}/ws/stream/{sessionId}?token=<idToken>`
+    - Client → Server:
+      - `{"event":"start","config":{ "languageCode":"ja-JP","sampleRateHertz":16000,"enableSpeakerDiarization":true,"speakerCount":2,"model":"latest_long" }}`
+      - バイナリ: 16kHz, 16-bit, mono PCM チャンク
+      - `{"event":"stop"}`
+    - Server → Client:
+      - `{"event":"partial" | "final","transcript":"...","words":[{"start":1.23,"end":2.34,"speakerTag":1}]}`
+
+servers:
+  - url: https://classnote-api.example.com
+    description: Production (example)
+  - url: https://classnote-api-900324644592.asia-northeast1.run.app
+    description: GCP Cloud Run (current)
+
+security:
+  - FirebaseAuth: []
+
+tags:
+  - name: sessions
+    description: Create, list and fetch lecture/meeting sessions
+  - name: transcription
+    description: Batch transcription and diarization
+  - name: summary
+    description: Summaries and quizzes
+  - name: qa
+    description: Lecture-based Q&A
+  - name: upload
+    description: Signed URL and audio upload coordination
+
+paths:
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: List sessions for a user
+      description: |
+        指定したユーザのセッション一覧（講義 / 会議）を取得する。
+        将来的にページネーションを追加する場合は `page` / `pageSize` などを拡張する。
+      parameters:
+        - name: userId
+          in: query
+          description: Firebase UID もしくはメールアドレスなど、ユーザ識別子
+          required: true
+          schema:
+            type: string
+        - name: mode
+          in: query
+          description: セッション種別でフィルタ (lecture / meeting)。省略時は両方。
+          required: false
+          schema:
+            type: string
+            enum: [lecture, meeting]
+      responses:
+        "200":
+          description: List of sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Session"
+        "401":
+          description: Unauthorized
+    post:
+      tags: [sessions]
+      summary: Create a new session
+      description: |
+        iOS クライアントから新規セッション（講義 / 会議）を作成する。
+        音声アップロードは別途 `/upload-url` → signed URL → PUT で行う。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          description: Invalid input
+        "401":
+          description: Unauthorized
+
+  /sessions/{sessionId}:
+    get:
+      tags: [sessions]
+      summary: Get session detail
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+  /upload-url:
+    post:
+      tags: [upload]
+      summary: Get a signed URL to upload audio
+      description: |
+        音声ファイルを GCS / S3 等に直接 PUT するための署名付き URL を発行する。
+        クライアントは返却された URL に対して `PUT` で音声をアップロードする。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UploadUrlRequest"
+      responses:
+        "200":
+          description: Signed upload URL issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadUrlResponse"
+        "400":
+          description: Invalid input
+        "401":
+          description: Unauthorized
+
+  /sessions/{sessionId}/start_transcribe:
+    post:
+      tags: [transcription]
+      summary: Start batch transcription for a session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartTranscribeRequest"
+      responses:
+        "200":
+          description: Transcription started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartTranscribeResponse"
+        "400":
+          description: Invalid state or input
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+  /sessions/{sessionId}/refresh_transcript:
+    post:
+      tags: [transcription]
+      summary: Get latest transcription and diarization status
+      description: |
+        バッチ文字起こしジョブのステータスを確認し、完了していれば
+        文字起こしテキスト + 話者分離結果 (speakers / segments) を返す。
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Reserved for future options (現在は空オブジェクト)
+      responses:
+        "200":
+          description: Transcript and diarization status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscriptRefreshResponse"
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+  /sessions/{sessionId}/summarize:
+    post:
+      tags: [summary]
+      summary: Generate summary for a session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Reserved for future options (現在は空オブジェクト)
+      responses:
+        "200":
+          description: Summary generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SummaryResponse"
+        "400":
+          description: Transcript not ready or invalid state
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+  /sessions/{sessionId}/quiz:
+    post:
+      tags: [summary]
+      summary: Generate quiz questions for a session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: count
+          in: query
+          required: false
+          description: Number of questions to generate (default 5)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 5
+      responses:
+        "200":
+          description: Quiz generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuizResponse"
+        "400":
+          description: Transcript not ready or invalid state
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+  /sessions/{sessionId}/qa:
+    post:
+      tags: [qa]
+      summary: Ask a question about a lecture/meeting
+      description: |
+        セッションの文字起こし内容に基づいて QA を行う。
+        回答とともに、関連する時間区間への citation を返すことができる。
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QaRequest"
+      responses:
+        "200":
+          description: Answer generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QaResponse"
+        "400":
+          description: Transcript not ready or invalid question
+        "401":
+          description: Unauthorized
+        "404":
+          description: Session not found
+
+components:
+  securitySchemes:
+    FirebaseAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Firebase ID token as Bearer token.
+        Example: Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+  schemas:
+    # ===== Core domain =====
+    Session:
+      type: object
+      description: Lecture or meeting session
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+          description: Owner user identifier (Firebase UID or email)
+        mode:
+          type: string
+          enum: [lecture, meeting]
+        title:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        audioPath:
+          type: string
+          nullable: true
+          description: Storage path (e.g., gs://bucket/... )
+        contentType:
+          type: string
+          nullable: true
+          example: audio/wav
+        durationSec:
+          type: number
+          format: float
+          nullable: true
+        summaryStatus:
+          type: string
+          nullable: true
+          enum: [pending, running, completed, failed]
+        transcriptLength:
+          type: integer
+          nullable: true
+        speakers:
+          type: array
+          description: Speaker list used for diarization (事後処理)
+          items:
+            $ref: "#/components/schemas/Speaker"
+        segments:
+          type: array
+          description: Diarized transcript segments (optional)
+          items:
+            $ref: "#/components/schemas/Segment"
+        summary:
+          $ref: "#/components/schemas/Summary"
+        quiz:
+          $ref: "#/components/schemas/QuizResponse"
+      required:
+        - id
+        - userId
+        - mode
+        - title
+        - createdAt
+
+    Speaker:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Internal speaker id (e.g., spk_0)
+        label:
+          type: string
+          description: Short label (e.g., "A", "B", "自分")
+        display_name:
+          type: string
+          description: Human-readable display name (e.g., "話者A")
+      required:
+        - id
+        - label
+
+    Segment:
+      type: object
+      description: A diarized segment of the transcript
+      properties:
+        startSec:
+          type: number
+          format: float
+        endSec:
+          type: number
+          format: float
+        speakerId:
+          type: string
+        text:
+          type: string
+      required:
+        - startSec
+        - endSec
+        - speakerId
+        - text
+
+    # ===== Requests =====
+    CreateSessionRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [lecture, meeting]
+        title:
+          type: string
+          description: Optional initial title
+        userId:
+          type: string
+          description: Firebase UID or email
+      required:
+        - mode
+        - userId
+
+    UploadUrlRequest:
+      type: object
+      properties:
+        sessionId:
+          type: string
+        mode:
+          type: string
+          enum: [lecture, meeting]
+        contentType:
+          type: string
+          example: audio/wav
+      required:
+        - sessionId
+        - mode
+        - contentType
+
+    UploadUrlResponse:
+      type: object
+      properties:
+        uploadUrl:
+          type: string
+          description: Signed URL to upload audio via PUT
+        method:
+          type: string
+          example: PUT
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Optional headers to include in PUT (e.g., Content-Type)
+      required:
+        - uploadUrl
+
+    StartTranscribeRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [lecture, meeting]
+      required:
+        - mode
+
+    StartTranscribeResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: started
+        sessionId:
+          type: string
+      required:
+        - status
+        - sessionId
+
+    TranscriptRefreshResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        transcriptText:
+          type: string
+          nullable: true
+        speakers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Speaker"
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Segment"
+      required:
+        - status
+
+    # ===== Summary / Quiz / QA =====
+    Summary:
+      type: object
+      nullable: true
+      properties:
+        overview:
+          type: string
+        points:
+          type: array
+          items:
+            type: string
+        keywords:
+          type: array
+          items:
+            type: string
+
+    SummaryResponse:
+      type: object
+      properties:
+        summary:
+          $ref: "#/components/schemas/Summary"
+      required:
+        - summary
+
+    QuizQuestion:
+      type: object
+      properties:
+        id:
+          type: string
+        question:
+          type: string
+        choices:
+          type: array
+          items:
+            type: string
+        correctIndex:
+          type: integer
+        explanation:
+          type: string
+          nullable: true
+      required:
+        - id
+        - question
+        - choices
+        - correctIndex
+
+    QuizResponse:
+      type: object
+      nullable: true
+      properties:
+        questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuizQuestion"
+
+    QaRequest:
+      type: object
+      properties:
+        question:
+          type: string
+      required:
+        - question
+
+    QaCitation:
+      type: object
+      properties:
+        startSec:
+          type: number
+          format: float
+        endSec:
+          type: number
+          format: float
+        text:
+          type: string
+      required:
+        - startSec
+        - endSec
+        - text
+
+    QaResponse:
+      type: object
+      properties:
+        answer:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/QaCitation"
+      required:
+        - answer

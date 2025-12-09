@@ -1,0 +1,9 @@
+# Files to exclude from the Cloud Build context
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv
+env/
+venv/
