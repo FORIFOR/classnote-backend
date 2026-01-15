@@ -1,0 +1,200 @@
+2026-01-06 08:42:02 INFO:     169.254.169.126:49682 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:02 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:03 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:03 INFO:     169.254.169.126:49698 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:05 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:05 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:05 INFO:     169.254.169.126:49712 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:05 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:06 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:06 INFO:     169.254.169.126:49718 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:08 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:08 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:08 INFO:     169.254.169.126:49722 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:08 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:09 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:09 INFO:     169.254.169.126:49734 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:11 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:11 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:11 INFO:     169.254.169.126:49750 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:11 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:12 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:12 INFO:     169.254.169.126:57388 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:14 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:14 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:14 INFO:     169.254.169.126:57400 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:14 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:15 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:15 INFO:     169.254.169.126:57408 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:17 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:17 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:17 INFO:     169.254.169.126:57412 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:17 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:18 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:18 INFO:     169.254.169.126:57418 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:20 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:20 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:20 INFO:     169.254.169.126:57426 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:20 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:21 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:21 INFO:     169.254.169.126:57428 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:23 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:23 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:23 INFO:     169.254.169.126:41276 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:23 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:24 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:24 INFO:     169.254.169.126:41284 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:26 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:26 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:26 INFO:     169.254.169.126:41288 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:26 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:27 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:42:27 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:27 INFO:     169.254.169.126:41292 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:27 INFO:     169.254.169.126:41298 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:42:29 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:29 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:29 INFO:     169.254.169.126:41300 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:29 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:30 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:30 INFO:     169.254.169.126:41314 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:32 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:32 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:32 INFO:     169.254.169.126:30822 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:32 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:33 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:33 INFO:     169.254.169.126:30832 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:35 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:35 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:35 INFO:     169.254.169.126:30840 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:35 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:35 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:35 INFO:     169.254.169.126:30854 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:38 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:38 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:38 INFO:     169.254.169.126:30860 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:38 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:38 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:38 INFO:     169.254.169.126:30870 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:41 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:41 INFO:     169.254.169.126:30878 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:41 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:41 INFO:     169.254.169.126:12822 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:44 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:44 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:44 INFO:     169.254.169.126:12826 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:44 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:44 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:44 INFO:     169.254.169.126:12842 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:46 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:47 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:47 INFO:     169.254.169.126:12854 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:47 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:47 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:47 INFO:     169.254.169.126:12860 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:49 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:50 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:50 INFO:     169.254.169.126:12862 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:50 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:50 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:50 INFO:     169.254.169.126:12868 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:52 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:52 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:52 INFO:     169.254.169.126:58456 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:53 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:53 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:53 INFO:     169.254.169.126:58472 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:55 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:56 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:56 INFO:     169.254.169.126:58488 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:56 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:56 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:56 INFO:     169.254.169.126:58498 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:42:58 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:42:58 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:58 INFO:     169.254.169.126:58508 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:42:58 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:42:59 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:42:59 INFO:     169.254.169.126:58510 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:01 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:01 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:01 INFO:     169.254.169.126:43772 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:01 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:02 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:02 INFO:     169.254.169.126:43774 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:04 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:04 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:04 INFO:     169.254.169.126:43784 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:05 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:05 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:05 INFO:     169.254.169.126:43786 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:07 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:07 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:07 INFO:     169.254.169.126:43790 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:08 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:08 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:08 INFO:     169.254.169.126:43792 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:10 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:10 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:10 INFO:     169.254.169.126:43794 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:10 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:11 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:11 INFO:     169.254.169.126:43804 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:13 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:13 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:13 INFO:     169.254.169.126:23764 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:13 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:14 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:14 INFO:     169.254.169.126:23768 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:16 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:16 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:16 INFO:     169.254.169.126:23782 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:16 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:17 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:17 INFO:     169.254.169.126:23794 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:19 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:19 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:19 INFO:     169.254.169.126:23808 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:19 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:20 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:20 INFO:     169.254.169.126:23814 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:22 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:22 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:22 INFO:     169.254.169.126:35580 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:22 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:23 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:23 INFO:     169.254.169.126:35588 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:25 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:25 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:25 INFO:     169.254.169.126:35600 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:25 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:26 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:26 INFO:     169.254.169.126:35608 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:28 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:28 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:28 INFO:     169.254.169.126:35614 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:28 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:29 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:29 INFO:     169.254.169.126:35622 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:31 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:31 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:31 INFO:     169.254.169.126:35626 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:31 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:32 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:32 INFO:     169.254.169.126:39456 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:34 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:34 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:34 INFO:     169.254.169.126:39464 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:34 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:34 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:34 INFO:     169.254.169.126:39470 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:37 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:37 INFO:     169.254.169.126:39476 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:37 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:37 INFO:     169.254.169.126:39488 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:44:09 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:44:09 INFO:     169.254.169.126:44836 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found

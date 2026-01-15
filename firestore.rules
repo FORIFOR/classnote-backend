@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // =========================================================
+    // Helper Functions
+    // =========================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isSessionParticipant(resourceData) {
+      return isAuthenticated() && (
+        resourceData.ownerUserId == request.auth.uid ||
+        (resourceData.participantUserIds is list && request.auth.uid in resourceData.participantUserIds) ||
+        // Legacy support
+        (resourceData.ownerUid == request.auth.uid)
+      );
+    }
+
+    // =========================================================
+    // Collections
+    // =========================================================
+
+    // Users Collection
+    // Read: Owner only
+    // Write: Deny (Use Backend API PATCH /users/me)
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if false;
+
+      // User Subcollections (e.g. sessionMeta)
+      match /sessionMeta/{sessionId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+
+    // Sessions Collection
+    // Read: Owner or Participant
+    // Write: Deny (Use Backend API for all session modifications)
+    match /sessions/{sessionId} {
+      allow read: if isSessionParticipant(resource.data);
+      allow write: if false;
+
+      // Session Subcollections
+      match /{subcollection=**} {
+        allow read: if isSessionParticipant(get(/databases/$(database)/documents/sessions/$(sessionId)).data);
+        allow write: if false;
+      }
+    }
+
+    // Admin-only Collections
+    // usage_logs, user_daily_usage, system_stats, pricing_config
+    // These should only be accessed by Backend (Admin SDK)
+    match /usage_logs/{document=**} {
+      allow read, write: if false;
+    }
+    
+    match /user_daily_usage/{document=**} {
+      allow read, write: if false;
+    }
+    
+    match /system_stats/{document=**} {
+      allow read, write: if false;
+    }
+    
+    match /pricing_config/{document=**} {
+      allow read, write: if false;
+    }
+
+    // Default Deny All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

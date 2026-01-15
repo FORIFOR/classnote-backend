@@ -1,0 +1,265 @@
+2026-01-06 05:22:29 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be/jobs
+2026-01-06 05:22:30 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:22:30 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 05:22:30 INFO:     169.254.169.126:51716 - "POST /sessions/lecture-1767568426636-4e11be/jobs HTTP/1.1" 200 OK
+2026-01-06 05:22:30 INFO:     169.254.169.126:51726 - "POST /internal/tasks/quiz HTTP/1.1" 200 OK
+2026-01-06 05:27:09 DEBUG: app/main.py starting...
+2026-01-06 05:27:12 INFO:     Started server process [1]
+2026-01-06 05:27:12 INFO:     Waiting for application startup.
+2026-01-06 05:27:12 INFO:     Application startup complete.
+2026-01-06 05:27:12 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 05:28:15 INFO:     Shutting down
+2026-01-06 05:28:15 INFO:     Shutting down
+2026-01-06 05:28:15 INFO:     Waiting for application shutdown.
+2026-01-06 05:28:15 INFO:     Application shutdown complete.
+2026-01-06 05:28:15 INFO:     Finished server process [1]
+2026-01-06 05:28:15 INFO:     Waiting for application shutdown.
+2026-01-06 05:28:15 INFO:     Application shutdown complete.
+2026-01-06 05:28:15 INFO:     Finished server process [1]
+2026-01-06 05:32:13 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be
+2026-01-06 05:32:13 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:14 INFO:     169.254.169.126:58080 - "GET /sessions/lecture-1767568426636-4e11be HTTP/1.1" 200 OK
+2026-01-06 05:32:14 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be/artifacts/summary
+2026-01-06 05:32:15 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:15 INFO:     169.254.169.126:58096 - "GET /sessions/lecture-1767568426636-4e11be/artifacts/summary HTTP/1.1" 200 OK
+2026-01-06 05:32:17 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be/jobs
+2026-01-06 05:32:18 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:18 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 05:32:18 INFO:     169.254.169.126:1718 - "POST /sessions/lecture-1767568426636-4e11be/jobs HTTP/1.1" 200 OK
+2026-01-06 05:32:18 INFO:     169.254.169.126:1732 - "POST /internal/tasks/quiz HTTP/1.1" 200 OK
+2026-01-06 05:47:26 INFO:     Shutting down
+2026-01-06 05:47:26 INFO:     Waiting for application shutdown.
+2026-01-06 05:47:26 INFO:     Application shutdown complete.
+2026-01-06 05:47:26 INFO:     Finished server process [1]
+2026-01-06 06:56:39 DEBUG: app/main.py starting...
+2026-01-06 06:56:41 INFO:     Started server process [1]
+2026-01-06 06:56:41 INFO:     Waiting for application startup.
+2026-01-06 06:56:41 INFO:     Application startup complete.
+2026-01-06 06:56:41 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:04:39 DEBUG: app/main.py starting...
+2026-01-06 07:04:42 INFO:     Started server process [1]
+2026-01-06 07:04:42 INFO:     Waiting for application startup.
+2026-01-06 07:04:42 INFO:     Application startup complete.
+2026-01-06 07:04:42 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:05:25 POST 500 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:05:26 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:05:26 Failed to enqueue youtube import task: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:26 Failed to enqueue youtube import for lecture-1767683126502-1965ce: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:26 Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 75, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 438, in result
+    raise self
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 1180, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 996, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+2026-01-06 07:05:26 	status = StatusCode.INVALID_ARGUMENT
+2026-01-06 07:05:26 	details = "Task.dispatchDeadline must be between [15s, 30m]."
+2026-01-06 07:05:26 	debug_error_string = "UNKNOWN:Error received from peer ipv4:172.217.31.138:443 {grpc_status:3, grpc_message:"Task.dispatchDeadline must be between [15s, 30m]."}"
+2026-01-06 07:05:26 >
+2026-01-06 07:05:26 The above exception was the direct cause of the following exception:
+2026-01-06 07:05:26 Traceback (most recent call last):
+  File "/app/app/routes/imports.py", line 158, in import_youtube
+    enqueue_youtube_import_task(session_id, req.url, language=req.language or "ja")
+  File "/app/app/task_queue.py", line 528, in enqueue_youtube_import_task
+    raise e
+  File "/app/app/task_queue.py", line 524, in enqueue_youtube_import_task
+    tasks_client.create_task(parent=parent, task=task)
+  File "/usr/local/lib/python3.11/site-packages/google/cloud/tasks_v2/services/cloud_tasks/client.py", line 2557, in create_task
+    response = rpc(
+               ^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/gapic_v1/method.py", line 131, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 77, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.InvalidArgument: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:27 INFO:     169.254.169.126:53194 - "POST /imports/youtube HTTP/1.1" 500 Internal Server Error
+2026-01-06 07:05:59 INFO:     Shutting down
+2026-01-06 07:05:59 INFO:     Waiting for application shutdown.
+2026-01-06 07:05:59 INFO:     Application shutdown complete.
+2026-01-06 07:05:59 INFO:     Finished server process [1]
+2026-01-06 07:10:39 DEBUG: app/main.py starting...
+2026-01-06 07:10:41 INFO:     Started server process [1]
+2026-01-06 07:10:41 INFO:     Waiting for application startup.
+2026-01-06 07:10:41 INFO:     Application startup complete.
+2026-01-06 07:10:41 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:10:58 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:10:59 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:10:59 INFO:     169.254.169.126:32274 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:10:59 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:10:59 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767683459018-5d7a33
+2026-01-06 07:11:01 [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:11:01 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:11:02 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:11:02 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:11:02 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:11:02 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:11:02 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:11:03 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683459018-5d7a33_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:11:03 YouTube Import Failed for lecture-1767683459018-5d7a33
+2026-01-06 07:11:03 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 32, in _download_and_convert
+    subprocess.check_call([
+  File "/usr/local/lib/python3.11/subprocess.py", line 413, in check_call
+    raise CalledProcessError(retcode, cmd)
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683459018-5d7a33_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:11:03 During handling of the above exception, another exception occurred:
+2026-01-06 07:11:03 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 150, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 41, in _download_and_convert
+    raise ValueError("Failed to download video (yt-dlp error)")
+ValueError: Failed to download video (yt-dlp error)
+2026-01-06 07:11:03 INFO:     169.254.169.126:32298 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:11:03 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:11:03 INFO:     169.254.169.126:32306 - "GET /sessions/lecture-1767683459018-5d7a33 HTTP/1.1" 200 OK
+2026-01-06 07:11:51 INFO:     Shutting down
+2026-01-06 07:11:51 INFO:     Waiting for application shutdown.
+2026-01-06 07:11:51 INFO:     Application shutdown complete.
+2026-01-06 07:11:51 INFO:     Finished server process [1]
+2026-01-06 07:15:46 DEBUG: app/main.py starting...
+2026-01-06 07:15:48 INFO:     Started server process [1]
+2026-01-06 07:15:48 INFO:     Waiting for application startup.
+2026-01-06 07:15:48 INFO:     Application startup complete.
+2026-01-06 07:15:48 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:16:36 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:16:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:16:37 INFO:     169.254.169.126:53066 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:16:37 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:16:38 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767683797202-202d5f
+2026-01-06 07:16:41 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683797202-202d5f_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:16:41 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:16:41 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:16:41 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:16:41 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:16:41 YouTube Import Failed for lecture-1767683797202-202d5f
+2026-01-06 07:16:41 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683797202-202d5f_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:16:41 During handling of the above exception, another exception occurred:
+2026-01-06 07:16:41 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:16:41 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:16:41 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:16:41 INFO:     169.254.169.126:55066 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:16:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:16:41 INFO:     169.254.169.126:55078 - "GET /sessions/lecture-1767683797202-202d5f HTTP/1.1" 200 OK
+2026-01-06 07:16:52 INFO:     Shutting down
+2026-01-06 07:16:52 INFO:     Waiting for application shutdown.
+2026-01-06 07:16:52 INFO:     Application shutdown complete.
+2026-01-06 07:16:52 INFO:     Finished server process [1]
+2026-01-06 07:22:23 DEBUG: app/main.py starting...
+2026-01-06 07:22:26 INFO:     Started server process [1]
+2026-01-06 07:22:26 INFO:     Waiting for application startup.
+2026-01-06 07:22:26 INFO:     Application startup complete.
+2026-01-06 07:22:26 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:22:41 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:22:42 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:22:42 INFO:     169.254.169.126:21926 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:22:42 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:22:44 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684162401-ded6bb
+2026-01-06 07:22:46 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684162401-ded6bb_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:22:46 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:22:46 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:22:46 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:22:46 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:22:46 YouTube Import Failed for lecture-1767684162401-ded6bb
+2026-01-06 07:22:46 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684162401-ded6bb_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:22:46 During handling of the above exception, another exception occurred:
+2026-01-06 07:22:46 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:22:46 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:22:46 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:22:46 INFO:     169.254.169.126:21928 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:22:46 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:22:46 INFO:     169.254.169.126:39490 - "GET /sessions/lecture-1767684162401-ded6bb HTTP/1.1" 200 OK
+2026-01-06 07:23:31 INFO:     Shutting down
+2026-01-06 07:23:31 INFO:     Waiting for application shutdown.
+2026-01-06 07:23:31 INFO:     Application shutdown complete.
+2026-01-06 07:23:31 INFO:     Finished server process [1]
+2026-01-06 07:23:38 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:23:38 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:23:39 INFO:     169.254.169.126:7114 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:23:39 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:23:39 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684218708-16d760
+2026-01-06 07:23:41 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684218708-16d760_in.%(ext)s', 'https://www.youtube.com/watch?v=BaW_jenozKc']' returned non-zero exit status 1.
+2026-01-06 07:23:41 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:23:41 ERROR: [youtube] BaW_jenozKc: Video unavailable
+2026-01-06 07:23:41 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=BaW_jenozKc
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading webpage
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading android sdkless player API JSON
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading web safari player API JSON
+2026-01-06 07:23:41 YouTube Import Failed for lecture-1767684218708-16d760
+2026-01-06 07:23:41 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684218708-16d760_in.%(ext)s', 'https://www.youtube.com/watch?v=BaW_jenozKc']' returned non-zero exit status 1.
+2026-01-06 07:23:41 During handling of the above exception, another exception occurred:
+2026-01-06 07:23:41 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:23:41 ERROR: [youtube] BaW_jenozKc: Video unavailable
+2026-01-06 07:23:41 INFO:     169.254.169.126:7124 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:23:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:23:41 INFO:     169.254.169.126:7132 - "GET /sessions/lecture-1767684218708-16d760 HTTP/1.1" 200 OK

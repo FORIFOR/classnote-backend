@@ -1,3 +1,4 @@
+import os
 import yaml
 import requests
 import json
@@ -7,8 +8,9 @@ from typing import Dict, Any, Optional
 
 # Constants
 OPENAPI_FILE = "openapi.yaml"
-BASE_URL = "http://localhost:8000"  # Adjust if running on a different port
-# BASE_URL = "https://classnote-api-900324644592.asia-northeast1.run.app" # For Cloud Run debugging
+BASE_URL = os.environ.get("OPENAPI_BASE_URL", "http://localhost:8000")
+ALLOW_WRITE = os.environ.get("OPENAPI_ALLOW_WRITE", "0") == "1"
+AUTH_TOKEN = os.environ.get("OPENAPI_AUTH_TOKEN")
 
 def load_openapi_spec(filepath: str) -> Dict[str, Any]:
     with open(filepath, 'r') as f:
@@ -65,38 +67,46 @@ def run_test(method: str, path: str, spec_path_item: Dict[str, Any], context: Di
     if not op_spec:
         return True
         
+    if op_spec.get("security") and not AUTH_TOKEN:
+        print(f"SKIPPING {method} {path} - auth required but OPENAPI_AUTH_TOKEN not set")
+        return True
+
     if 'requestBody' in op_spec:
-        # Provide dummy data based on schema hints or context
-        if method.lower() == 'post' and path == '/sessions':
-             json_body = {
-                 "title": "Test Session",
-                 "mode": "lecture",
-                 "userId": "test-user-uid"
-             }
-        elif method.lower() == 'post' and path == '/upload-url':
-             json_body = {
-                 "sessionId": context.get('current_session_id'),
-                 "mode": "lecture",
-                 "contentType": "audio/wav"
-             }
-        elif 'start_transcribe' in path: 
-             json_body = { "mode": "lecture" }
-        elif 'summarize' in path:
-             json_body = {}
-        elif 'quiz' in path:
-             # quiz might take query params, not body
-             pass
-        elif 'qa' in path:
-             json_body = { "question": "What is AI?" }
-        # Add other specific body constructions here
+        op_id = (op_spec.get("operationId") or "").upper()
+        body_env_key = f"OPENAPI_BODY_{op_id}" if op_id else None
+        body_json = None
+        if body_env_key and body_env_key in os.environ:
+            body_json = os.environ.get(body_env_key)
+        elif "OPENAPI_BODY_JSON" in os.environ:
+            body_json = os.environ.get("OPENAPI_BODY_JSON")
+
+        if body_json:
+            try:
+                json_body = json.loads(body_json)
+            except json.JSONDecodeError:
+                print(f"SKIPPING {method} {path} - Invalid JSON in {body_env_key or 'OPENAPI_BODY_JSON'}")
+                return True
+        else:
+            print(f"SKIPPING {method} {path} - Request body required but not provided")
+            return True
     
     # Query params
     params = {}
     if 'parameters' in op_spec:
         for p in op_spec['parameters']:
             if p['in'] == 'query':
-                if p['name'] == 'userId':
-                    params['userId'] = 'test-user-uid'
+                env_key = f"OPENAPI_QUERY_{p['name'].upper()}"
+                if env_key in os.environ:
+                    params[p['name']] = os.environ.get(env_key)
+                elif p.get("required"):
+                    print(f"SKIPPING {method} {path} - Missing required query param: {p['name']}")
+                    return True
+
+    if AUTH_TOKEN:
+        if AUTH_TOKEN.lower().startswith("bearer "):
+            headers["Authorization"] = AUTH_TOKEN
+        else:
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
     
     try:
         response = requests.request(method, url, json=json_body, params=params, headers=headers)
@@ -106,6 +116,10 @@ def run_test(method: str, path: str, spec_path_item: Dict[str, Any], context: Di
 
     expected_responses = op_spec.get('responses', {})
     status_code = str(response.status_code)
+
+    if status_code in ("401", "403") and not AUTH_TOKEN:
+        print(f"  [SKIP] Auth required (status {status_code}); OPENAPI_AUTH_TOKEN not set")
+        return True
     
     if status_code not in expected_responses and 'default' not in expected_responses:
         # Check for range definitions like "2XX" if we were being fancy, but spec uses explicit codes
@@ -115,12 +129,6 @@ def run_test(method: str, path: str, spec_path_item: Dict[str, Any], context: Di
         
     print(f"  [OK] Status: {status_code}")
     
-    # Capture interesting data for context
-    if method.lower() == 'post' and path == '/sessions' and response.status_code == 201:
-        data = response.json()
-        context['current_session_id'] = data.get('id')
-        print(f"    captured session_id: {context['current_session_id']}")
-
     return True
 
 def main():
@@ -130,39 +138,36 @@ def main():
         print(f"Error: {OPENAPI_FILE} not found.")
         sys.exit(1)
         
+    session_id = os.environ.get("OPENAPI_SESSION_ID")
     context = {
         'path_params': {
-            'sessionId': 'placeholder_until_created' 
+            'sessionId': session_id,
+            'session_id': session_id,
+            'quiz_id': os.environ.get("OPENAPI_QUIZ_ID"),
+            'quizId': os.environ.get("OPENAPI_QUIZ_ID"),
+            'target_uid': os.environ.get("OPENAPI_TARGET_UID"),
+            'targetUid': os.environ.get("OPENAPI_TARGET_UID"),
+            'user_id': os.environ.get("OPENAPI_USER_ID"),
+            'userId': os.environ.get("OPENAPI_USER_ID"),
+            'code': os.environ.get("OPENAPI_CODE"),
+            'token': os.environ.get("OPENAPI_TOKEN"),
         }
     }
+    context['path_params'] = {k: v for k, v in context['path_params'].items() if v}
     
-    # Order matters: Create session first to get an ID
     paths = spec.get('paths', {})
-    
-    # 1. Test POST /sessions first
-    if '/sessions' in paths:
-        run_test('POST', '/sessions', paths['/sessions'], context)
-        
-    # Update context with real ID if created
-    if 'current_session_id' in context:
-        context['path_params']['sessionId'] = context['current_session_id']
-    else:
-        print("Warning: Could not create a session. Subsequent tests needing sessionId might fail or be skipped.")
 
     # 2. Iterate others
     failed_count = 0
     for path, path_item in paths.items():
         for method in ['get', 'post', 'put', 'delete', 'patch']:
             if method in path_item:
-                # Skip the one we already ran
-                if path == '/sessions' and method == 'post':
+                if method != 'get' and not ALLOW_WRITE:
+                    print(f"SKIPPING {method.upper()} {path} - write operations disabled")
                     continue
-                
-                # Careful with DELETE to not kill our session too early? 
-                # For now let's just run everything.
-                if method == 'delete':
-                     print(f"Skipping DELETE {path} for now to preserve state")
-                     continue
+                if method == 'delete' and not ALLOW_WRITE:
+                    print(f"Skipping DELETE {path} for now to preserve state")
+                    continue
 
                 if not run_test(method.upper(), path, path_item, context):
                     failed_count += 1

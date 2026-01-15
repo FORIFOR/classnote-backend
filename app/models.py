@@ -7,6 +7,9 @@ class CreateSessionRequest(BaseModel):
     title: str
     mode: Literal["lecture", "meeting"] = "lecture"
     userId: str = Field(..., description="Firebase Auth の uid など")
+    startAt: Optional[datetime] = None
+    endAt: Optional[datetime] = None
+    syncToGoogleCalendar: Optional[bool] = False
 
 
 # ---------- 話者分離 (Diarization) Models ---------- #
@@ -37,6 +40,8 @@ class SessionResponse(BaseModel):
     userId: str
     status: str
     createdAt: datetime
+    startAt: Optional[datetime] = None
+    endAt: Optional[datetime] = None
     startedAt: Optional[datetime] = None
     endedAt: Optional[datetime] = None
     durationSec: Optional[float] = None
@@ -145,12 +150,9 @@ class QaRequest(BaseModel):
     question: str
 
 class QaCitation(BaseModel):
-    startSec: float
-    endSec: float
-    text: str
+    excerpt: Optional[str] = None
+    reason: Optional[str] = None
 
 class QaResponse(BaseModel):
     answer: str
-    citations: List[QaCitation]
-
-
+    citations: Optional[List[QaCitation]] = None

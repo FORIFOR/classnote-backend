@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Classnote Realtime STT Demo</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .controls { margin-bottom: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px; }
+        input { margin: 5px; padding: 5px; width: 300px; }
+        label { display: inline-block; width: 100px; }
+        button { padding: 8px 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        button:disabled { background: #ccc; }
+        button.stop { background: #dc3545; }
+        #transcript { margin-top: 20px; border: 1px solid #ddd; padding: 10px; min-height: 200px; white-space: pre-wrap; }
+        .word { display: inline-block; margin-right: 4px; padding: 2px; border-radius: 3px; }
+        .spk-1 { background-color: #e3f2fd; color: #0d47a1; }
+        .spk-2 { background-color: #fce4ec; color: #880e4f; }
+    </style>
+</head>
+<body>
+    <h1>Classnote Realtime STT Demo</h1>
+
+    <div class="controls">
+        <div>
+            <label>API Host:</label>
+            <input type="text" id="host" value="localhost:8000">
+        </div>
+        <div>
+            <label>Session ID:</label>
+            <input type="text" id="sessionId" value="demo-session-1">
+        </div>
+        <div>
+            <label>Token:</label>
+            <input type="text" id="token" placeholder="Firebase ID Token (Optional if localhost)">
+        </div>
+        <br>
+        <button id="btnConnect" onclick="startRecording()">Start Recording</button>
+        <button id="btnStop" onclick="stopRecording()" class="stop" disabled>Stop</button>
+    </div>
+
+    <div id="status">Status: Ready</div>
+    <div id="transcript"></div>
+
+    <script>
+        let socket;
+        let audioContext;
+        let processor;
+        let mediaStream;
+        let isRecording = false;
+
+        const SAMPLE_RATE = 16000; // Target sample rate for GCP STT
+        
+        function log(msg) {
+            document.getElementById('status').textContent = `Status: ${msg}`;
+            console.log(msg);
+        }
+
+        async function startRecording() {
+            const host = document.getElementById('host').value;
+            const sessionId = document.getElementById('sessionId').value;
+            const token = document.getElementById('token').value;
+
+            // 1. Setup WebSocket
+            const protocol = host.includes('localhost') ? 'ws' : 'wss';
+            let wsUrl = `${protocol}://${host}/ws/stream/${sessionId}`;
+            if (token) wsUrl += `?token=${token}`;
+
+            log('Connecting to WebSocket...');
+            socket = new WebSocket(wsUrl);
+            socket.binaryType = 'arraybuffer';
+
+            socket.onopen = () => {
+                log('Connected! Asking for permission...');
+                // Send Start event
+                const startMsg = {
+                    event: "start",
+                    config: {
+                        languageCode: "ja-JP",
+                        sampleRateHertz: SAMPLE_RATE,
+                        enableSpeakerDiarization: true,
+                        speakerCount: 2
+                    }
+                };
+                socket.send(JSON.stringify(startMsg));
+                
+                // Start Audio
+                initAudio();
+            };
+
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.event === "partial" || data.event === "final") {
+                    renderTranscript(data);
+                } else if (data.event === "connected") {
+                    log('Server ready. Recording...');
+                    document.getElementById('btnConnect').disabled = true;
+                    document.getElementById('btnStop').disabled = false;
+                    isRecording = true;
+                }
+            };
+
+            socket.onclose = () => {
+                log('Disconnected');
+                cleanup();
+            };
+
+            socket.onerror = (e) => {
+                log('WebSocket Error');
+                console.error(e);
+            };
+        }
+
+        async function initAudio() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                
+                // Create MediaStreamSource
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                
+                // Create ScriptProcessor (bufferSize, inputChannels, outputChannels)
+                // Use 4096 buffer size for reasonable latency/performance balance
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                source.connect(processor);
+                processor.connect(audioContext.destination); // destination is needed for processor to run
+
+                processor.onaudioprocess = (e) => {
+                    if (!isRecording || socket.readyState !== WebSocket.OPEN) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    
+                    // Convert Float32Array to Int16Array (PCM)
+                    const pcmData = floatTo16BitPCM(inputData);
+                    
+                    // Send to WebSocket
+                    socket.send(pcmData);
+                };
+
+            } catch (err) {
+                log('Error accessing microphone: ' + err.message);
+                console.error(err);
+            }
+        }
+
+        function stopRecording() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ event: "stop" }));
+                socket.close();
+            }
+            cleanup();
+        }
+
+        function cleanup() {
+            isRecording = false;
+            document.getElementById('btnConnect').disabled = false;
+            document.getElementById('btnStop').disabled = true;
+            
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            if (processor) {
+                processor.disconnect();
+            }
+        }
+
+        function floatTo16BitPCM(input) {
+            const output = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return output.buffer;
+        }
+
+        let fullTranscript = []; // Store accumulated words
+
+        function renderTranscript(data) {
+            // Check if this is a final result or partial
+            // In a real app, you might want to replace the last "partial" block with new data
+            // Simple approach: append partials to a temporary view, verify finals to permanent storage
+            
+            // For demo: just clear and render "words" if available, or "transcript"
+            
+            const div = document.getElementById('transcript');
+            // If it's a "final" result, we append it permanently.
+            // If it's "partial", we just show it at the end.
+            
+            // Wait, the API sends a stream of chunks. 
+            // result.words contains the words for THAT chunk (or accumulated for the request).
+            // GCP Streaming API `is_final=true` means the phrase is done.
+            
+            if (data.event === "final") {
+                // Determine speaker tag from words if possible
+                let html = "";
+                if (data.words && data.words.length > 0) {
+                     // Calculate dominant speaker or show individual words
+                     data.words.forEach(w => {
+                         const colorClass = `spk-${w.speakerTag}`;
+                         html += `<span class="word ${colorClass}" title="spk:${w.speakerTag}">${w.word}</span>`;
+                     });
+                     html += "<br>";
+                } else {
+                     html = `<div>${data.transcript}</div>`;
+                }
+                
+                // Append to main display
+                // Note: This simple append approach might duplicate if logic isn't perfect, 
+                // but for a demo it shows the stream flows.
+                const finalSpan = document.createElement('span');
+                finalSpan.innerHTML = html;
+                div.appendChild(finalSpan);
+                
+                // Remove any scanning/interim text if we had a separate element for it
+            } else {
+                // Partial - maybe show in a separate "current" box or just log
+                // console.log("Partial:", data.transcript);
+                // Updating a "current utterance" element would be better
+                let temp = document.getElementById('temp-transcript');
+                if (!temp) {
+                    temp = document.createElement('div');
+                    temp.id = 'temp-transcript';
+                    temp.style.color = '#888';
+                    div.appendChild(temp);
+                }
+                temp.textContent = data.transcript;
+                
+                // If we get a final later, we should remove/clear this temp
+                if (data.is_final) { // data.event is "final" handled above, so this block is only for non-final
+                     temp.textContent = "";
+                }
+            }
+            
+            // Handle clearing temp on final
+            if (data.event === "final") {
+                const temp = document.getElementById('temp-transcript');
+                if (temp) temp.textContent = "";
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+2026-01-06 08:43:34 INFO:     169.254.169.126:39470 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:43:37 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:43:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:37 INFO:     169.254.169.126:39476 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:43:37 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:43:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:43:37 INFO:     169.254.169.126:39488 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:44:09 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:44:09 INFO:     169.254.169.126:44836 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:47:34 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:47:34 INFO:     169.254.169.126:17092 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:49:35 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/share_link
+2026-01-06 08:49:35 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:49:36 INFO:     169.254.169.126:61538 - "POST /sessions/meeting-1767688609154-c029ae/share_link HTTP/1.1" 200 OK
+2026-01-06 08:49:49 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/share/51qO6XRkoA9xfaVcMf0aGQ/join
+2026-01-06 08:49:49 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:49:49 INFO:     169.254.169.126:23646 - "POST /share/51qO6XRkoA9xfaVcMf0aGQ/join HTTP/1.1" 200 OK
+2026-01-06 08:49:49 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:49:50 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:49:50 INFO:     169.254.169.126:23652 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:50:39 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/share/51qO6XRkoA9xfaVcMf0aGQ/join
+2026-01-06 08:50:39 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:50:39 INFO:     169.254.169.126:26878 - "POST /share/51qO6XRkoA9xfaVcMf0aGQ/join HTTP/1.1" 200 OK
+2026-01-06 08:50:40 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:50:40 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:50:40 INFO:     169.254.169.126:26892 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:50:48 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:50:48 INFO:     169.254.169.126:47668 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:52:22 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me
+2026-01-06 08:52:23 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:23 INFO:     169.254.169.126:19436 - "GET /users/me HTTP/1.1" 200 OK
+2026-01-06 08:52:23 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me/subscription
+2026-01-06 08:52:23 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:23 INFO:     169.254.169.126:19440 - "POST /users/me/subscription HTTP/1.1" 200 OK
+2026-01-06 08:52:42 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:52:42 INFO:     169.254.169.126:63242 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:52:47 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions
+2026-01-06 08:52:48 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:48 INFO:     169.254.169.126:63244 - "GET /sessions HTTP/1.1" 200 OK
+2026-01-06 08:52:48 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions
+2026-01-06 08:52:48 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions
+2026-01-06 08:52:48 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:48 INFO:     169.254.169.126:63256 - "GET /sessions HTTP/1.1" 200 OK
+2026-01-06 08:52:48 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:49 INFO:     169.254.169.126:63266 - "GET /sessions HTTP/1.1" 200 OK
+2026-01-06 08:52:50 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:52:50 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:50 INFO:     169.254.169.126:63280 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:52:50 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me
+2026-01-06 08:52:51 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:51 INFO:     169.254.169.126:63282 - "GET /users/me HTTP/1.1" 200 OK
+2026-01-06 08:52:51 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/reaction
+2026-01-06 08:52:51 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:52:51 INFO:     169.254.169.126:63290 - "GET /sessions/meeting-1767688609154-c029ae/reaction HTTP/1.1" 200 OK
+2026-01-06 08:52:52 DEBUG: app/main.py starting...
+2026-01-06 08:52:54 INFO:     Started server process [1]
+2026-01-06 08:52:54 INFO:     Waiting for application startup.
+2026-01-06 08:52:54 INFO:     Application startup complete.
+2026-01-06 08:52:54 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 08:53:16 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 08:53:17 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:53:17 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/summarize
+2026-01-06 08:53:17 Failed to enqueue summary/quiz for lecture-1767689597011-d14baa: cannot access local variable 'enqueue_playlist_task' where it is not associated with a value
+2026-01-06 08:53:17 Traceback (most recent call last):
+  File "/app/app/routes/imports.py", line 165, in import_youtube
+    enqueue_playlist_task(session_id)
+    ^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'enqueue_playlist_task' where it is not associated with a value
+2026-01-06 08:53:17 INFO:     169.254.169.126:4928 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 08:53:18 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:20 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767689597011-d14baa
+2026-01-06 08:53:24 /usr/local/lib/python3.11/site-packages/vertexai/generative_models/_generative_models.py:433: UserWarning: This feature is deprecated as of June 24, 2025 and will be removed on June 24, 2026. For details, see https://cloud.google.com/vertex-ai/generative-ai/docs/deprecations/genai-vertexai-sdk.
+2026-01-06 08:53:24   warning_logs.show_deprecation_warning()
+2026-01-06 08:53:24 INFO:     169.254.169.126:4952 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:24 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:24 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:53:24 INFO:     169.254.169.126:29616 - "GET /sessions/lecture-1767689597011-d14baa HTTP/1.1" 200 OK
+2026-01-06 08:53:24 INFO:     169.254.169.126:29620 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:25 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:25 INFO:     169.254.169.126:29626 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:26 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:26 INFO:     169.254.169.126:29628 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:27 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767689597011-d14baa
+2026-01-06 08:53:27 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:27 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:53:27 INFO:     169.254.169.126:29642 - "GET /sessions/lecture-1767689597011-d14baa HTTP/1.1" 200 OK
+2026-01-06 08:53:27 INFO:     169.254.169.126:29656 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:28 Summarization failed for session lecture-1767689597011-d14baa
+2026-01-06 08:53:28 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 139, in handle_summarize_task
+    "playlist": playlist,
+                ^^^^^^^^
+NameError: name 'playlist' is not defined
+2026-01-06 08:53:28 INFO:     169.254.169.126:4938 - "POST /internal/tasks/summarize HTTP/1.1" 200 OK
+2026-01-06 08:53:29 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:29 INFO:     169.254.169.126:45964 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:30 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767689597011-d14baa
+2026-01-06 08:53:30 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:53:30 INFO:     169.254.169.126:45972 - "GET /sessions/lecture-1767689597011-d14baa HTTP/1.1" 200 OK
+2026-01-06 08:53:32 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:32 INFO:     169.254.169.126:45980 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:53:38 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:53:38 INFO:     169.254.169.126:45982 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found

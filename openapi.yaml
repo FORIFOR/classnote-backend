@@ -1,595 +1,6225 @@
-openapi: 3.0.3
+openapi: 3.1.0
 info:
-  title: GLASSNOTE-X Backend API
-  version: "0.1.0"
-  description: |
-    Backend API for GLASSNOTE-X (CLASSNOTE-X).
-    - iOS クライアント (`ClassnoteX`) から利用されることを想定
-    - Firebase ID トークンによる Bearer 認証
-    - セッション作成 → 音声アップロード用署名付きURL発行 → バッチ文字起こし → 要約生成 → 小テスト生成 → QA
-
-    Realtime streaming (WebSocket) は HTTP ではないため、OpenAPI の HTTP Paths からは外し、
-    下記のようにカスタム記述とする:
-
-    - WebSocket URL: `wss://{host}/ws/stream/{sessionId}?token=<idToken>`
-    - Client → Server:
-      - `{"event":"start","config":{ "languageCode":"ja-JP","sampleRateHertz":16000,"enableSpeakerDiarization":true,"speakerCount":2,"model":"latest_long" }}`
-      - バイナリ: 16kHz, 16-bit, mono PCM チャンク
-      - `{"event":"stop"}`
-    - Server → Client:
-      - `{"event":"partial" | "final","transcript":"...","words":[{"start":1.23,"end":2.34,"speakerTag":1}]}`
-
-servers:
-  - url: https://classnote-api.example.com
-    description: Production (example)
-  - url: https://classnote-api-900324644592.asia-northeast1.run.app
-    description: GCP Cloud Run (current)
-
-security:
-  - FirebaseAuth: []
-
-tags:
-  - name: sessions
-    description: Create, list and fetch lecture/meeting sessions
-  - name: transcription
-    description: Batch transcription and diarization
-  - name: summary
-    description: Summaries and quizzes
-  - name: qa
-    description: Lecture-based Q&A
-  - name: upload
-    description: Signed URL and audio upload coordination
-
+  title: ClassnoteX API
+  description: Backend API for ClassnoteX - AI-powered recording and transcription
+    app.
+  version: 0.4.0
 paths:
-  /sessions:
+  /sessions/{session_id}/assets:
     get:
-      tags: [sessions]
-      summary: List sessions for a user
-      description: |
-        指定したユーザのセッション一覧（講義 / 会議）を取得する。
-        将来的にページネーションを追加する場合は `page` / `pageSize` などを拡張する。
+      tags:
+      - Assets
+      summary: Get Session Assets
+      description: 'Get Asset Manifest for a session.
+
+        Tells client what exists and its status.'
+      operationId: get_session_assets_sessions__session_id__assets_get
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
-        - name: userId
-          in: query
-          description: Firebase UID もしくはメールアドレスなど、ユーザ識別子
-          required: true
-          schema:
-            type: string
-        - name: mode
-          in: query
-          description: セッション種別でフィルタ (lecture / meeting)。省略時は両方。
-          required: false
-          schema:
-            type: string
-            enum: [lecture, meeting]
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       responses:
-        "200":
-          description: List of sessions
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetManifest'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/assets/resolve:
+    post:
+      tags:
+      - Assets
+      summary: Resolve Session Assets
+      description: 'Generate Signed URLs for requested assets.
+
+        Handles legacy text assets by serving them directly or uploading to GCS on-demand
+        (TBD).
+
+        For now: Signed URLs for GCS, direct content for text (via special internal
+        URL or data URI?).
+
+        User requirement: "resolve -> URL".'
+      operationId: resolve_session_assets_sessions__session_id__assets_resolve_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetResolveRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetResolveResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/assets/{asset_type}/ensure:
+    post:
+      tags:
+      - Assets
+      summary: Ensure Asset Generation
+      description: 'Idempotent generation trigger.
+
+        If asset is missing or failed, triggers generation task.
+
+        If ready or processing, does nothing.'
+      operationId: ensure_asset_generation_sessions__session_id__assets__asset_type__ensure_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: asset_type
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Asset Type
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/transcript:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Transcript
+      operationId: get_artifact_transcript_sessions__session_id__artifacts_transcript_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivedStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - Sessions
+      summary: Upload Transcript Artifact
+      description: 'Upload a transcript artifact from device (or other source).
+
+        If mode is device* or dual, this may update the main transcript.'
+      operationId: upload_transcript_artifact_sessions__session_id__artifacts_transcript_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptUploadRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions:
+    post:
+      tags:
+      - Sessions
+      summary: Create Session
+      operationId: create_session_sessions_post
+      security:
+      - OAuth2PasswordBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    get:
+      tags:
+      - Sessions
+      summary: List Sessions
+      operationId: list_sessions_sessions_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User Id
+      - name: kind
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Kind
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      - name: from_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: From Date
+      - name: to_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: To Date
+      responses:
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/Session"
-        "401":
-          description: Unauthorized
-    post:
-      tags: [sessions]
-      summary: Create a new session
-      description: |
-        iOS クライアントから新規セッション（講義 / 会議）を作成する。
-        音声アップロードは別途 `/upload-url` → signed URL → PUT で行う。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateSessionRequest"
-      responses:
-        "201":
-          description: Session created
+                  $ref: '#/components/schemas/SessionResponse'
+                title: Response List Sessions Sessions Get
+        '422':
+          description: Validation Error
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Session"
-        "400":
-          description: Invalid input
-        "401":
-          description: Unauthorized
-
-  /sessions/{sessionId}:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}:
     get:
-      tags: [sessions]
-      summary: Get session detail
+      tags:
+      - Sessions
+      summary: Get Session
+      operationId: get_session_sessions__session_id__get
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       responses:
-        "200":
-          description: Session detail
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Session"
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
-
-  /upload-url:
-    post:
-      tags: [upload]
-      summary: Get a signed URL to upload audio
-      description: |
-        音声ファイルを GCS / S3 等に直接 PUT するための署名付き URL を発行する。
-        クライアントは返却された URL に対して `PUT` で音声をアップロードする。
+                $ref: '#/components/schemas/SessionDetailResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - Sessions
+      summary: Update Session
+      description: セッションの部分更新（タイトル、タグなど）
+      operationId: update_session_sessions__session_id__patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/UploadUrlRequest"
+              $ref: '#/components/schemas/UpdateSessionRequest'
       responses:
-        "200":
-          description: Signed upload URL issued
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UploadUrlResponse"
-        "400":
-          description: Invalid input
-        "401":
-          description: Unauthorized
-
-  /sessions/{sessionId}/start_transcribe:
-    post:
-      tags: [transcription]
-      summary: Start batch transcription for a session
+                $ref: '#/components/schemas/SessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - Sessions
+      summary: Delete Session
+      operationId: delete_session_sessions__session_id__delete
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/calendar:sync:
+    post:
+      tags:
+      - Sessions
+      summary: Sync Session Calendar
+      description: 指定ユーザー（基本はリクエスト本人）のカレンダーにセッションを同期登録する。
+      operationId: sync_session_calendar_sessions__session_id__calendar_sync_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/StartTranscribeRequest"
+              $ref: '#/components/schemas/CalendarSyncRequest'
       responses:
-        "200":
-          description: Transcription started
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StartTranscribeResponse"
-        "400":
-          description: Invalid state or input
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
-
-  /sessions/{sessionId}/refresh_transcript:
-    post:
-      tags: [transcription]
-      summary: Get latest transcription and diarization status
-      description: |
-        バッチ文字起こしジョブのステータスを確認し、完了していれば
-        文字起こしテキスト + 話者分離結果 (speakers / segments) を返す。
+                $ref: '#/components/schemas/CalendarSyncStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/calendar:status:
+    get:
+      tags:
+      - Sessions
+      summary: Get Calendar Sync Status
+      operationId: get_calendar_sync_status_sessions__session_id__calendar_status_get
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarSyncStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/transcript:
+    post:
+      tags:
+      - Sessions
+      summary: Update Transcript
+      description: '文字起こし＋話者分離セグメントをアップロード。
+
+        iOS オンデバイス STT で完結した場合、segments と source="device" を送信。
+
+        クラウド STT/diar コストを 0 にできる。'
+      operationId: update_transcript_sessions__session_id__transcript_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/transcript_chunks:append:
+    post:
+      tags:
+      - Sessions
+      summary: Append Transcript Chunks
+      operationId: append_transcript_chunks_sessions__session_id__transcript_chunks_append_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptChunkAppendRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptChunkAppendResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/transcript_chunks:replace:
+    post:
+      tags:
+      - Sessions
+      summary: Replace Transcript Chunks
+      operationId: replace_transcript_chunks_sessions__session_id__transcript_chunks_replace_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptChunkReplaceRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptChunkAppendResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/device_sync:
+    post:
+      tags:
+      - Sessions
+      summary: Device Sync
+      description: '端末側で生成された音声・文字起こし・話者分離結果をサーバへ同期し、
+
+        必要に応じてプレイリスト生成をトリガーする。'
+      operationId: device_sync_sessions__session_id__device_sync_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceSyncRequest'
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/meta:
+    patch:
+      tags:
+      - Sessions
+      summary: Update Session Meta
+      description: 'ユーザーごとのセッションメタデータ（ピン留め、既読など）を更新する。
+
+        コピーなし共有設計に対応。'
+      operationId: update_session_meta_sessions__session_id__meta_patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionMetaUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/jobs:
+    post:
+      tags:
+      - Sessions
+      summary: Create Job
+      operationId: create_job_sessions__session_id__jobs_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/jobs/{job_id}:
+    get:
+      tags:
+      - Sessions
+      summary: Get Job By Id
+      description: 'Fetch a specific job status by its ID.
+
+        Used for polling status of async operations.'
+      operationId: get_job_by_id_sessions__session_id__jobs__job_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/jobs/{job_type}:
+    get:
+      tags:
+      - Sessions
+      summary: Get Job Status
+      operationId: get_job_status_sessions__session_id__jobs__job_type__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: job_type
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Job Type
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/summary:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Summary
+      operationId: get_artifact_summary_sessions__session_id__artifacts_summary_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivedStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/playlist:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Playlist
+      operationId: get_artifact_playlist_sessions__session_id__artifacts_playlist_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaylistArtifactResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/quiz:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Quiz
+      operationId: get_artifact_quiz_sessions__session_id__artifacts_quiz_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivedStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/explain:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Explain
+      operationId: get_artifact_explain_sessions__session_id__artifacts_explain_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivedStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/artifacts/highlights:
+    get:
+      tags:
+      - Sessions
+      summary: Get Artifact Highlights
+      description: Alias for /highlights logic but under /artifacts namespace.
+      operationId: get_artifact_highlights_sessions__session_id__artifacts_highlights_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HighlightsResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/transcription/retry:
+    post:
+      tags:
+      - Sessions
+      summary: Retry Transcription
+      description: 'Retry cloud transcription.
+
+        Only allows retrying if not currently pending/running.'
+      operationId: retry_transcription_sessions__session_id__transcription_retry_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryTranscriptionRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/transcription:run:
+    post:
+      tags:
+      - Sessions
+      summary: Run Transcription
+      description: 'Trigger batch transcription (alias for /transcription/retry).
+
+        Used when transcript is missing or needs regeneration.'
+      operationId: run_transcription_sessions__session_id__transcription_run_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryTranscriptionRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/quizzes/{quiz_id}/answers:
+    post:
+      tags:
+      - Sessions
+      summary: Submit Quiz Answer
+      description: クイズ回答を送信し、正誤判定と統計更新を行う。
+      operationId: submit_quiz_answer_sessions__session_id__quizzes__quiz_id__answers_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: quiz_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Quiz Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuizAnswerRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/notes:
+    patch:
+      tags:
+      - Sessions
+      summary: Update Notes
+      operationId: update_notes_sessions__session_id__notes_patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotesUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/batch_delete:
+    post:
+      tags:
+      - Sessions
+      summary: Batch Delete Sessions
+      operationId: batch_delete_sessions_sessions_batch_delete_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchDeleteRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /sessions/{session_id}/audio_url:
+    get:
+      tags:
+      - Sessions
+      summary: Get Audio Url
+      description: 'Get a signed URL for audio playback/download.
+
+        Returns compression metadata (codec, container) to help client decode.'
+      operationId: get_audio_url_sessions__session_id__audio_url_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedCompressedAudioResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/audio:prepareUpload:
+    post:
+      tags:
+      - Sessions
+      summary: Prepare Audio Upload
+      description: オーディオアップロード用の署名付きURLを発行する。
+      operationId: prepare_audio_upload_sessions__session_id__audio_prepareUpload_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AudioPrepareRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioPrepareResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/audio:commit:
+    post:
+      tags:
+      - Sessions
+      summary: Commit Audio Upload
+      operationId: commit_audio_upload_sessions__session_id__audio_commit_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AudioCommitRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioCommitResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/audio:
+    delete:
+      tags:
+      - Sessions
+      summary: Delete Audio
+      operationId: delete_audio_sessions__session_id__audio_delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/qa/{qa_id}:
+    get:
+      tags:
+      - Sessions
+      summary: Get Qa Result
+      description: QA 結果を取得する（ポーリング用）。
+      operationId: get_qa_result_sessions__session_id__qa__qa_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: qa_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Qa Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QaStatusResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/share:invite:
+    post:
+      tags:
+      - Sessions
+      summary: Invite Session Member
+      operationId: invite_session_member_sessions__session_id__share_invite_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionMemberInviteRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionMemberResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/shared_with_users:
+    get:
+      tags:
+      - Sessions
+      summary: Get Shared Users
+      description: 'Get summary of users this session is shared with.
+
+        Only accessible by the session owner.'
+      operationId: get_shared_users_sessions__session_id__shared_with_users_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SharedUserSummary'
+                title: Response Get Shared Users Sessions  Session Id  Shared With
+                  Users Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/members:
+    get:
+      tags:
+      - Sessions
+      summary: Get Shared Users
+      description: 'Get summary of users this session is shared with.
+
+        Only accessible by the session owner.'
+      operationId: get_shared_users_sessions__session_id__members_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionMemberResponse'
+                title: Response Get Shared Users Sessions  Session Id  Members Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/participants_users:
+    get:
+      tags:
+      - Sessions
+      summary: Get Participants Users
+      description: 'Get public profiles of all participants (including owner) in the
+        session.
+
+        Accessible by any participant (owner, editor, viewer).'
+      operationId: get_participants_users_sessions__session_id__participants_users_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SharedUserSummary'
+                title: Response Get Participants Users Sessions  Session Id  Participants
+                  Users Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/members/{user_id}:
+    patch:
+      tags:
+      - Sessions
+      summary: Update Session Member
+      operationId: update_session_member_sessions__session_id__members__user_id__patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionMemberUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionMemberResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - Sessions
+      summary: Remove Session Member
+      operationId: remove_session_member_sessions__session_id__members__user_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/share/code:
+    post:
+      tags:
+      - Sessions
+      summary: Generate Session Share Code
+      description: セッション共有用6桁コードの発行（有効期限付き）
+      operationId: generate_session_share_code_sessions__session_id__share_code_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/share/join:
+    post:
+      tags:
+      - Sessions
+      summary: Join Session
+      description: 6桁コードでセッションに参加する。
+      operationId: join_session_sessions_share_join_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinSessionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /sessions/{session_id}/image_notes/upload_url:
+    post:
+      tags:
+      - Sessions
+      summary: Get Image Upload Url
+      operationId: get_image_upload_url_sessions__session_id__image_notes_upload_url_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageUploadUrlRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageUploadUrlResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/image_notes:
+    get:
+      tags:
+      - Sessions
+      summary: List Image Notes
+      description: 'Get image notes with cached signed URLs.
+
+        Optimized: Caches signed URLs in Firestore to avoid regenerating each request.'
+      operationId: list_image_notes_sessions__session_id__image_notes_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ImageNoteDTO'
+                title: Response List Image Notes Sessions  Session Id  Image Notes
+                  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/tags:
+    patch:
+      tags:
+      - Sessions
+      summary: Update Tags
+      operationId: update_tags_sessions__session_id__tags_patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagUpdateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /auth/line:
+    post:
+      tags:
+      - Authentication
+      summary: Auth Line
+      operationId: auth_line_auth_line_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LineAuthRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LineAuthResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /users/search:
+    get:
+      tags:
+      - Users
+      summary: Search Users
+      operationId: search_users_users_search_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: q
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          description: Search query (email or display name)
+          title: Q
+        description: Search query (email or display name)
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PublicUser'
+                title: Response Search Users Users Search Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /users/me:
+    get:
+      tags:
+      - Users
+      summary: Get Me
+      operationId: get_me_users_me_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+      security:
+      - OAuth2PasswordBearer: []
+    patch:
+      tags:
+      - Users
+      summary: Update Me
+      operationId: update_me_users_me_patch
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MeUpdateRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/me/entitlement:
+    get:
+      tags:
+      - Users
+      summary: Get My Entitlement
+      description: ユーザーの現在の権限状態を返す (StoreKit 2 / billing flow対応)
+      operationId: get_my_entitlement_users_me_entitlement_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntitlementResponse'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/claim-username:
+    post:
+      tags:
+      - Users
+      summary: Claim Username
+      operationId: claim_username_users_claim_username_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimUsernameRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/lookup:
+    get:
+      tags:
+      - Users
+      summary: Users Lookup
+      operationId: users_lookup_users_lookup_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: uids
+        in: query
+        required: true
+        schema:
+          type: string
+          description: Comma separated uids
+          title: Uids
+        description: Comma separated uids
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Users Lookup Users Lookup Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /users/me/subscription/ios:
+    post:
+      tags:
+      - Users
+      summary: Verify Ios Subscription
+      description: 'iOSクライアントからのStoreKit 2購入状態を受け取り、プランを更新する。
+
+        1. App Store Server API (JWS) 検証 (Robust)
+
+        2. クライアント信頼 (Fallback/MVP)'
+      operationId: verify_ios_subscription_users_me_subscription_ios_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionVerifyRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/me/subscription:
+    post:
+      tags:
+      - Users
+      summary: Verify Ios Subscription
+      description: 'iOSクライアントからのStoreKit 2購入状態を受け取り、プランを更新する。
+
+        1. App Store Server API (JWS) 検証 (Robust)
+
+        2. クライアント信頼 (Fallback/MVP)'
+      operationId: verify_ios_subscription_users_me_subscription_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionVerifyRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/me/capabilities:
+    get:
+      tags:
+      - Users
+      summary: Get My Capabilities
+      description: 'プランに応じた機能フラグ・制限情報を返す。
+
+        クライアントはこれを信じてUIを制御する。'
+      operationId: get_my_capabilities_users_me_capabilities_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/me/usage:
+    get:
+      tags:
+      - Users
+      summary: Get My Usage Alias
+      description: 'iOS互換エイリアス: /users/me/usage → /usage/me/summary'
+      operationId: get_my_usage_alias_users_me_usage_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: from_date
+        in: query
         required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              description: Reserved for future options (現在は空オブジェクト)
-      responses:
-        "200":
-          description: Transcript and diarization status
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TranscriptRefreshResponse"
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
-
-  /sessions/{sessionId}/summarize:
-    post:
-      tags: [summary]
-      summary: Generate summary for a session
-      parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: From Date
+      - name: to_date
+        in: query
         required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: To Date
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /users/me/profile:
+    get:
+      tags:
+      - Users
+      summary: Get Profile
+      operationId: get_profile_users_me_profile_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfileResponse'
+      security:
+      - OAuth2PasswordBearer: []
+    patch:
+      tags:
+      - Users
+      summary: Update Profile
+      operationId: update_profile_users_me_profile_patch
+      requestBody:
         content:
           application/json:
             schema:
-              type: object
-              description: Reserved for future options (現在は空オブジェクト)
+              $ref: '#/components/schemas/UserProfileUpdateRequest'
+        required: true
       responses:
-        "200":
-          description: Summary generated
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SummaryResponse"
-        "400":
-          description: Transcript not ready or invalid state
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
-
-  /sessions/{sessionId}/quiz:
-    post:
-      tags: [summary]
-      summary: Generate quiz questions for a session
-      parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: count
-          in: query
-          required: false
-          description: Number of questions to generate (default 5)
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 20
-            default: 5
-      responses:
-        "200":
-          description: Quiz generated
+                $ref: '#/components/schemas/UserProfileResponse'
+        '422':
+          description: Validation Error
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QuizResponse"
-        "400":
-          description: Transcript not ready or invalid state
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
-
-  /sessions/{sessionId}/qa:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/me/share-code:
     post:
-      tags: [qa]
-      summary: Ask a question about a lecture/meeting
-      description: |
-        セッションの文字起こし内容に基づいて QA を行う。
-        回答とともに、関連する時間区間への citation を返すことができる。
+      tags:
+      - Users
+      summary: Create Or Refresh Share Code
+      operationId: create_or_refresh_share_code_users_me_share_code_post
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareCodeResponse'
+      security:
+      - OAuth2PasswordBearer: []
+  /users/share_lookup:
+    post:
+      tags:
+      - Users
+      summary: Share Lookup
+      operationId: share_lookup_users_share_lookup_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShareLookupRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLookupResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /users/search_by_share_code:
+    get:
+      tags:
+      - Users
+      summary: Search By Share Code
+      operationId: search_by_share_code_users_search_by_share_code_get
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
-        - name: sessionId
-          in: path
-          required: true
-          schema:
-            type: string
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Code
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLookupResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /billing/ios/confirm:
+    post:
+      tags:
+      - Billing
+      summary: Confirm Ios Purchase
+      operationId: confirm_ios_purchase_billing_ios_confirm_post
+      parameters:
+      - $ref: '#/components/parameters/RequestIdHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingConfirmRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingConfirmResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /billing/apple/notifications:
+    post:
+      tags:
+      - Billing
+      summary: Handle App Store Notifications
+      operationId: handle_app_store_notifications_billing_apple_notifications_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppStoreNotificationRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /share-code/{code}:
+    get:
+      tags:
+      - Share
+      summary: Lookup User By Share Code
+      operationId: lookup_user_by_share_code_share_code__code__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareCodeLookupResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/share:
+    post:
+      tags:
+      - Share
+      summary: Share Session To User
+      operationId: share_session_to_user_sessions__session_id__share_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QaRequest"
+              $ref: '#/components/schemas/ShareByCodeRequest'
       responses:
-        "200":
-          description: Answer generated
+        '200':
+          description: Successful Response
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QaResponse"
-        "400":
-          description: Transcript not ready or invalid question
-        "401":
-          description: Unauthorized
-        "404":
-          description: Session not found
+                $ref: '#/components/schemas/ShareResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/share/{target_uid}:
+    delete:
+      tags:
+      - Share
+      summary: Revoke Share
+      operationId: revoke_share_sessions__session_id__share__target_uid__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: target_uid
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Target Uid
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /s/{token}:
+    get:
+      tags:
+      - Share
+      summary: Share Fallback
+      description: 'Universal Links Fallback Page.
 
+        If the app is installed, the link ''https://deepnote.app/s/{token}'' should
+        open the app directly.
+
+        If not installed (or failed), this HTML page is shown.'
+      operationId: share_fallback_s__token__get
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Token
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/share_link:
+    get:
+      tags:
+      - Share
+      summary: Create Share Link
+      operationId: create_share_link_sessions__session_id__share_link_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - Share
+      summary: Create Share Link
+      operationId: create_share_link_sessions__session_id__share_link_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /share/{token}:
+    get:
+      tags:
+      - Share
+      summary: Resolve Share Link
+      description: 'Share Link Fallback (Proposal B):
+
+        If opened in browser (no app installed), redirect to App Store.
+
+        App with Universal Links will capture this URL and call /share/{token}/info
+        instead.'
+      operationId: resolve_share_link_share__token__get
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Token
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /share/{token}/info:
+    get:
+      tags:
+      - Share
+      summary: Resolve Share Link Info
+      description: Endpoint for the App to resolve token to sessionId.
+      operationId: resolve_share_link_info_share__token__info_get
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Token
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /share/{token}/join:
+    post:
+      tags:
+      - Share
+      summary: Join Via Share Link
+      operationId: join_via_share_link_share__token__join_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Token
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /shares/{token}:
+    get:
+      tags:
+      - Share
+      summary: Get Shared Session Details
+      description: 'Public read-only session detail view for App (Universal Links).
+
+        No Authentication required (Token is key).'
+      operationId: get_shared_session_details_shares__token__get
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Token
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedSessionDTO'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /google/oauth/start:
+    get:
+      tags:
+      - Google
+      summary: Google Oauth Start
+      operationId: google_oauth_start_google_oauth_start_get
+      parameters:
+      - name: return_to
+        in: query
+        required: false
+        schema:
+          type: string
+          default: /
+          title: Return To
+      - name: token
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Token
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /google/oauth/callback:
+    get:
+      tags:
+      - Google
+      summary: Google Oauth Callback
+      operationId: google_oauth_callback_google_oauth_callback_get
+      parameters:
+      - name: code
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Code
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          title: State
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /search/sessions:
+    get:
+      tags:
+      - Search
+      - Search
+      summary: Search Sessions
+      description: 'Search sessions with filters.
+
+        Note: Firestore requires composite indexes for complex filtering.'
+      operationId: search_sessions_search_sessions_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Query text (title match or simple search)
+          title: Q
+        description: Query text (title match or simple search)
+      - name: mode
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Mode
+      - name: tag
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tag
+      - name: from_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: From Date
+      - name: to_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: To Date
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionResponse'
+                title: Response Search Sessions Search Sessions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /search/tasks:
+    get:
+      tags:
+      - Search
+      - Search
+      summary: Search Tasks
+      description: 'Search tasks assigned to or owned by user.
+
+        Assumes `tasks` root collection exists with `userId` or `assignee` fields.'
+      operationId: search_tasks_search_tasks_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Q
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TaskResponse'
+                title: Response Search Tasks Search Tasks Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /search/decisions:
+    get:
+      tags:
+      - Search
+      - Search
+      summary: Search Decisions
+      description: "Search decisions extracted from sessions.\nAssumes `decisions`\
+        \ root collection? Or `summaries` collection query?\nUser spec: \"3.4 summaries\
+        \ / tasks / decisions\". \nUsually decisions are inside `summary` object or\
+        \ separate.\nIf separate `decisions` not strictly defined as root collection,\
+        \ we might check `summaries`.\nUser Spec 4.6 says: GET /search/decisions.\n\
+        Let's assume we maintain a `decisions` collection or query Summaries.\nFor\
+        \ MVP, let's query `sessions` and extract decisions? No, that's heavy.\nLet's\
+        \ assume we query 'summaries' collection if it exists?\nSchema 3.4 says `summaries/{sessionId}`.\
+        \ It's 1-to-1 with session? Or root collection `summaries`?\nIf root `summaries`\
+        \ collection exists, we can query it."
+      operationId: search_decisions_search_decisions_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Q
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DecisionResponse'
+                title: Response Search Decisions Search Decisions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/reaction:
+    get:
+      tags:
+      - Reactions
+      summary: Get Reaction State
+      operationId: get_reaction_state_sessions__session_id__reaction_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionStateResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    put:
+      tags:
+      - Reactions
+      summary: Set Reaction
+      operationId: set_reaction_sessions__session_id__reaction_put
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetReactionRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionStateResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /admin/overview:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get Admin Overview
+      description: 'Get KPI overview for admin dashboard.
+
+        TODO: Add proper admin role check.'
+      operationId: get_admin_overview_admin_overview_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverviewResponse'
+      security:
+      - OAuth2PasswordBearer: []
+  /admin/users:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get Admin Users
+      description: Get paginated user list with filters.
+      operationId: get_admin_users_admin_users_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: query
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Search by name, email, or UID
+          title: Query
+        description: Search by name, email, or UID
+      - name: plan
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Filter by plan
+          title: Plan
+        description: Filter by plan
+      - name: active
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: 'Filter by activity: 7d, 30d, inactive'
+          title: Active
+        description: 'Filter by activity: 7d, 30d, inactive'
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          default: 50
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserSummary'
+                title: Response Get Admin Users Admin Users Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /admin/users/rankings:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get User Rankings
+      description: Get top users by specified metric.
+      operationId: get_user_rankings_admin_users_rankings_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: metric
+        in: query
+        required: false
+        schema:
+          type: string
+          description: 'Metric: recording, cost, sessions'
+          default: recording
+          title: Metric
+        description: 'Metric: recording, cost, sessions'
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 50
+          default: 10
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RankingItem'
+                title: Response Get User Rankings Admin Users Rankings Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /admin/users/{uid}:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get User Detail
+      description: Get detailed user info with usage stats.
+      operationId: get_user_detail_admin_users__uid__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: uid
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Uid
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetailResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /admin/config/pricing:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get Pricing Config
+      description: Get current pricing configuration.
+      operationId: get_pricing_config_admin_config_pricing_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingConfig'
+      security:
+      - OAuth2PasswordBearer: []
+    patch:
+      tags:
+      - Admin
+      - Admin
+      summary: Update Pricing Config
+      description: Update pricing configuration.
+      operationId: update_pricing_config_admin_config_pricing_patch
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PricingConfig'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingConfig'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /admin/sessions:
+    get:
+      tags:
+      - Admin
+      - Admin
+      summary: Get Admin Sessions
+      description: Get paginated session list with filters.
+      operationId: get_admin_sessions_admin_sessions_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Filter by status
+          title: Status
+        description: Filter by status
+      - name: mode
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Filter by mode
+          title: Mode
+        description: Filter by mode
+      - name: userId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Filter by userId
+          title: Userid
+        description: Filter by userId
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          default: 50
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminSessionListItem'
+                title: Response Get Admin Sessions Admin Sessions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /imports/youtube:
+    post:
+      tags:
+      - Imports
+      summary: Import Youtube
+      operationId: import_youtube_imports_youtube_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportYouTubeRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportYouTubeResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
+  /sessions/{session_id}/quiz_attempts:
+    post:
+      tags:
+      - Quiz Analytics
+      summary: Create Quiz Attempt
+      operationId: create_quiz_attempt_sessions__session_id__quiz_attempts_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuizAttemptCreate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuizAttempt'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /analytics/quiz:
+    get:
+      tags:
+      - Quiz Analytics
+      summary: Get Quiz Analytics
+      operationId: get_quiz_analytics_analytics_quiz_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: from
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: From
+      - name: to
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: To
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuizAnalytics'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /analytics/quiz/sessions:
+    get:
+      tags:
+      - Quiz Analytics
+      summary: Get Session Quiz Stats
+      operationId: get_session_quiz_stats_analytics_quiz_sessions_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 50
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionQuizStat'
+                title: Response Get Session Quiz Stats Analytics Quiz Sessions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /usage/admin/backfill:
+    post:
+      tags:
+      - Usage
+      - Usage
+      summary: Backfill Usage
+      description: 'Admin-only: Backfill usage data from sessions collection.
+
+        Scans all sessions and populates user_daily_usage.'
+      operationId: backfill_usage_usage_admin_backfill_post
+      parameters:
+      - name: secret
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Secret
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /usage/me/summary:
+    get:
+      tags:
+      - Usage
+      - Usage
+      summary: Get My Usage Summary
+      description: 'Get the current user''s usage summary for a date range.
+
+
+        Useful for:
+
+        - Showing usage dashboard in the app
+
+        - Checking quota usage
+
+        - Billing purposes'
+      operationId: get_my_usage_summary_usage_me_summary_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: from_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Start date (yyyy-MM-dd). Defaults to 30 days ago.
+          title: From Date
+        description: Start date (yyyy-MM-dd). Defaults to 30 days ago.
+      - name: to_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: End date (yyyy-MM-dd). Defaults to today.
+          title: To Date
+        description: End date (yyyy-MM-dd). Defaults to today.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummaryResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /usage/admin/users/{user_id}/summary:
+    get:
+      tags:
+      - Usage
+      - Usage
+      summary: Get User Usage Summary Admin
+      description: 'Admin endpoint to view any user''s usage.
+
+
+        TODO: Add proper admin role check'
+      operationId: get_user_usage_summary_admin_usage_admin_users__user_id__summary_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      - name: from_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: From Date
+      - name: to_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: To Date
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummaryResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /usage/analytics/me/timeline:
+    get:
+      tags:
+      - Usage
+      - Usage
+      summary: Get Usage Timeline
+      description: 時系列データの取得（グラフ用）。
+      operationId: get_usage_timeline_usage_analytics_me_timeline_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: range
+        in: query
+        required: false
+        schema:
+          type: string
+          default: 30d
+          title: Range
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /health:
+    get:
+      summary: Health
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
 components:
-  securitySchemes:
-    FirebaseAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
-      description: |
-        Firebase ID token as Bearer token.
-        Example: Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6...
-
   schemas:
-    # ===== Core domain =====
-    Session:
-      type: object
-      description: Lecture or meeting session
+    AdminSessionListItem:
       properties:
         id:
           type: string
+          title: Id
         userId:
           type: string
-          description: Owner user identifier (Firebase UID or email)
-        mode:
-          type: string
-          enum: [lecture, meeting]
+          title: Userid
         title:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
         createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-          nullable: true
-        audioPath:
-          type: string
-          nullable: true
-          description: Storage path (e.g., gs://bucket/... )
-        contentType:
-          type: string
-          nullable: true
-          example: audio/wav
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
         durationSec:
           type: number
-          format: float
-          nullable: true
+          title: Durationsec
+          default: 0.0
+        status:
+          type: string
+          title: Status
+          default: created
+        mode:
+          type: string
+          title: Mode
+          default: lecture
+        audioStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Audiostatus
         summaryStatus:
-          type: string
-          nullable: true
-          enum: [pending, running, completed, failed]
-        transcriptLength:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summarystatus
+        sizeBytes:
           type: integer
-          nullable: true
-        speakers:
-          type: array
-          description: Speaker list used for diarization (事後処理)
-          items:
-            $ref: "#/components/schemas/Speaker"
-        segments:
-          type: array
-          description: Diarized transcript segments (optional)
-          items:
-            $ref: "#/components/schemas/Segment"
+          title: Sizebytes
+          default: 0
+      type: object
+      required:
+      - id
+      - userId
+      title: AdminSessionListItem
+    AppStoreNotificationRequest:
+      properties:
+        signedPayload:
+          type: string
+          title: Signedpayload
+      type: object
+      required:
+      - signedPayload
+      title: AppStoreNotificationRequest
+    AssetItem:
+      properties:
+        status:
+          $ref: '#/components/schemas/AssetStatus'
+        version:
+          type: integer
+          title: Version
+          default: 1
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+        contentType:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Contenttype
+        sizeBytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Sizebytes
+        sha256:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sha256
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        lockedReason:
+          anyOf:
+          - type: string
+            enum:
+            - paywall
+            - quota
+            - ownerOnly
+          - type: 'null'
+          title: Lockedreason
+      type: object
+      required:
+      - status
+      title: AssetItem
+    AssetManifest:
+      properties:
+        audio:
+          anyOf:
+          - $ref: '#/components/schemas/AssetItem'
+          - type: 'null'
+        transcript:
+          anyOf:
+          - $ref: '#/components/schemas/AssetItem'
+          - type: 'null'
         summary:
-          $ref: "#/components/schemas/Summary"
+          anyOf:
+          - $ref: '#/components/schemas/AssetItem'
+          - type: 'null'
         quiz:
-          $ref: "#/components/schemas/QuizResponse"
-      required:
-        - id
-        - userId
-        - mode
-        - title
-        - createdAt
-
-    Speaker:
+          anyOf:
+          - $ref: '#/components/schemas/AssetItem'
+          - type: 'null'
+        playlist:
+          anyOf:
+          - $ref: '#/components/schemas/AssetItem'
+          - type: 'null'
+        images:
+          additionalProperties:
+            $ref: '#/components/schemas/AssetItem'
+          type: object
+          title: Images
+          default: {}
       type: object
+      title: AssetManifest
+    AssetResolveRequest:
       properties:
-        id:
-          type: string
-          description: Internal speaker id (e.g., spk_0)
-        label:
-          type: string
-          description: Short label (e.g., "A", "B", "自分")
-        display_name:
-          type: string
-          description: Human-readable display name (e.g., "話者A")
-      required:
-        - id
-        - label
-
-    Segment:
+        types:
+          items:
+            type: string
+            enum:
+            - audio
+            - summary
+            - quiz
+            - transcript
+          type: array
+          title: Types
       type: object
-      description: A diarized segment of the transcript
-      properties:
-        startSec:
-          type: number
-          format: float
-        endSec:
-          type: number
-          format: float
-        speakerId:
-          type: string
-        text:
-          type: string
       required:
-        - startSec
-        - endSec
-        - speakerId
-        - text
-
-    # ===== Requests =====
-    CreateSessionRequest:
-      type: object
+      - types
+      title: AssetResolveRequest
+    AssetResolveResponse:
       properties:
-        mode:
-          type: string
-          enum: [lecture, meeting]
-        title:
-          type: string
-          description: Optional initial title
-        userId:
-          type: string
-          description: Firebase UID or email
+        assets:
+          additionalProperties:
+            $ref: '#/components/schemas/ResolvedAsset'
+          type: object
+          title: Assets
+      type: object
       required:
-        - mode
-        - userId
-
-    UploadUrlRequest:
-      type: object
+      - assets
+      title: AssetResolveResponse
+    AssetStatus:
+      type: string
+      enum:
+      - ready
+      - processing
+      - missing
+      - error
+      title: AssetStatus
+    AudioCommitRequest:
       properties:
-        sessionId:
+        storagePath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Storagepath
+        sizeBytes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Sizebytes
+        contentType:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Contenttype
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        metadata:
+          anyOf:
+          - $ref: '#/components/schemas/AudioMeta'
+          - type: 'null'
+        expectedSizeBytes:
+          type: integer
+          title: Expectedsizebytes
+        expectedPayloadSha256:
           type: string
-        mode:
+          title: Expectedpayloadsha256
+      type: object
+      required:
+      - expectedSizeBytes
+      - expectedPayloadSha256
+      title: AudioCommitRequest
+    AudioCommitResponse:
+      properties:
+        status:
+          $ref: '#/components/schemas/AudioStatus'
+        deleteAfterAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Deleteafterat
+      type: object
+      required:
+      - status
+      title: AudioCommitResponse
+    AudioMeta:
+      properties:
+        variant:
           type: string
-          enum: [lecture, meeting]
+          title: Variant
+          default: compressed
+        codec:
+          type: string
+          title: Codec
+        container:
+          type: string
+          title: Container
+        sampleRate:
+          type: integer
+          title: Samplerate
+        channels:
+          type: integer
+          title: Channels
+        sizeBytes:
+          type: integer
+          title: Sizebytes
+        payloadSha256:
+          type: string
+          title: Payloadsha256
+        bitrate:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Bitrate
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        originalSha256:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Originalsha256
+      type: object
+      required:
+      - codec
+      - container
+      - sampleRate
+      - channels
+      - sizeBytes
+      - payloadSha256
+      title: AudioMeta
+    AudioPrepareRequest:
+      properties:
         contentType:
           type: string
-          example: audio/wav
-      required:
-        - sessionId
-        - mode
-        - contentType
-
-    UploadUrlResponse:
+          title: Contenttype
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        sampleRate:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Samplerate
+        bitrate:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Bitrate
+        codec:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Codec
+        appVersion:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Appversion
       type: object
+      required:
+      - contentType
+      title: AudioPrepareRequest
+    AudioPrepareResponse:
       properties:
         uploadUrl:
           type: string
-          description: Signed URL to upload audio via PUT
+          title: Uploadurl
         method:
           type: string
-          example: PUT
+          title: Method
         headers:
+          additionalProperties: true
           type: object
-          additionalProperties:
-            type: string
-          description: Optional headers to include in PUT (e.g., Content-Type)
-      required:
-        - uploadUrl
-
-    StartTranscribeRequest:
+          title: Headers
+        storagePath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Storagepath
+        deleteAfterAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Deleteafterat
       type: object
+      required:
+      - uploadUrl
+      - method
+      - headers
+      title: AudioPrepareResponse
+    AudioStatus:
+      type: string
+      enum:
+      - pending
+      - uploading
+      - uploaded
+      - processing
+      - ready
+      - failed
+      - expired
+      - unknown
+      title: AudioStatus
+    BatchDeleteRequest:
       properties:
-        mode:
-          type: string
-          enum: [lecture, meeting]
-      required:
-        - mode
-
-    StartTranscribeResponse:
+        ids:
+          items:
+            type: string
+          type: array
+          title: Ids
       type: object
+      required:
+      - ids
+      title: BatchDeleteRequest
+    BillingConfirmRequest:
+      properties:
+        signedTransaction:
+          type: string
+          title: Signedtransaction
+      type: object
+      required:
+      - signedTransaction
+      title: BillingConfirmRequest
+    BillingConfirmResponse:
+      properties:
+        ok:
+          type: boolean
+          title: Ok
+        plan:
+          type: string
+          title: Plan
+        status:
+          type: string
+          title: Status
+        entitled:
+          type: boolean
+          title: Entitled
+        expiresAt:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Expiresat
+        originalTransactionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Originaltransactionid
+        transactionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transactionid
+        productId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Productid
+        requestId:
+          type: string
+          title: Requestid
+      type: object
+      required:
+      - ok
+      - plan
+      - status
+      - entitled
+      - requestId
+      title: BillingConfirmResponse
+    CalendarSyncRequest:
+      properties:
+        userId:
+          type: string
+          title: Userid
+        calendarId:
+          type: string
+          title: Calendarid
+          default: primary
+      type: object
+      required:
+      - userId
+      title: CalendarSyncRequest
+    CalendarSyncStatusResponse:
       properties:
         status:
           type: string
-          example: started
-        sessionId:
-          type: string
+          title: Status
+        eventId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Eventid
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+        errorReason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorreason
+      type: object
       required:
-        - status
-        - sessionId
-
-    TranscriptRefreshResponse:
-      type: object
-      properties:
-        status:
-          type: string
-          enum: [pending, running, completed, failed]
-        transcriptText:
-          type: string
-          nullable: true
-        speakers:
-          type: array
-          items:
-            $ref: "#/components/schemas/Speaker"
-        segments:
-          type: array
-          items:
-            $ref: "#/components/schemas/Segment"
-      required:
-        - status
-
-    # ===== Summary / Quiz / QA =====
-    Summary:
-      type: object
-      nullable: true
-      properties:
-        overview:
-          type: string
-        points:
-          type: array
-          items:
-            type: string
-        keywords:
-          type: array
-          items:
-            type: string
-
-    SummaryResponse:
-      type: object
-      properties:
-        summary:
-          $ref: "#/components/schemas/Summary"
-      required:
-        - summary
-
-    QuizQuestion:
-      type: object
+      - status
+      title: CalendarSyncStatusResponse
+    CapabilitiesResponse:
       properties:
         id:
           type: string
-        question:
+          title: Id
+          default: capabilities
+        plan:
           type: string
-        choices:
-          type: array
-          items:
-            type: string
-        correctIndex:
+          title: Plan
+        canRealtimeTranslate:
+          type: boolean
+          title: Canrealtimetranslate
+        sttPostEngine:
+          type: string
+          title: Sttpostengine
+        monthlyRecordingLimitMin:
           type: integer
-        explanation:
-          type: string
-          nullable: true
+          title: Monthlyrecordinglimitmin
+        remainingRecordingMin:
+          type: integer
+          title: Remainingrecordingmin
+        canRegenerateTranscript:
+          type: boolean
+          title: Canregeneratetranscript
+        maxSessions:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Maxsessions
+        maxSummaries:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Maxsummaries
+        maxQuizzes:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Maxquizzes
+      type: object
       required:
-        - id
-        - question
-        - choices
-        - correctIndex
-
-    QuizResponse:
-      type: object
-      nullable: true
+      - plan
+      - canRealtimeTranslate
+      - sttPostEngine
+      - monthlyRecordingLimitMin
+      - remainingRecordingMin
+      - canRegenerateTranscript
+      title: CapabilitiesResponse
+    ClaimUsernameRequest:
       properties:
-        questions:
-          type: array
-          items:
-            $ref: "#/components/schemas/QuizQuestion"
-
-    QaRequest:
-      type: object
-      properties:
-        question:
+        username:
           type: string
-      required:
-        - question
-
-    QaCitation:
+          title: Username
+          description: '3-20 chars: a-z0-9_'
       type: object
+      required:
+      - username
+      title: ClaimUsernameRequest
+    CreateSessionRequest:
+      properties:
+        title:
+          type: string
+          title: Title
+        mode:
+          type: string
+          title: Mode
+          default: lecture
+        userId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Userid
+        tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Tags
+        status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+        startAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Startat
+        endAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Endat
+        syncToGoogleCalendar:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Synctogooglecalendar
+          default: false
+        visibility:
+          type: string
+          title: Visibility
+          default: private
+        transcriptionMode:
+          anyOf:
+          - $ref: '#/components/schemas/TranscriptionMode'
+          - type: 'null'
+          default: cloud_google
+      type: object
+      required:
+      - title
+      title: CreateSessionRequest
+    DecisionResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        sessionId:
+          type: string
+          title: Sessionid
+        content:
+          type: string
+          title: Content
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+      type: object
+      required:
+      - id
+      - sessionId
+      - content
+      title: DecisionResponse
+    DerivedStatusResponse:
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        jobId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Jobid
+        result:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Result
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+        errorReason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorreason
+        modelInfo:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Modelinfo
+        idempotencyKey:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotencykey
+      type: object
+      required:
+      - status
+      title: DerivedStatusResponse
+    PlaylistArtifactResponse:
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        jobId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Jobid
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+        items:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/PlaylistItem'
+            type: array
+          - type: 'null'
+          title: Items
+        errorReason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorreason
+        modelInfo:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Modelinfo
+        idempotencyKey:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotencykey
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Version
+      type: object
+      required:
+      - status
+      title: PlaylistArtifactResponse
+    DeviceSyncRequest:
+      properties:
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
+        segments:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/DiarizedSegment'
+            type: array
+          - type: 'null'
+          title: Segments
+        notes:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Notes
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        audioPath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Audiopath
+        audioMeta:
+          anyOf:
+          - $ref: '#/components/schemas/AudioMeta'
+          - type: 'null'
+        needsPlaylist:
+          type: boolean
+          title: Needsplaylist
+          default: true
+      type: object
+      title: DeviceSyncRequest
+    DiarizedSegment:
       properties:
         startSec:
           type: number
-          format: float
+          title: Startsec
         endSec:
           type: number
-          format: float
+          title: Endsec
+        summary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summary
+        label:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Label
+        segments:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Segments
+        speakerId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Speakerid
         text:
           type: string
-      required:
-        - startSec
-        - endSec
-        - text
-
-    QaResponse:
+          title: Text
       type: object
-      properties:
-        answer:
-          type: string
-        citations:
-          type: array
-          items:
-            $ref: "#/components/schemas/QaCitation"
       required:
-        - answer
+      - startSec
+      - endSec
+      - text
+      title: DiarizedSegment
+      description: 話者分離セグメント（iOS オンデバイス STT から送信）
+    EntitlementResponse:
+      properties:
+        entitled:
+          type: boolean
+          title: Entitled
+        plan:
+          type: string
+          title: Plan
+        expiresAt:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Expiresat
+      type: object
+      required:
+      - entitled
+      - plan
+      title: EntitlementResponse
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    Highlight:
+      properties:
+        id:
+          type: string
+          title: Id
+        type:
+          $ref: '#/components/schemas/HighlightType'
+        startSec:
+          type: number
+          title: Startsec
+        endSec:
+          type: number
+          title: Endsec
+        text:
+          type: string
+          title: Text
+      type: object
+      required:
+      - id
+      - type
+      - startSec
+      - endSec
+      - text
+      title: Highlight
+    HighlightType:
+      type: string
+      enum:
+      - important
+      - question
+      - todo
+      - other
+      title: HighlightType
+    HighlightsResponse:
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        highlights:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/Highlight'
+            type: array
+          - type: 'null'
+          title: Highlights
+        tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Tags
+      type: object
+      required:
+      - status
+      title: HighlightsResponse
+    ImageNoteDTO:
+      properties:
+        id:
+          type: string
+          title: Id
+        url:
+          type: string
+          title: Url
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+      type: object
+      required:
+      - id
+      - url
+      title: ImageNoteDTO
+    ImageUploadUrlRequest:
+      properties:
+        contentType:
+          type: string
+          title: Contenttype
+          default: image/jpeg
+      type: object
+      title: ImageUploadUrlRequest
+    ImageUploadUrlResponse:
+      properties:
+        imageId:
+          type: string
+          title: Imageid
+        uploadUrl:
+          type: string
+          title: Uploadurl
+        storagePath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Storagepath
+        method:
+          type: string
+          title: Method
+          default: PUT
+      type: object
+      required:
+      - imageId
+      - uploadUrl
+      title: ImageUploadUrlResponse
+    ImportYouTubeRequest:
+      properties:
+        url:
+          type: string
+          title: Url
+        mode:
+          type: string
+          enum:
+          - lecture
+          - meeting
+          title: Mode
+          default: lecture
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        language:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Language
+          default: ja
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
+        transcriptLang:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcriptlang
+        isAutoGenerated:
+          type: boolean
+          title: Isautogenerated
+          default: false
+      type: object
+      required:
+      - url
+      title: ImportYouTubeRequest
+    ImportYouTubeResponse:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        transcriptStatus:
+          type: string
+          title: Transcriptstatus
+          default: ready
+        summaryStatus:
+          type: string
+          title: Summarystatus
+          default: pending
+        quizStatus:
+          type: string
+          title: Quizstatus
+          default: pending
+        sourceUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sourceurl
+      type: object
+      required:
+      - sessionId
+      title: ImportYouTubeResponse
+    JobRequest:
+      properties:
+        type:
+          type: string
+          enum:
+          - summary
+          - quiz
+          - explain
+          - playlist
+          - calendar_sync
+          - transcribe
+          - generate_highlights
+          - diarize
+          - translate
+          - qa
+          title: Type
+        params:
+          additionalProperties: true
+          type: object
+          title: Params
+          default: {}
+        idempotencyKey:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotencykey
+      type: object
+      required:
+      - type
+      title: JobRequest
+    JobResponse:
+      properties:
+        jobId:
+          type: string
+          title: Jobid
+        type:
+          type: string
+          enum:
+          - summary
+          - quiz
+          - explain
+          - playlist
+          - calendar_sync
+          - transcribe
+          - generate_highlights
+          - diarize
+          - translate
+          - qa
+          title: Type
+        status:
+          type: string
+          title: Status
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        errorReason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorreason
+        result:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Result
+        progress:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Progress
+          default: 0.0
+        pollUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: PollUrl
+          description: Full path for polling this job, e.g. /sessions/{sid}/jobs/{jobId}
+      type: object
+      required:
+      - jobId
+      - type
+      - status
+      - createdAt
+      title: JobResponse
+      description: Response from job creation or status query. Use pollUrl for polling.
+    JobStatus:
+      type: string
+      enum:
+      - pending
+      - running
+      - completed
+      - failed
+      title: JobStatus
+    JoinSessionRequest:
+      properties:
+        code:
+          type: string
+          title: Code
+      type: object
+      required:
+      - code
+      title: JoinSessionRequest
+    LineAuthRequest:
+      properties:
+        idToken:
+          type: string
+          title: Idtoken
+        nonce:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Nonce
+      type: object
+      required:
+      - idToken
+      title: LineAuthRequest
+    LineAuthResponse:
+      properties:
+        firebaseCustomToken:
+          type: string
+          title: Firebasecustomtoken
+      type: object
+      required:
+      - firebaseCustomToken
+      title: LineAuthResponse
+    MeResponse:
+      properties:
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        hasUsername:
+          type: boolean
+          title: Hasusername
+          default: false
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        photoUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Photourl
+        providers:
+          items:
+            type: string
+          type: array
+          title: Providers
+          default: []
+        provider:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Provider
+        allowSearch:
+          type: boolean
+          title: Allowsearch
+          default: true
+        shareCode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sharecode
+        isShareable:
+          type: boolean
+          title: Isshareable
+          default: true
+        plan:
+          type: string
+          title: Plan
+          default: free
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+        securityState:
+          type: string
+          title: Securitystate
+          default: normal
+        riskScore:
+          type: integer
+          title: Riskscore
+          default: 0
+        freeCloudCreditsRemaining:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Freecloudcreditsremaining
+      type: object
+      required:
+      - uid
+      title: MeResponse
+    MeUpdateRequest:
+      properties:
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        allowSearch:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Allowsearch
+        isShareable:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Isshareable
+      type: object
+      title: MeUpdateRequest
+    NotesUpdateRequest:
+      properties:
+        notes:
+          type: string
+          title: Notes
+      type: object
+      required:
+      - notes
+      title: NotesUpdateRequest
+    OverviewResponse:
+      properties:
+        total_users:
+          type: integer
+          title: Total Users
+        dau:
+          type: integer
+          title: Dau
+        wau:
+          type: integer
+          title: Wau
+        mau:
+          type: integer
+          title: Mau
+        new_users_today:
+          type: integer
+          title: New Users Today
+        new_users_7d:
+          type: integer
+          title: New Users 7D
+        total_sessions_today:
+          type: integer
+          title: Total Sessions Today
+        total_sessions_7d:
+          type: integer
+          title: Total Sessions 7D
+        total_recording_sec_today:
+          type: number
+          title: Total Recording Sec Today
+        total_recording_sec_7d:
+          type: number
+          title: Total Recording Sec 7D
+        estimated_cost_today_usd:
+          type: number
+          title: Estimated Cost Today Usd
+        estimated_cost_7d_usd:
+          type: number
+          title: Estimated Cost 7D Usd
+        jobs_failed_24h:
+          type: integer
+          title: Jobs Failed 24H
+      type: object
+      required:
+      - total_users
+      - dau
+      - wau
+      - mau
+      - new_users_today
+      - new_users_7d
+      - total_sessions_today
+      - total_sessions_7d
+      - total_recording_sec_today
+      - total_recording_sec_7d
+      - estimated_cost_today_usd
+      - estimated_cost_7d_usd
+      - jobs_failed_24h
+      title: OverviewResponse
+    PlaylistItem:
+      properties:
+        id:
+          type: string
+          title: Id
+        title:
+          type: string
+          title: Title
+        startSec:
+          type: number
+          title: Startsec
+        endSec:
+          type: number
+          title: Endsec
+        speakerId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Speakerid
+        snippet:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Snippet
+        type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Type
+        confidence:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Confidence
+        order:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Order
+      type: object
+      required:
+      - id
+      - title
+      - startSec
+      - endSec
+      title: PlaylistItem
+    PricingConfig:
+      properties:
+        llm_input_per_1k_tokens_usd:
+          type: number
+          title: Llm Input Per 1K Tokens Usd
+          default: 0.0015
+        llm_output_per_1k_tokens_usd:
+          type: number
+          title: Llm Output Per 1K Tokens Usd
+          default: 0.002
+        storage_gb_month_usd:
+          type: number
+          title: Storage Gb Month Usd
+          default: 0.02
+        egress_gb_usd:
+          type: number
+          title: Egress Gb Usd
+          default: 0.12
+        speech_per_min_usd:
+          type: number
+          title: Speech Per Min Usd
+          default: 0.024
+        cloudrun_shared_monthly_usd:
+          type: number
+          title: Cloudrun Shared Monthly Usd
+          default: 50.0
+        firestore_shared_monthly_usd:
+          type: number
+          title: Firestore Shared Monthly Usd
+          default: 20.0
+      type: object
+      title: PricingConfig
+    PublicUser:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        photoUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Photourl
+        providers:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Providers
+        allowSearch:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Allowsearch
+      type: object
+      required:
+      - uid
+      title: PublicUser
+    QaStatusResponse:
+      properties:
+        qaId:
+          type: string
+          title: Qaid
+        sessionId:
+          type: string
+          title: Sessionid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        question:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Question
+        answer:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Answer
+        citations:
+          anyOf:
+          - items: {}
+            type: array
+          - type: 'null'
+          title: Citations
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+      type: object
+      required:
+      - qaId
+      - sessionId
+      - status
+      title: QaStatusResponse
+    QuizAnalytics:
+      properties:
+        attempts:
+          type: integer
+          title: Attempts
+        completedAttempts:
+          type: integer
+          title: Completedattempts
+        completionRate:
+          type: number
+          title: Completionrate
+        avgAccuracy:
+          type: number
+          title: Avgaccuracy
+        avgAnswered:
+          type: number
+          title: Avganswered
+        sessionsWithQuiz:
+          type: integer
+          title: Sessionswithquiz
+          default: 0
+        sessionsTested:
+          type: integer
+          title: Sessionstested
+          default: 0
+      type: object
+      required:
+      - attempts
+      - completedAttempts
+      - completionRate
+      - avgAccuracy
+      - avgAnswered
+      title: QuizAnalytics
+    QuizAnswerRequest:
+      properties:
+        answerIndex:
+          type: integer
+          title: Answerindex
+      type: object
+      required:
+      - answerIndex
+      title: QuizAnswerRequest
+    QuizAttempt:
+      properties:
+        quizVersion:
+          type: integer
+          title: Quizversion
+          default: 1
+        total:
+          type: integer
+          title: Total
+        answered:
+          type: integer
+          title: Answered
+        correct:
+          type: integer
+          title: Correct
+        durationSec:
+          type: number
+          title: Durationsec
+        completed:
+          type: boolean
+          title: Completed
+        answers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Answers
+        id:
+          type: string
+          title: Id
+        sessionId:
+          type: string
+          title: Sessionid
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        userId:
+          type: string
+          title: Userid
+      type: object
+      required:
+      - total
+      - answered
+      - correct
+      - durationSec
+      - completed
+      - id
+      - sessionId
+      - createdAt
+      - userId
+      title: QuizAttempt
+    QuizAttemptCreate:
+      properties:
+        quizVersion:
+          type: integer
+          title: Quizversion
+          default: 1
+        total:
+          type: integer
+          title: Total
+        answered:
+          type: integer
+          title: Answered
+        correct:
+          type: integer
+          title: Correct
+        durationSec:
+          type: number
+          title: Durationsec
+        completed:
+          type: boolean
+          title: Completed
+        answers:
+          anyOf:
+          - additionalProperties:
+              type: string
+            type: object
+          - type: 'null'
+          title: Answers
+      type: object
+      required:
+      - total
+      - answered
+      - correct
+      - durationSec
+      - completed
+      title: QuizAttemptCreate
+    RankingItem:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        value:
+          type: number
+          title: Value
+        unit:
+          type: string
+          title: Unit
+      type: object
+      required:
+      - uid
+      - value
+      - unit
+      title: RankingItem
+    ReactionStateResponse:
+      properties:
+        myEmoji:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Myemoji
+        counts:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Counts
+          default: {}
+      type: object
+      title: ReactionStateResponse
+    ResolvedAsset:
+      properties:
+        url:
+          type: string
+          title: Url
+        headers:
+          additionalProperties:
+            type: string
+          type: object
+          title: Headers
+          default: {}
+        expiresAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Expiresat
+        sha256:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sha256
+        version:
+          type: integer
+          title: Version
+          default: 1
+        contentType:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Contenttype
+        format:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Format
+      type: object
+      required:
+      - url
+      title: ResolvedAsset
+    RetryTranscriptionRequest:
+      properties:
+        mode:
+          type: string
+          title: Mode
+          default: cloud_google
+      type: object
+      title: RetryTranscriptionRequest
+    SessionDetailResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        title:
+          type: string
+          title: Title
+        mode:
+          type: string
+          title: Mode
+        userId:
+          type: string
+          title: Userid
+        status:
+          type: string
+          title: Status
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        tags:
+          items:
+            type: string
+          type: array
+          title: Tags
+          default: []
+        isOwner:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Isowner
+        sharedWithCount:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Sharedwithcount
+        sharedUserIds:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Shareduserids
+          default: []
+        reactionCounts:
+          anyOf:
+          - additionalProperties:
+              type: integer
+            type: object
+          - type: 'null'
+          title: Reactioncounts
+          default: {}
+        ownerUserId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Owneruserid
+        participantUserIds:
+          items:
+            type: string
+          type: array
+          title: Participantuserids
+          default: []
+        participants:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Participants
+        visibility:
+          type: string
+          title: Visibility
+          default: private
+        autoTags:
+          items:
+            type: string
+          type: array
+          title: Autotags
+          default: []
+        topicSummary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Topicsummary
+        summaryStatus:
+          anyOf:
+          - $ref: '#/components/schemas/JobStatus'
+          - type: 'null'
+          default: pending
+        quizStatus:
+          anyOf:
+          - $ref: '#/components/schemas/JobStatus'
+          - type: 'null'
+          default: pending
+        explainStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Explainstatus
+          default: not_started
+        diarizationStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Diarizationstatus
+          default: not_started
+        highlightsStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Highlightsstatus
+          default: not_started
+        isArchived:
+          type: boolean
+          title: Isarchived
+          default: false
+        lastOpenedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastopenedat
+        startedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Startedat
+        endedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Endedat
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        hasTranscript:
+          type: boolean
+          title: Hastranscript
+          default: false
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
+        notes:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Notes
+        assets:
+          anyOf:
+          - $ref: '#/components/schemas/AssetResolveResponse'
+          - type: 'null'
+        googleCalendar:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Googlecalendar
+        reactionIncr:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Reactionincr
+          default: 0
+        segments:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Segments
+        diarizedSegments:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Diarizedsegments
+        audioStatus:
+          anyOf:
+          - $ref: '#/components/schemas/AudioStatus'
+          - type: 'null'
+          default: unknown
+        audioMeta:
+          anyOf:
+          - $ref: '#/components/schemas/AudioMeta'
+          - type: 'null'
+        summaryError:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summaryerror
+        summaryMarkdown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summarymarkdown
+        quizError:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quizerror
+        quizMarkdown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quizmarkdown
+        quizJson:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quizjson
+        playlistStatus:
+          anyOf:
+          - $ref: '#/components/schemas/JobStatus'
+          - type: 'null'
+        playlist:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/PlaylistItem'
+            type: array
+          - type: 'null'
+          title: Playlist
+        audioPath:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Audiopath
+        speakers:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Speakers
+        hasSummary:
+          type: boolean
+          title: Hassummary
+          default: false
+        hasQuiz:
+          type: boolean
+          title: Hasquiz
+          default: false
+      type: object
+      required:
+      - id
+      - title
+      - mode
+      - userId
+      - status
+      - createdAt
+      title: SessionDetailResponse
+    SessionMemberInviteRequest:
+      properties:
+        userId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Userid
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        role:
+          type: string
+          title: Role
+          default: viewer
+      type: object
+      title: SessionMemberInviteRequest
+    SessionMemberResponse:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        userId:
+          type: string
+          title: Userid
+        role:
+          type: string
+          title: Role
+        joinedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Joinedat
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+        displayNameSnapshot:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displaynamesnapshot
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        photoUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Photourl
+      type: object
+      required:
+      - sessionId
+      - userId
+      - role
+      title: SessionMemberResponse
+    SessionMemberUpdateRequest:
+      properties:
+        role:
+          type: string
+          title: Role
+      type: object
+      required:
+      - role
+      title: SessionMemberUpdateRequest
+    SessionMetaUpdateRequest:
+      properties:
+        isPinned:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Ispinned
+        isArchived:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Isarchived
+        lastOpenedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastopenedat
+      type: object
+      title: SessionMetaUpdateRequest
+    SessionQuizStat:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        title:
+          type: string
+          title: Title
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        attemptsCount:
+          type: integer
+          title: Attemptscount
+        bestAccuracy:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Bestaccuracy
+        lastAccuracy:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Lastaccuracy
+        completionRate:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Completionrate
+        lastAttemptAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastattemptat
+      type: object
+      required:
+      - sessionId
+      - title
+      - createdAt
+      - attemptsCount
+      title: SessionQuizStat
+    SessionResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        title:
+          type: string
+          title: Title
+        mode:
+          type: string
+          title: Mode
+        userId:
+          type: string
+          title: Userid
+        status:
+          type: string
+          title: Status
+        createdAt:
+          type: string
+          format: date-time
+          title: Createdat
+        tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Tags
+        isOwner:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Isowner
+        sharedWithCount:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Sharedwithcount
+        sharedUserIds:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Shareduserids
+          default: []
+        reactionCounts:
+          anyOf:
+          - additionalProperties:
+              type: integer
+            type: object
+          - type: 'null'
+          title: Reactioncounts
+          default: {}
+        ownerUserId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Owneruserid
+        participantUserIds:
+          items:
+            type: string
+          type: array
+          title: Participantuserids
+          default: []
+        participants:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Participants
+        visibility:
+          type: string
+          title: Visibility
+          default: private
+        autoTags:
+          items:
+            type: string
+          type: array
+          title: Autotags
+          default: []
+        topicSummary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Topicsummary
+        summaryStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summarystatus
+          default: not_started
+        quizStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Quizstatus
+          default: not_started
+        explainStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Explainstatus
+          default: not_started
+        diarizationStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Diarizationstatus
+          default: not_started
+        highlightsStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Highlightsstatus
+          default: not_started
+        isArchived:
+          type: boolean
+          title: Isarchived
+          default: false
+        lastOpenedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastopenedat
+        startedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Startedat
+        endedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Endedat
+        durationSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Durationsec
+        hasTranscript:
+          type: boolean
+          title: Hastranscript
+          default: false
+        cloudTicket:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Cloudticket
+        cloudAllowedUntil:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Cloudalloweduntil
+        cloudStatus:
+          anyOf:
+          - type: string
+            enum: ["none", "allowed", "limited", "blocked"]
+          - type: 'null'
+          title: Cloudstatus
+      type: object
+      required:
+      - id
+      - title
+      - mode
+      - userId
+      - status
+      - createdAt
+      title: SessionResponse
+    SetReactionRequest:
+      properties:
+        emoji:
+          anyOf:
+          - type: string
+            enum:
+            - 🔥
+            - 👏
+            - 😇
+            - 🤯
+            - 🫶
+          - type: 'null'
+          title: Emoji
+      type: object
+      title: SetReactionRequest
+    ShareByCodeRequest:
+      properties:
+        targetShareCode:
+          type: string
+          title: Targetsharecode
+      type: object
+      required:
+      - targetShareCode
+      title: ShareByCodeRequest
+    ShareCodeLookupResponse:
+      properties:
+        userId:
+          type: string
+          title: Userid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+      type: object
+      required:
+      - userId
+      title: ShareCodeLookupResponse
+    ShareCodeResponse:
+      properties:
+        shareCode:
+          type: string
+          title: Sharecode
+      type: object
+      required:
+      - shareCode
+      title: ShareCodeResponse
+    ShareLinkResponse:
+      properties:
+        url:
+          type: string
+          title: Url
+      type: object
+      required:
+      - url
+      title: ShareLinkResponse
+    ShareLookupRequest:
+      properties:
+        code:
+          type: string
+          title: Code
+      type: object
+      required:
+      - code
+      title: ShareLookupRequest
+    ShareLookupResponse:
+      properties:
+        found:
+          type: boolean
+          title: Found
+        targetUserId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Targetuserid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        photoUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Photourl
+      type: object
+      required:
+      - found
+      title: ShareLookupResponse
+    ShareResponse:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        sharedUserIds:
+          items:
+            type: string
+          type: array
+          title: Shareduserids
+      type: object
+      required:
+      - sessionId
+      - sharedUserIds
+      title: ShareResponse
+    SharedSessionDTO:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        title:
+          type: string
+          title: Title
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
+        summaryMarkdown:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summarymarkdown
+        ownerDisplayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ownerdisplayname
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+      type: object
+      required:
+      - sessionId
+      - title
+      title: SharedSessionDTO
+    SharedUserSummary:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Username
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        photoUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Photourl
+        isShareable:
+          type: boolean
+          title: Isshareable
+          default: true
+      type: object
+      required:
+      - uid
+      title: SharedUserSummary
+    SignedCompressedAudioResponse:
+      properties:
+        audioUrl:
+          type: string
+          title: Audiourl
+        expiresAt:
+          type: string
+          format: date-time
+          title: Expiresat
+        compressionMetadata:
+          anyOf:
+          - $ref: '#/components/schemas/AudioMeta'
+          - type: 'null'
+      type: object
+      required:
+      - audioUrl
+      - expiresAt
+      title: SignedCompressedAudioResponse
+    SubscriptionVerifyRequest:
+      properties:
+        isSubscribed:
+          type: boolean
+          title: Issubscribed
+        originalTransactionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Originaltransactionid
+        productId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Productid
+        purchaseDate:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Purchasedate
+        expirationDate:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Expirationdate
+        environment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Environment
+        maxImageNotes:
+          type: integer
+          title: Maximagenotes
+          default: 3
+        transactionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transactionid
+        signedTransactionInfo:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Signedtransactioninfo
+        receipt_data:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Receipt Data
+      type: object
+      required:
+      - isSubscribed
+      title: SubscriptionVerifyRequest
+    TagUpdateRequest:
+      properties:
+        tags:
+          items:
+            type: string
+          type: array
+          title: Tags
+      type: object
+      required:
+      - tags
+      title: TagUpdateRequest
+    TaskResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        sessionId:
+          type: string
+          title: Sessionid
+        userId:
+          type: string
+          title: Userid
+        title:
+          type: string
+          title: Title
+        assignee:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Assignee
+        dueDate:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Duedate
+        status:
+          type: string
+          title: Status
+          default: open
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          default: ai
+      type: object
+      required:
+      - id
+      - sessionId
+      - userId
+      - title
+      title: TaskResponse
+    TranscriptChunkAppendRequest:
+      properties:
+        chunks:
+          items:
+            $ref: '#/components/schemas/TranscriptChunkInput'
+          type: array
+          title: Chunks
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          default: device
+        updateSessionTranscript:
+          type: boolean
+          title: Updatesessiontranscript
+          default: false
+        finalize:
+          type: boolean
+          title: Finalize
+          default: false
+      type: object
+      required:
+      - chunks
+      title: TranscriptChunkAppendRequest
+    TranscriptChunkAppendResponse:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+        chunkIds:
+          items:
+            type: string
+          type: array
+          title: Chunkids
+        count:
+          type: integer
+          title: Count
+        status:
+          $ref: '#/components/schemas/JobStatus'
+          default: completed
+      type: object
+      required:
+      - sessionId
+      - chunkIds
+      - count
+      title: TranscriptChunkAppendResponse
+    TranscriptChunkInput:
+      properties:
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Id
+        startMs:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Startms
+        endMs:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Endms
+        speakerId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Speakerid
+        text:
+          type: string
+          title: Text
+        kind:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Kind
+          default: final
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Version
+      type: object
+      required:
+      - text
+      title: TranscriptChunkInput
+    TranscriptChunkReplaceRequest:
+      properties:
+        chunks:
+          items:
+            $ref: '#/components/schemas/TranscriptChunkInput'
+          type: array
+          title: Chunks
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          default: batch
+        updateSessionTranscript:
+          type: boolean
+          title: Updatesessiontranscript
+          default: false
+      type: object
+      required:
+      - chunks
+      title: TranscriptChunkReplaceRequest
+    TranscriptUpdateRequest:
+      properties:
+        transcriptText:
+          type: string
+          title: Transcripttext
+        segments:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/DiarizedSegment'
+            type: array
+          - type: 'null'
+          title: Segments
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          default: device
+      type: object
+      required:
+      - transcriptText
+      title: TranscriptUpdateRequest
+      description: 文字起こしアップロード（iOS から transcript + segments を送信）
+    TranscriptUploadRequest:
+      properties:
+        text:
+          type: string
+          title: Text
+        source:
+          type: string
+          title: Source
+        modelInfo:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Modelinfo
+        processingTimeSec:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Processingtimesec
+        isFinal:
+          type: boolean
+          title: Isfinal
+          default: true
+      type: object
+      required:
+      - text
+      - source
+      title: TranscriptUploadRequest
+    TranscriptionMode:
+      type: string
+      enum:
+      - cloud_google
+      - device_sherpa
+      - device_apple
+      - dual_cloud_and_device
+      title: TranscriptionMode
+    UpdateSessionRequest:
+      properties:
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        tags:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Tags
+        status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Status
+        visibility:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Visibility
+      type: object
+      title: UpdateSessionRequest
+      description: PATCH 部分更新。指定したフィールドだけ更新。
+    UsageSummaryResponse:
+      properties:
+        user_id:
+          type: string
+          title: User Id
+        from_date:
+          type: string
+          title: From Date
+        to_date:
+          type: string
+          title: To Date
+        total_recording_sec:
+          type: number
+          title: Total Recording Sec
+          default: 0.0
+        session_count:
+          type: integer
+          title: Session Count
+          default: 0
+        summary_invocations:
+          type: integer
+          title: Summary Invocations
+          default: 0
+        summary_success:
+          type: integer
+          title: Summary Success
+          default: 0
+        quiz_invocations:
+          type: integer
+          title: Quiz Invocations
+          default: 0
+        quiz_success:
+          type: integer
+          title: Quiz Success
+          default: 0
+        diarization_invocations:
+          type: integer
+          title: Diarization Invocations
+          default: 0
+        qa_invocations:
+          type: integer
+          title: Qa Invocations
+          default: 0
+        llm_input_tokens:
+          type: integer
+          title: Llm Input Tokens
+          default: 0
+        llm_output_tokens:
+          type: integer
+          title: Llm Output Tokens
+          default: 0
+        share_count:
+          type: integer
+          title: Share Count
+          default: 0
+        export_count:
+          type: integer
+          title: Export Count
+          default: 0
+        passRate:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Passrate
+        topTags:
+          anyOf:
+          - items: {}
+            type: array
+          - type: 'null'
+          title: Toptags
+        timeline_daily:
+          anyOf:
+          - items: {}
+            type: array
+          - type: 'null'
+          title: Timeline Daily
+        by_mode:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: By Mode
+      type: object
+      required:
+      - user_id
+      - from_date
+      - to_date
+      title: UsageSummaryResponse
+      description: Response for /me/usage-summary
+    UserDetailResponse:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        plan:
+          type: string
+          title: Plan
+          default: free
+        providers:
+          items:
+            type: string
+          type: array
+          title: Providers
+          default: []
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+        lastSeenAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastseenat
+        session_count_30d:
+          type: integer
+          title: Session Count 30D
+          default: 0
+        total_recording_min_30d:
+          type: number
+          title: Total Recording Min 30D
+          default: 0.0
+        total_recording_min_lifetime:
+          type: number
+          title: Total Recording Min Lifetime
+          default: 0.0
+        estimated_cost_30d_usd:
+          type: number
+          title: Estimated Cost 30D Usd
+          default: 0.0
+        active_badge:
+          type: string
+          title: Active Badge
+          default: inactive
+        session_count_lifetime:
+          type: integer
+          title: Session Count Lifetime
+          default: 0
+        llm_input_tokens_30d:
+          type: integer
+          title: Llm Input Tokens 30D
+          default: 0
+        llm_output_tokens_30d:
+          type: integer
+          title: Llm Output Tokens 30D
+          default: 0
+        audio_bytes_30d:
+          type: integer
+          title: Audio Bytes 30D
+          default: 0
+      type: object
+      required:
+      - uid
+      title: UserDetailResponse
+    UserProfileResponse:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        shareCode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sharecode
+        isShareable:
+          type: boolean
+          title: Isshareable
+          default: true
+      type: object
+      required:
+      - uid
+      title: UserProfileResponse
+    UserProfileUpdateRequest:
+      properties:
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        isShareable:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Isshareable
+      type: object
+      title: UserProfileUpdateRequest
+    UserSummary:
+      properties:
+        uid:
+          type: string
+          title: Uid
+        displayName:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Displayname
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+        plan:
+          type: string
+          title: Plan
+          default: free
+        providers:
+          items:
+            type: string
+          type: array
+          title: Providers
+          default: []
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+        lastSeenAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Lastseenat
+        session_count_30d:
+          type: integer
+          title: Session Count 30D
+          default: 0
+        total_recording_min_30d:
+          type: number
+          title: Total Recording Min 30D
+          default: 0.0
+        total_recording_min_lifetime:
+          type: number
+          title: Total Recording Min Lifetime
+          default: 0.0
+        estimated_cost_30d_usd:
+          type: number
+          title: Estimated Cost 30D Usd
+          default: 0.0
+        active_badge:
+          type: string
+          title: Active Badge
+          default: inactive
+      type: object
+      required:
+      - uid
+      title: UserSummary
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+  parameters:
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      description: クライアント側のリクエストID。未指定の場合はサーバ側で生成する。
+      required: false
+      schema:
+        type: string
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      description: 冪等性キー。重複送信時の安全な再実行判定に利用する。
+      required: false
+      schema:
+        type: string
+  headers:
+    RequestId:
+      description: リクエスト追跡用のID。
+      schema:
+        type: string
+  securitySchemes:
+    OAuth2PasswordBearer:
+      type: oauth2
+      flows:
+        password:
+          scopes: {}
+          tokenUrl: token

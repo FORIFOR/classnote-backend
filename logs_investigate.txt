@@ -1,0 +1,667 @@
+2026-01-06 05:22:30 INFO:     169.254.169.126:51716 - "POST /sessions/lecture-1767568426636-4e11be/jobs HTTP/1.1" 200 OK
+2026-01-06 05:22:30 INFO:     169.254.169.126:51726 - "POST /internal/tasks/quiz HTTP/1.1" 200 OK
+2026-01-06 05:27:09 DEBUG: app/main.py starting...
+2026-01-06 05:27:12 INFO:     Started server process [1]
+2026-01-06 05:27:12 INFO:     Waiting for application startup.
+2026-01-06 05:27:12 INFO:     Application startup complete.
+2026-01-06 05:27:12 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 05:28:15 INFO:     Shutting down
+2026-01-06 05:28:15 INFO:     Shutting down
+2026-01-06 05:28:15 INFO:     Waiting for application shutdown.
+2026-01-06 05:28:15 INFO:     Application shutdown complete.
+2026-01-06 05:28:15 INFO:     Finished server process [1]
+2026-01-06 05:28:15 INFO:     Waiting for application shutdown.
+2026-01-06 05:28:15 INFO:     Application shutdown complete.
+2026-01-06 05:28:15 INFO:     Finished server process [1]
+2026-01-06 05:32:13 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be
+2026-01-06 05:32:13 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:14 INFO:     169.254.169.126:58080 - "GET /sessions/lecture-1767568426636-4e11be HTTP/1.1" 200 OK
+2026-01-06 05:32:14 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be/artifacts/summary
+2026-01-06 05:32:15 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:15 INFO:     169.254.169.126:58096 - "GET /sessions/lecture-1767568426636-4e11be/artifacts/summary HTTP/1.1" 200 OK
+2026-01-06 05:32:17 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767568426636-4e11be/jobs
+2026-01-06 05:32:18 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 05:32:18 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 05:32:18 INFO:     169.254.169.126:1718 - "POST /sessions/lecture-1767568426636-4e11be/jobs HTTP/1.1" 200 OK
+2026-01-06 05:32:18 INFO:     169.254.169.126:1732 - "POST /internal/tasks/quiz HTTP/1.1" 200 OK
+2026-01-06 05:47:26 INFO:     Shutting down
+2026-01-06 05:47:26 INFO:     Waiting for application shutdown.
+2026-01-06 05:47:26 INFO:     Application shutdown complete.
+2026-01-06 05:47:26 INFO:     Finished server process [1]
+2026-01-06 06:56:39 DEBUG: app/main.py starting...
+2026-01-06 06:56:41 INFO:     Started server process [1]
+2026-01-06 06:56:41 INFO:     Waiting for application startup.
+2026-01-06 06:56:41 INFO:     Application startup complete.
+2026-01-06 06:56:41 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:04:39 DEBUG: app/main.py starting...
+2026-01-06 07:04:42 INFO:     Started server process [1]
+2026-01-06 07:04:42 INFO:     Waiting for application startup.
+2026-01-06 07:04:42 INFO:     Application startup complete.
+2026-01-06 07:04:42 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:05:25 POST 500 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:05:26 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:05:26 Failed to enqueue youtube import task: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:26 Failed to enqueue youtube import for lecture-1767683126502-1965ce: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:26 Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 75, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 438, in result
+    raise self
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 1180, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 996, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+2026-01-06 07:05:26 	status = StatusCode.INVALID_ARGUMENT
+2026-01-06 07:05:26 	details = "Task.dispatchDeadline must be between [15s, 30m]."
+2026-01-06 07:05:26 	debug_error_string = "UNKNOWN:Error received from peer ipv4:172.217.31.138:443 {grpc_status:3, grpc_message:"Task.dispatchDeadline must be between [15s, 30m]."}"
+2026-01-06 07:05:26 >
+2026-01-06 07:05:26 The above exception was the direct cause of the following exception:
+2026-01-06 07:05:26 Traceback (most recent call last):
+  File "/app/app/routes/imports.py", line 158, in import_youtube
+    enqueue_youtube_import_task(session_id, req.url, language=req.language or "ja")
+  File "/app/app/task_queue.py", line 528, in enqueue_youtube_import_task
+    raise e
+  File "/app/app/task_queue.py", line 524, in enqueue_youtube_import_task
+    tasks_client.create_task(parent=parent, task=task)
+  File "/usr/local/lib/python3.11/site-packages/google/cloud/tasks_v2/services/cloud_tasks/client.py", line 2557, in create_task
+    response = rpc(
+               ^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/gapic_v1/method.py", line 131, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 77, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.InvalidArgument: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 07:05:27 INFO:     169.254.169.126:53194 - "POST /imports/youtube HTTP/1.1" 500 Internal Server Error
+2026-01-06 07:05:59 INFO:     Shutting down
+2026-01-06 07:05:59 INFO:     Waiting for application shutdown.
+2026-01-06 07:05:59 INFO:     Application shutdown complete.
+2026-01-06 07:05:59 INFO:     Finished server process [1]
+2026-01-06 07:10:39 DEBUG: app/main.py starting...
+2026-01-06 07:10:41 INFO:     Started server process [1]
+2026-01-06 07:10:41 INFO:     Waiting for application startup.
+2026-01-06 07:10:41 INFO:     Application startup complete.
+2026-01-06 07:10:41 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:10:58 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:10:59 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:10:59 INFO:     169.254.169.126:32274 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:10:59 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:10:59 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767683459018-5d7a33
+2026-01-06 07:11:01 [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:11:01 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:11:02 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:11:02 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:11:02 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:11:02 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:11:02 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:11:03 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683459018-5d7a33_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:11:03 YouTube Import Failed for lecture-1767683459018-5d7a33
+2026-01-06 07:11:03 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 32, in _download_and_convert
+    subprocess.check_call([
+  File "/usr/local/lib/python3.11/subprocess.py", line 413, in check_call
+    raise CalledProcessError(retcode, cmd)
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683459018-5d7a33_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:11:03 During handling of the above exception, another exception occurred:
+2026-01-06 07:11:03 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 150, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 41, in _download_and_convert
+    raise ValueError("Failed to download video (yt-dlp error)")
+ValueError: Failed to download video (yt-dlp error)
+2026-01-06 07:11:03 INFO:     169.254.169.126:32298 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:11:03 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:11:03 INFO:     169.254.169.126:32306 - "GET /sessions/lecture-1767683459018-5d7a33 HTTP/1.1" 200 OK
+2026-01-06 07:11:51 INFO:     Shutting down
+2026-01-06 07:11:51 INFO:     Waiting for application shutdown.
+2026-01-06 07:11:51 INFO:     Application shutdown complete.
+2026-01-06 07:11:51 INFO:     Finished server process [1]
+2026-01-06 07:15:46 DEBUG: app/main.py starting...
+2026-01-06 07:15:48 INFO:     Started server process [1]
+2026-01-06 07:15:48 INFO:     Waiting for application startup.
+2026-01-06 07:15:48 INFO:     Application startup complete.
+2026-01-06 07:15:48 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:16:36 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:16:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:16:37 INFO:     169.254.169.126:53066 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:16:37 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:16:38 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767683797202-202d5f
+2026-01-06 07:16:41 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683797202-202d5f_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:16:41 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:16:41 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:16:41 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:16:41 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:16:41 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:16:41 YouTube Import Failed for lecture-1767683797202-202d5f
+2026-01-06 07:16:41 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767683797202-202d5f_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:16:41 During handling of the above exception, another exception occurred:
+2026-01-06 07:16:41 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:16:41 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:16:41 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:16:41 INFO:     169.254.169.126:55066 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:16:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:16:41 INFO:     169.254.169.126:55078 - "GET /sessions/lecture-1767683797202-202d5f HTTP/1.1" 200 OK
+2026-01-06 07:16:52 INFO:     Shutting down
+2026-01-06 07:16:52 INFO:     Waiting for application shutdown.
+2026-01-06 07:16:52 INFO:     Application shutdown complete.
+2026-01-06 07:16:52 INFO:     Finished server process [1]
+2026-01-06 07:22:23 DEBUG: app/main.py starting...
+2026-01-06 07:22:26 INFO:     Started server process [1]
+2026-01-06 07:22:26 INFO:     Waiting for application startup.
+2026-01-06 07:22:26 INFO:     Application startup complete.
+2026-01-06 07:22:26 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:22:41 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:22:42 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:22:42 INFO:     169.254.169.126:21926 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:22:42 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:22:44 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684162401-ded6bb
+2026-01-06 07:22:46 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684162401-ded6bb_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:22:46 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:22:46 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:22:46 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:22:46 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:22:46 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:22:46 YouTube Import Failed for lecture-1767684162401-ded6bb
+2026-01-06 07:22:46 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684162401-ded6bb_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:22:46 During handling of the above exception, another exception occurred:
+2026-01-06 07:22:46 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:22:46 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:22:46 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:22:46 INFO:     169.254.169.126:21928 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:22:46 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:22:46 INFO:     169.254.169.126:39490 - "GET /sessions/lecture-1767684162401-ded6bb HTTP/1.1" 200 OK
+2026-01-06 07:23:31 INFO:     Shutting down
+2026-01-06 07:23:31 INFO:     Waiting for application shutdown.
+2026-01-06 07:23:31 INFO:     Application shutdown complete.
+2026-01-06 07:23:31 INFO:     Finished server process [1]
+2026-01-06 07:23:38 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:23:38 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:23:39 INFO:     169.254.169.126:7114 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:23:39 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:23:39 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684218708-16d760
+2026-01-06 07:23:41 yt-dlp failed: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684218708-16d760_in.%(ext)s', 'https://www.youtube.com/watch?v=BaW_jenozKc']' returned non-zero exit status 1.
+2026-01-06 07:23:41 yt-dlp stderr: WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:23:41 ERROR: [youtube] BaW_jenozKc: Video unavailable
+2026-01-06 07:23:41 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=BaW_jenozKc
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading webpage
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading android sdkless player API JSON
+2026-01-06 07:23:41 [youtube] BaW_jenozKc: Downloading web safari player API JSON
+2026-01-06 07:23:41 YouTube Import Failed for lecture-1767684218708-16d760
+2026-01-06 07:23:41 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684218708-16d760_in.%(ext)s', 'https://www.youtube.com/watch?v=BaW_jenozKc']' returned non-zero exit status 1.
+2026-01-06 07:23:41 During handling of the above exception, another exception occurred:
+2026-01-06 07:23:41 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 153, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 44, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:23:41 ERROR: [youtube] BaW_jenozKc: Video unavailable
+2026-01-06 07:23:41 INFO:     169.254.169.126:7124 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:23:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:23:41 INFO:     169.254.169.126:7132 - "GET /sessions/lecture-1767684218708-16d760 HTTP/1.1" 200 OK
+2026-01-06 07:27:52 DEBUG: app/main.py starting...
+2026-01-06 07:27:54 INFO:     Started server process [1]
+2026-01-06 07:27:54 INFO:     Waiting for application startup.
+2026-01-06 07:27:54 INFO:     Application startup complete.
+2026-01-06 07:27:54 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:28:11 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:28:12 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:28:12 INFO:     169.254.169.126:41266 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:28:12 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:28:13 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684492310-bbda75
+2026-01-06 07:28:15 yt-dlp failed: Command '['yt-dlp', '--js-runtimes', 'nodejs', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684492310-bbda75_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:28:15 yt-dlp stderr: WARNING: Ignoring unsupported JavaScript runtime(s): nodejs. Supported runtimes: deno, node, bun, quickjs.
+2026-01-06 07:28:15 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:28:15 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:28:15 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:28:15 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
+2026-01-06 07:28:15 [youtube] jNQXAC9IVRw: Downloading webpage
+2026-01-06 07:28:15 [youtube] jNQXAC9IVRw: Downloading android sdkless player API JSON
+2026-01-06 07:28:15 [youtube] jNQXAC9IVRw: Downloading web safari player API JSON
+2026-01-06 07:28:15 YouTube Import Failed for lecture-1767684492310-bbda75
+2026-01-06 07:28:15 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--js-runtimes', 'nodejs', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684492310-bbda75_in.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw']' returned non-zero exit status 1.
+2026-01-06 07:28:15 During handling of the above exception, another exception occurred:
+2026-01-06 07:28:15 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 155, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 46, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: Ignoring unsupported JavaScript runtime(s): nodejs. Supported runtimes: deno, node, bun, quickjs.
+2026-01-06 07:28:15 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:28:15 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:28:15 ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:28:15 INFO:     169.254.169.126:41282 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:28:16 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:28:16 INFO:     169.254.169.126:41286 - "GET /sessions/lecture-1767684492310-bbda75 HTTP/1.1" 200 OK
+2026-01-06 07:28:57 INFO:     Shutting down
+2026-01-06 07:28:57 INFO:     Waiting for application shutdown.
+2026-01-06 07:28:57 INFO:     Application shutdown complete.
+2026-01-06 07:28:57 INFO:     Finished server process [1]
+2026-01-06 07:29:11 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:29:11 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:29:11 INFO:     169.254.169.126:26828 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:29:11 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/import_youtube
+2026-01-06 07:29:12 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767684551313-17ad71
+2026-01-06 07:29:14 yt-dlp failed: Command '['yt-dlp', '--js-runtimes', 'nodejs', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684551313-17ad71_in.%(ext)s', 'https://www.youtube.com/watch?v=M7FIvfx5J10']' returned non-zero exit status 1.
+2026-01-06 07:29:14 yt-dlp stderr: WARNING: Ignoring unsupported JavaScript runtime(s): nodejs. Supported runtimes: deno, node, bun, quickjs.
+2026-01-06 07:29:14 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:29:14 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:29:14 ERROR: [youtube] M7FIvfx5J10: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:29:14 yt-dlp stdout: [youtube] Extracting URL: https://www.youtube.com/watch?v=M7FIvfx5J10
+2026-01-06 07:29:14 [youtube] M7FIvfx5J10: Downloading webpage
+2026-01-06 07:29:14 [youtube] M7FIvfx5J10: Downloading android sdkless player API JSON
+2026-01-06 07:29:14 [youtube] M7FIvfx5J10: Downloading web safari player API JSON
+2026-01-06 07:29:14 YouTube Import Failed for lecture-1767684551313-17ad71
+2026-01-06 07:29:14 Traceback (most recent call last):
+  File "/app/app/services/youtube.py", line 33, in _download_and_convert
+    subprocess.run([
+  File "/usr/local/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['yt-dlp', '--js-runtimes', 'nodejs', '--no-playlist', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', '/tmp/lecture-1767684551313-17ad71_in.%(ext)s', 'https://www.youtube.com/watch?v=M7FIvfx5J10']' returned non-zero exit status 1.
+2026-01-06 07:29:14 During handling of the above exception, another exception occurred:
+2026-01-06 07:29:14 Traceback (most recent call last):
+  File "/app/app/routes/tasks.py", line 239, in handle_import_youtube_task
+    transcript = process_youtube_import(session_id, url, language=language)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 155, in process_youtube_import
+    local_audio = _download_and_convert(url, session_id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/services/youtube.py", line 46, in _download_and_convert
+    raise ValueError(f"Failed to download video (yt-dlp error): {e.stderr}")
+ValueError: Failed to download video (yt-dlp error): WARNING: Ignoring unsupported JavaScript runtime(s): nodejs. Supported runtimes: deno, node, bun, quickjs.
+2026-01-06 07:29:14 WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+2026-01-06 07:29:14 WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+2026-01-06 07:29:14 ERROR: [youtube] M7FIvfx5J10: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+2026-01-06 07:29:14 INFO:     169.254.169.126:26834 - "POST /internal/tasks/import_youtube HTTP/1.1" 200 OK
+2026-01-06 07:29:14 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:29:14 INFO:     169.254.169.126:26846 - "GET /sessions/lecture-1767684551313-17ad71 HTTP/1.1" 200 OK
+2026-01-06 07:44:21 INFO:     Shutting down
+2026-01-06 07:44:21 INFO:     Waiting for application shutdown.
+2026-01-06 07:44:21 INFO:     Application shutdown complete.
+2026-01-06 07:44:21 INFO:     Finished server process [1]
+2026-01-06 07:55:40 DEBUG: app/main.py starting...
+2026-01-06 07:55:43 INFO:     Started server process [1]
+2026-01-06 07:55:43 INFO:     Waiting for application startup.
+2026-01-06 07:55:43 INFO:     Application startup complete.
+2026-01-06 07:55:43 INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+2026-01-06 07:55:59 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:56:00 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:56:00 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/summarize
+2026-01-06 07:56:01 INFO:     169.254.169.126:8344 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:56:01 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:03 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767686160507-4048fb
+2026-01-06 07:56:09 /usr/local/lib/python3.11/site-packages/vertexai/generative_models/_generative_models.py:433: UserWarning: This feature is deprecated as of June 24, 2025 and will be removed on June 24, 2026. For details, see https://cloud.google.com/vertex-ai/generative-ai/docs/deprecations/genai-vertexai-sdk.
+2026-01-06 07:56:09   warning_logs.show_deprecation_warning()
+2026-01-06 07:56:09 INFO:     169.254.169.126:37246 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:09 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:09 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:56:09 INFO:     169.254.169.126:37262 - "GET /sessions/lecture-1767686160507-4048fb HTTP/1.1" 200 OK
+2026-01-06 07:56:09 INFO:     169.254.169.126:37266 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:10 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:10 INFO:     169.254.169.126:37268 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:11 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:11 INFO:     169.254.169.126:37278 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:12 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:12 INFO:     169.254.169.126:17350 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:13 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:13 INFO:     169.254.169.126:17366 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:15 INFO:     169.254.169.126:8346 - "POST /internal/tasks/summarize HTTP/1.1" 200 OK
+2026-01-06 07:56:17 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:17 INFO:     169.254.169.126:17374 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:23 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:23 INFO:     169.254.169.126:45180 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:56:36 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:56:36 INFO:     169.254.169.126:57088 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:57:02 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:57:02 INFO:     169.254.169.126:61296 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:57:53 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:57:53 INFO:     169.254.169.126:38412 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:00 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/imports/youtube
+2026-01-06 07:58:00 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:58:00 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/summarize
+2026-01-06 07:58:00 INFO:     169.254.169.126:38422 - "POST /imports/youtube HTTP/1.1" 200 OK
+2026-01-06 07:58:01 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:01 INFO:     169.254.169.126:50146 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:02 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:02 INFO:     169.254.169.126:50158 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:03 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767686280406-acb9cc
+2026-01-06 07:58:03 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:03 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:58:03 INFO:     169.254.169.126:50160 - "GET /sessions/lecture-1767686280406-acb9cc HTTP/1.1" 200 OK
+2026-01-06 07:58:03 INFO:     169.254.169.126:50174 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:04 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:04 INFO:     169.254.169.126:50178 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:05 INFO:     169.254.169.126:38430 - "POST /internal/tasks/summarize HTTP/1.1" 200 OK
+2026-01-06 07:58:05 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:05 INFO:     169.254.169.126:50182 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:06 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/lecture-1767686280406-acb9cc
+2026-01-06 07:58:06 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 07:58:06 INFO:     169.254.169.126:50190 - "GET /sessions/lecture-1767686280406-acb9cc HTTP/1.1" 200 OK
+2026-01-06 07:58:07 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:07 INFO:     169.254.169.126:50198 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:10 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:10 INFO:     169.254.169.126:50206 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:17 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:17 INFO:     169.254.169.126:48896 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:30 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:30 INFO:     169.254.169.126:63628 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:58:55 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:58:55 INFO:     169.254.169.126:20846 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:59:36 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:59:36 INFO:     169.254.169.126:23038 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 07:59:47 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 07:59:47 INFO:     169.254.169.126:32266 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:01:29 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:01:29 INFO:     169.254.169.126:25986 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:03:01 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:03:01 INFO:     169.254.169.126:12162 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:04:54 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:04:54 INFO:     169.254.169.126:57532 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:09:50 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:09:50 INFO:     169.254.169.126:60794 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:11:44 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:11:44 INFO:     169.254.169.126:34028 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:23:30 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:23:30 INFO:     169.254.169.126:17658 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:25:23 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:25:23 INFO:     169.254.169.126:33414 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:31:34 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me
+2026-01-06 08:31:34 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me
+2026-01-06 08:31:35 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:31:35 INFO:     169.254.169.126:34052 - "GET /users/me HTTP/1.1" 200 OK
+2026-01-06 08:31:35 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me/subscription
+2026-01-06 08:31:36 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:31:36 INFO:     169.254.169.126:34066 - "GET /users/me HTTP/1.1" 200 OK
+2026-01-06 08:31:36 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:31:37 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions
+2026-01-06 08:31:37 AppStoreService not initialized. Missing environment variables.
+2026-01-06 08:31:37 INFO:     169.254.169.126:34076 - "POST /users/me/subscription HTTP/1.1" 200 OK
+2026-01-06 08:31:37 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:31:37 /usr/local/lib/python3.11/site-packages/google/cloud/firestore_v1/base_collection.py:315: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+2026-01-06 08:31:37   return query.where(field_path, op_string, value)
+2026-01-06 08:31:37 INFO:     169.254.169.126:34092 - "GET /sessions HTTP/1.1" 200 OK
+2026-01-06 08:36:48 POST 201 https://classnote-api-900324644592.asia-northeast1.run.app/sessions
+2026-01-06 08:36:49 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:36:49 INFO:     169.254.169.126:23578 - "POST /sessions HTTP/1.1" 201 Created
+2026-01-06 08:37:32 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/audio:prepareUpload
+2026-01-06 08:37:32 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:32 INFO:     169.254.169.126:10506 - "POST /sessions/meeting-1767688609154-c029ae/audio%3AprepareUpload HTTP/1.1" 200 OK
+2026-01-06 08:37:33 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/audio:commit
+2026-01-06 08:37:33 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:33 Failed to enqueue transcribe task: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 08:37:33 Failed to enqueue transcribe task after commit: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 08:37:33 INFO:     169.254.169.126:10510 - "POST /sessions/meeting-1767688609154-c029ae/audio%3Acommit HTTP/1.1" 200 OK
+2026-01-06 08:37:33 POST 500 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/jobs
+2026-01-06 08:37:34 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:34 Failed to enqueue transcribe task: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 08:37:34 INFO:     169.254.169.126:10520 - "POST /sessions/meeting-1767688609154-c029ae/jobs HTTP/1.1" 500 Internal Server Error
+2026-01-06 08:37:34 ERROR:    Exception in ASGI application
+2026-01-06 08:37:34 Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 75, in error_remapped_callable
+    return callable_(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 276, in __call__
+    response, ignored_call = self._with_call(
+                             ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 331, in _with_call
+    return call.result(), call
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 438, in result
+    raise self
+  File "/usr/local/lib/python3.11/site-packages/grpc/_interceptor.py", line 314, in continuation
+    response, call = self._thunk(new_method).with_call(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 1180, in with_call
+    return _end_unary_response_blocking(state, call, True, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/grpc/_channel.py", line 996, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+2026-01-06 08:37:34 	status = StatusCode.INVALID_ARGUMENT
+2026-01-06 08:37:34 	details = "Task.dispatchDeadline must be between [15s, 30m]."
+2026-01-06 08:37:34 	debug_error_string = "UNKNOWN:Error received from peer ipv4:142.250.199.138:443 {grpc_message:"Task.dispatchDeadline must be between [15s, 30m].", grpc_status:3}"
+2026-01-06 08:37:34 >
+2026-01-06 08:37:34 The above exception was the direct cause of the following exception:
+2026-01-06 08:37:34 Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 416, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1135, in __call__
+    await super().__call__(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/middleware/cors.py", line 85, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 115, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 101, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 355, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 243, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/app/routes/sessions.py", line 1230, in create_job
+    enqueue_transcribe_task(session_id, force=force, engine=engine)
+  File "/app/app/task_queue.py", line 495, in enqueue_transcribe_task
+    raise e
+  File "/app/app/task_queue.py", line 491, in enqueue_transcribe_task
+    tasks_client.create_task(parent=parent, task=task)
+  File "/usr/local/lib/python3.11/site-packages/google/cloud/tasks_v2/services/cloud_tasks/client.py", line 2557, in create_task
+    response = rpc(
+               ^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/gapic_v1/method.py", line 131, in __call__
+    return wrapped_func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/timeout.py", line 130, in func_with_timeout
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/site-packages/google/api_core/grpc_helpers.py", line 77, in error_remapped_callable
+    raise exceptions.from_grpc_error(exc) from exc
+google.api_core.exceptions.InvalidArgument: 400 Task.dispatchDeadline must be between [15s, 30m].
+2026-01-06 08:37:34 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/transcript
+2026-01-06 08:37:34 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:34 INFO:     169.254.169.126:10530 - "POST /sessions/meeting-1767688609154-c029ae/transcript HTTP/1.1" 200 OK
+2026-01-06 08:37:35 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:37:35 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:35 INFO:     169.254.169.126:10534 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:37:35 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/users/me
+2026-01-06 08:37:36 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:36 INFO:     169.254.169.126:10542 - "GET /users/me HTTP/1.1" 200 OK
+2026-01-06 08:37:36 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/reaction
+2026-01-06 08:37:36 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:36 INFO:     169.254.169.126:10556 - "GET /sessions/meeting-1767688609154-c029ae/reaction HTTP/1.1" 200 OK
+2026-01-06 08:37:39 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/image_notes/upload_url
+2026-01-06 08:37:39 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:40 INFO:     169.254.169.126:10566 - "POST /sessions/meeting-1767688609154-c029ae/image_notes/upload_url HTTP/1.1" 200 OK
+2026-01-06 08:37:40 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:37:40 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:37:40 INFO:     169.254.169.126:10570 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:38:13 PATCH 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/notes
+2026-01-06 08:38:14 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:14 INFO:     169.254.169.126:61454 - "PATCH /sessions/meeting-1767688609154-c029ae/notes HTTP/1.1" 200 OK
+2026-01-06 08:38:20 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/transcript
+2026-01-06 08:38:20 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:20 INFO:     169.254.169.126:61464 - "POST /sessions/meeting-1767688609154-c029ae/transcript HTTP/1.1" 200 OK
+2026-01-06 08:38:20 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/jobs
+2026-01-06 08:38:20 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:21 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/summarize
+2026-01-06 08:38:21 INFO:     169.254.169.126:61478 - "POST /sessions/meeting-1767688609154-c029ae/jobs HTTP/1.1" 200 OK
+2026-01-06 08:38:21 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:38:21 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:21 INFO:     169.254.169.126:61490 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:38:21 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/summary
+2026-01-06 08:38:22 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:22 INFO:     169.254.169.126:59638 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/summary HTTP/1.1" 200 OK
+2026-01-06 08:38:24 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:38:24 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:24 INFO:     169.254.169.126:59642 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:38:24 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/summary
+2026-01-06 08:38:25 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:25 INFO:     169.254.169.126:59648 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/summary HTTP/1.1" 200 OK
+2026-01-06 08:38:27 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:38:27 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:27 INFO:     169.254.169.126:59656 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:38:27 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/summary
+2026-01-06 08:38:28 INFO:     169.254.169.126:61484 - "POST /internal/tasks/summarize HTTP/1.1" 200 OK
+2026-01-06 08:38:28 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:38:28 INFO:     169.254.169.126:59658 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/summary HTTP/1.1" 200 OK
+2026-01-06 08:40:40 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/transcript
+2026-01-06 08:40:40 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:40 INFO:     169.254.169.126:6536 - "POST /sessions/meeting-1767688609154-c029ae/transcript HTTP/1.1" 200 OK
+2026-01-06 08:40:40 POST 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/jobs
+2026-01-06 08:40:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:41 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:41 INFO:     169.254.169.126:6552 - "POST /sessions/meeting-1767688609154-c029ae/jobs HTTP/1.1" 200 OK
+2026-01-06 08:40:41 INFO:     169.254.169.126:10906 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:41 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:41 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:41 INFO:     169.254.169.126:10920 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:42 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:42 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:42 INFO:     169.254.169.126:10934 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:42 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:42 INFO:     169.254.169.126:10948 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:43 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:43 INFO:     169.254.169.126:10962 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:44 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:44 INFO:     169.254.169.126:10964 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:44 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:44 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:44 INFO:     169.254.169.126:10972 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:45 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:45 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:45 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:45 INFO:     169.254.169.126:10988 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:45 INFO:     169.254.169.126:11002 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:47 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:47 INFO:     169.254.169.126:11012 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:47 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:48 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:48 INFO:     169.254.169.126:11024 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:48 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:48 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:48 INFO:     169.254.169.126:11034 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:50 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:50 INFO:     169.254.169.126:11040 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:50 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:50 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:50 INFO:     169.254.169.126:11042 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:50 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:51 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:51 INFO:     169.254.169.126:11052 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:53 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:53 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:53 INFO:     169.254.169.126:58138 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:53 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:54 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:54 INFO:     169.254.169.126:58144 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:56 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae
+2026-01-06 08:40:56 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:56 INFO:     169.254.169.126:58156 - "GET /sessions/meeting-1767688609154-c029ae HTTP/1.1" 200 OK
+2026-01-06 08:40:56 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:40:56 POST 404 https://classnote-api-900324644592.asia-northeast1.run.app/internal/tasks/quiz
+2026-01-06 08:40:57 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:40:57 INFO:     169.254.169.126:58168 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
+2026-01-06 08:40:57 INFO:     169.254.169.126:58180 - "POST /internal/tasks/quiz HTTP/1.1" 404 Not Found
+2026-01-06 08:40:59 GET 200 https://classnote-api-900324644592.asia-northeast1.run.app/sessions/meeting-1767688609154-c029ae/artifacts/quiz
+2026-01-06 08:41:00 Auth get_user error: The credential used to initialize the SDK has insufficient permissions to perform the requested operation. See https://firebase.google.com/docs/admin/setup for details on how to initialize the Admin SDK with appropriate permissions (INSUFFICIENT_PERMISSION).
+2026-01-06 08:41:00 INFO:     169.254.169.126:58210 - "GET /sessions/meeting-1767688609154-c029ae/artifacts/quiz HTTP/1.1" 200 OK
