@@ -422,12 +422,20 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
     [OFFLINE-FIRST] Check if user can create a new session.
     Returns True if allowed.
     Raises HTTPException (402/403/409) if limit reached.
+
+    Plan limits:
+    - free: 1 active session, 1 cloud credit
+    - basic: 20 sessions/month
+    - pro (Premium): UNLIMITED
     """
-    # txn = db.transaction() # Not used here, using usage_logger
-    
     user_snapshot = db.collection("users").document(user_uid).get()
     user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
     plan = user_data.get("plan", "free")
+
+    # [PREMIUM] Pro users have NO limits - early return
+    if plan == "pro":
+        logger.debug(f"[Premium] User {user_uid} has unlimited access (plan=pro)")
+        return True
 
     is_cloud_request = (transcription_mode == "cloud_google")
 
@@ -1569,13 +1577,16 @@ async def create_job(
     # [SUBSCRIPTION LIMIT] Check Plan for AI Features
     user_doc = db.collection("users").document(current_user.uid).get()
     plan = user_doc.to_dict().get("plan", "free") if user_doc.exists else "free"
-    
-    # Paid-only features
-    # Paid-only features (Strictly blocked for Free)
-    # [Mod] Summary and Quiz are now allowed ONCE for Free plan.
+
+    # Features that are ONLY available on paid plans (not even 1-time for free)
     PAID_FEATURES_STRICT = ["explain", "translate"]
-    
-    if plan == "free":
+
+    # [PREMIUM] Pro users have unlimited access to ALL features
+    # Skip all limit checks and proceed directly to job creation
+    if plan == "pro":
+        logger.debug(f"[Premium] User {current_user.uid} has unlimited access to {req.type}")
+        pass  # Fall through to job creation with no restrictions
+    elif plan == "free":
         if req.type in PAID_FEATURES_STRICT:
              raise HTTPException(status_code=403, detail=f"{req.type} requires a paid subscription.")
         
