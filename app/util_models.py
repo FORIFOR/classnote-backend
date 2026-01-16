@@ -282,6 +282,7 @@ class AudioMeta(BaseModel):
 class AudioPrepareRequest(BaseModel):
     contentType: str
     durationSec: Optional[float] = None
+    fileSize: Optional[int] = None # [Security] Check upload size
     sampleRate: Optional[int] = None
     bitrate: Optional[int] = None
     codec: Optional[str] = None

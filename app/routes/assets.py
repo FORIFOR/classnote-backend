@@ -346,13 +346,13 @@ async def ensure_asset_generation(
         
     # Trigger Logic
     if asset_type == "summary":
-        enqueue_summarize_task(session_id)
+        enqueue_summarize_task(session_id, user_id=current_user.uid)
     elif asset_type == "quiz":
-        enqueue_quiz_task(session_id)
+        enqueue_quiz_task(session_id, user_id=current_user.uid)
     elif asset_type == "playlist":
-        enqueue_playlist_task(session_id)
+        enqueue_playlist_task(session_id, user_id=current_user.uid)
     elif asset_type == "explain":
-        enqueue_explain_task(session_id)
+        enqueue_explain_task(session_id, user_id=current_user.uid)
     else:
         raise HTTPException(400, f"Unsupported asset type for ensure: {asset_type}")
         

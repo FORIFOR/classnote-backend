@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from app.streaming_stt_v2 import StreamingSTTV2, compute_audio_stats
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME
+from google.cloud import firestore
 from app.services.usage import usage_logger
 
 router = APIRouter()
@@ -44,87 +45,82 @@ def _extract_seq_and_pcm(data: bytes) -> tuple[Optional[int], bytes]:
 @router.websocket("/ws/stream/{session_id}")
 async def ws_stream(websocket: WebSocket, session_id: str):
     await websocket.accept()
+    logger.info(f"[/ws/stream] WebSocket connected session_id={session_id}")
 
-    doc_ref = _session_doc_ref(session_id)
-    doc = doc_ref.get()
+    # Session State Data (Defined early for scope)
+    session_data = {}
+    uid = None
+    start_time = time.time()
+    MAX_STREAM_DURATION = 7200 # Default 2h
 
-    if not doc.exists:
-        logger.warning(f"[/ws/stream] Session not found: {session_id}")
-        await websocket.close(code=4000, reason="session_not_found")
-        return
+    # --- Connection Phase (Validation & Locks) ---
+    try:
+        doc_ref = _session_doc_ref(session_id)
+        doc = doc_ref.get()
 
-    session_data = doc.to_dict()
-    
-    
-    # Limit checks for Free Plan (Credit Based)
-    uid = session_data.get("userId") or session_data.get("ownerUserId") or session_data.get("ownerId")
-    if uid:
-        # [Security] Blocked/Restricted check
-        if not await usage_logger.check_security_state(uid):
-             logger.warning(f"[/ws/stream] Security block for user {uid}")
-             await websocket.close(code=4003, reason="security_block")
-             return
-
-        # [Security] Concurrent connection lock (Atomic)
-        # Using a specialized collection to track active streams
-        lock_ref = db.collection("active_streams").document(uid)
-        
-        @firestore.transactional
-        def txn_lock(transaction, ref):
-            snap = ref.get(transaction=transaction)
-            if snap.exists:
-                # Check for stale locks (e.g. older than 3 hours)
-                last_active = snap.get("updatedAt")
-                if last_active and (datetime.utcnow() - last_active.replace(tzinfo=None)).total_seconds() < 10800:
-                    return False # Active connection exists
-            
-            transaction.set(ref, {
-                "sessionId": session_id,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
-            return True
-
-        if not txn_lock(db.transaction(), lock_ref):
-            logger.info(f"[/ws/stream] User {uid} already has an active stream. Rejecting concurrent connection.")
-            await websocket.close(code=4003, reason="concurrent_stream_limit")
+        if not doc.exists:
+            logger.warning(f"[/ws/stream] Session not found: {session_id}")
+            await websocket.close(code=4000, reason="session_not_found")
             return
 
-        # Atomic consume (Only if this session doesn't already have an issued Cloud Ticket)
-        # If a ticket exists, it means credit was already consumed at session creation.
-        has_ticket = bool(session_data.get("cloudTicket"))
-        if not has_ticket:
-            allowed = await usage_logger.consume_free_cloud_credit(uid)
-            if not allowed:
-                # Release lock before closing
-                lock_ref.delete()
-                logger.info(f"[/ws/stream] User {uid} exhausted Free tier Cloud credits. Rejecting connection.")
-                await websocket.close(code=4003, reason="free_cloud_credit_exhausted")
+        session_data = doc.to_dict()
+        
+        # Limit checks for Free Plan (Credit Based)
+        uid = session_data.get("userId") or session_data.get("ownerUserId") or session_data.get("ownerId")
+        if uid:
+            # [Security] Blocked/Restricted check
+            if not await usage_logger.check_security_state(uid):
+                 logger.warning(f"[/ws/stream] Security block for user {uid}")
+                 await websocket.close(code=4003, reason="security_block")
+                 return
+
+            # [Security] Concurrent connection lock (Atomic)
+            lock_ref = db.collection("active_streams").document(uid)
+            
+            @firestore.transactional
+            def txn_lock(transaction, ref):
+                snap = ref.get(transaction=transaction)
+                if snap.exists:
+                    last_active = snap.get("updatedAt")
+                    if last_active and (datetime.utcnow() - last_active.replace(tzinfo=None)).total_seconds() < 10800:
+                        return False # Active connection exists
+                
+                transaction.set(ref, {
+                    "sessionId": session_id,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
+                return True
+
+            if not txn_lock(db.transaction(), lock_ref):
+                logger.info(f"[/ws/stream] User {uid} already has an active stream. Rejecting concurrent connection.")
+                await websocket.close(code=4003, reason="concurrent_stream_limit")
                 return
 
-    # Tracking for forced stop
-    start_time = time.time()
-    
-    # 120m hard limit (default 2h if not in session_data)
-    # Priority: 1. session_data[cloudAllowedUntil], 2. session_data[createdAt] + 2h, 3. 7200s fixed
-    cloud_allowed_until = session_data.get("cloudAllowedUntil")
-    if cloud_allowed_until:
-        # datetime might be timezone-aware from Firestore
-        if hasattr(cloud_allowed_until, 'timestamp'):
-             MAX_STREAM_DURATION = max(0, cloud_allowed_until.timestamp() - time.time())
-        else:
-             MAX_STREAM_DURATION = 7200
-    else:
-        created_at = session_data.get("createdAt")
-        if created_at and hasattr(created_at, 'timestamp'):
-            MAX_STREAM_DURATION = max(0, (created_at.timestamp() + 7200) - time.time())
-        else:
-            MAX_STREAM_DURATION = 7200
+            # Atomic consume (Only if this session doesn't already have an issued Cloud Ticket)
+            has_ticket = bool(session_data.get("cloudTicket"))
+            if not has_ticket:
+                allowed = await usage_logger.consume_free_cloud_credit(uid)
+                if not allowed:
+                    lock_ref.delete()
+                    logger.info(f"[/ws/stream] User {uid} exhausted Free tier Cloud credits. Rejecting connection.")
+                    await websocket.close(code=4003, reason="free_cloud_credit_exhausted")
+                    return
 
-    frame_count = 0
-    audio_started_at = None
-    NO_AUDIO_TIMEOUT = 20 # 20 seconds
+        # Duration & Timeout Calculation
+        cloud_allowed_until = session_data.get("cloudAllowedUntil")
+        if cloud_allowed_until:
+            if hasattr(cloud_allowed_until, 'timestamp'):
+                 MAX_STREAM_DURATION = max(0, cloud_allowed_until.timestamp() - time.time())
+        else:
+            created_at = session_data.get("createdAt")
+            if created_at and hasattr(created_at, 'timestamp'):
+                MAX_STREAM_DURATION = max(0, (created_at.timestamp() + 7200) - time.time())
 
-    logger.info(f"[/ws/stream] WebSocket connected session_id={session_id}")
+        logger.info(f"[/ws/stream] Setup complete for session_id={session_id}, duration_limit={MAX_STREAM_DURATION:.0f}s")
+    except Exception as e:
+        logger.error(f"[/ws/stream] Initial setup failed: {e}", exc_info=True)
+        await websocket.close(code=1011, reason="internal_setup_error")
+        return
 
     tmp_dir = Path("/tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -386,8 +382,8 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                         from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
                         
                         logger.info(f"[FreePlan] Auto-triggering Summary/Quiz for {session_id} (Streaming)")
-                        enqueue_summarize_task(session_id)
-                        enqueue_quiz_task(session_id, count=3)
+                        enqueue_summarize_task(session_id, user_id=uid)
+                        enqueue_quiz_task(session_id, count=3, user_id=uid)
                 except Exception as e:
                      logger.error(f"[FreePlan] Auto-trigger failed (Stream): {e}")
 

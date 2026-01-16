@@ -32,12 +32,13 @@ def enqueue_summarize_task(
     job_id: str | None = None,
     background_tasks: BackgroundTasks = None,
     idempotency_key: str | None = None,
+    user_id: str | None = None,
 ):
     """
     要約タスクをキューに入れる。
     ローカル環境などで Client がない場合は FastAPI の BackgroundTasks にフォールバックする（デバッグ用）。
     """
-    payload = {"sessionId": session_id, "jobId": job_id, "idempotencyKey": idempotency_key}
+    payload = {"sessionId": session_id, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
     
     # 1. ローカルデバッグ (No Cloud Tasks Client or Explicit Local Mode)
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
@@ -72,38 +73,7 @@ def enqueue_summarize_task(
         logger.error(f"Failed to create task: {e}")
         raise e
 
-def enqueue_transcribe_task(session_id: str, force: bool = False, engine: str = "whisper", job_id: str | None = None):
-    """
-    文字起こしタスク（Cloud Run Jobs / Functions 連携用）
-    """
-    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
-        logger.warning(f"Skipping Transcribe Task (Local mode not fully supported for Whisper): {session_id}")
-        # In local mode, we might just mark as failed or log warning
-        return
-
-    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
-    # Assume a separate endpoint for transcription
-    url = f"{CLOUD_RUN_URL}/internal/tasks/transcribe"
-    payload = {"sessionId": session_id, "force": force, "engine": engine, "jobId": job_id} # Corrected payload line
-    
-    task = {
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": url,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps(payload).encode(),
-        },
-        "dispatch_deadline": {"seconds": 3600}, # 60 mins for transcription
-    }
-
-    try:
-        response = tasks_client.create_task(parent=parent, task=task)
-        logger.info(f"Created transcribe task {response.name} for session {session_id}")
-    except Exception as e:
-        logger.error(f"Failed to create transcribe task for session {session_id}: {e}")
-        raise e
-
-def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None, idempotency_key: str | None = None):
+def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None, idempotency_key: str | None = None, user_id: str | None = None):
     # 同様に実装
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
         logger.info("Running quiz task locally")
@@ -112,7 +82,7 @@ def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     url = f"{CLOUD_RUN_URL}/internal/tasks/quiz"
-    payload = {"sessionId": session_id, "count": count, "jobId": job_id, "idempotencyKey": idempotency_key}
+    payload = {"sessionId": session_id, "count": count, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
     
     task = {
         "http_request": {
@@ -125,7 +95,7 @@ def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None
     
     tasks_client.create_task(parent=parent, task=task)
 
-def enqueue_explain_task(session_id: str, job_id: str | None = None, idempotency_key: str | None = None):
+def enqueue_explain_task(session_id: str, job_id: str | None = None, idempotency_key: str | None = None, user_id: str | None = None):
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
         logger.info("Running explain task locally")
         asyncio.create_task(_run_local_explain(session_id, job_id=job_id))
@@ -133,7 +103,7 @@ def enqueue_explain_task(session_id: str, job_id: str | None = None, idempotency
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     url = f"{CLOUD_RUN_URL}/internal/tasks/explain"
-    payload = {"sessionId": session_id, "idempotencyKey": idempotency_key}
+    payload = {"sessionId": session_id, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
 
     task = {
         "http_request": {
@@ -420,7 +390,7 @@ async def _run_local_playlist(session_id: str):
             "playlistError": str(e),
             "playlistUpdatedAt": datetime.utcnow()
         })
-def enqueue_generate_highlights_task(session_id: str):
+def enqueue_generate_highlights_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
     """
     ハイライト生成タスクをキューに入れる。
     """
@@ -431,7 +401,7 @@ def enqueue_generate_highlights_task(session_id: str):
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     url = f"{CLOUD_RUN_URL}/internal/tasks/highlights"
-    payload = {"sessionId": session_id}
+    payload = {"sessionId": session_id, "userId": user_id, "jobId": job_id}
 
     task = {
         "http_request": {
@@ -444,7 +414,7 @@ def enqueue_generate_highlights_task(session_id: str):
 
     tasks_client.create_task(parent=parent, task=task)
 
-def enqueue_playlist_task(session_id: str):
+def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
     """
     プレイリスト生成タスクをキューに入れる。
     """
@@ -455,7 +425,7 @@ def enqueue_playlist_task(session_id: str):
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     url = f"{CLOUD_RUN_URL}/internal/tasks/playlist"
-    payload = {"sessionId": session_id}
+    payload = {"sessionId": session_id, "userId": user_id, "jobId": job_id}
 
     task = {
         "http_request": {
@@ -480,6 +450,7 @@ def enqueue_transcribe_task(
     engine: str = "google",
     job_id: str | None = None,
     idempotency_key: str | None = None,
+    user_id: str | None = None,
 ):
     """
     文字起こしタスク（Cloud Run Jobs / Functions 連携用）
@@ -491,12 +462,13 @@ def enqueue_transcribe_task(
         "engine": engine,
         "jobId": job_id,
         "idempotencyKey": idempotency_key,
+        "userId": user_id,
     }
 
     # ローカルモード: asyncio.create_task でバックグラウンド実行
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
         logger.info(f"Running transcribe task locally for session: {session_id}")
-        asyncio.create_task(_run_local_transcribe(session_id, force=force, engine=engine, job_id=job_id))
+        asyncio.create_task(_run_local_transcribe(session_id, force=force, engine=engine, job_id=job_id, user_id=user_id))
         return
 
     # Cloud Tasks
@@ -520,7 +492,7 @@ def enqueue_transcribe_task(
         logger.error(f"Failed to enqueue transcribe task: {e}")
         raise e
 
-def enqueue_youtube_import_task(session_id: str, url: str, language: str = "ja"):
+def enqueue_youtube_import_task(session_id: str, url: str, language: str = "ja", user_id: str | None = None, job_id: str | None = None):
     """
     YouTube取込タスクをキューに入れる。
     """
@@ -534,7 +506,7 @@ def enqueue_youtube_import_task(session_id: str, url: str, language: str = "ja")
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     # Using generic queue for now
     target_url = f"{CLOUD_RUN_URL}/internal/tasks/import_youtube"
-    payload = {"sessionId": session_id, "url": url, "language": language}
+    payload = {"sessionId": session_id, "url": url, "language": language, "userId": user_id, "jobId": job_id}
 
     task = {
         "http_request": {
@@ -573,11 +545,14 @@ async def _run_local_youtube_import(session_id: str, url: str, language: str):
             "status": "録音済み",
             "audioPath": f"imports/{session_id}.flac" 
         })
-        # Trigger next steps (Summary/Quiz)
+        # [Security] Pass userId if available
+        data = doc_ref.get().to_dict() or {}
+        uid = data.get("ownerUserId") or data.get("userId")
+        
         # Trigger next steps (Summary/Quiz/Playlist)
-        enqueue_summarize_task(session_id)
-        enqueue_quiz_task(session_id)
-        enqueue_playlist_task(session_id)
+        enqueue_summarize_task(session_id, user_id=uid)
+        enqueue_quiz_task(session_id, user_id=uid)
+        enqueue_playlist_task(session_id, user_id=uid)
     except Exception as e:
         logger.exception("Local YouTube Import Failed")
         doc_ref.update({"status": "failed", "transcriptText": f"Error: {e}"})
@@ -734,8 +709,9 @@ async def _run_local_transcribe(session_id: str, force: bool = False, engine: st
 
         # Trigger downstream tasks (summary, quiz)
         if updates.get("transcriptText"):
-            enqueue_summarize_task(session_id)
-            enqueue_quiz_task(session_id)
+            uid = data.get("ownerUserId") or data.get("userId")
+            enqueue_summarize_task(session_id, user_id=uid)
+            enqueue_quiz_task(session_id, user_id=uid)
 
         logger.info(f"[local transcribe] completed for session: {session_id}")
 

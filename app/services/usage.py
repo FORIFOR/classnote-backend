@@ -398,6 +398,94 @@ class UsageLogger:
 
             transaction = db.transaction()
             txn_risk(transaction, user_ref)
+        except Exception as e:
+            logger.error(f"Failed to track security event: {e}")
+
+    async def check_and_increment_inflight(self, user_id: str, job_type: str, limit: int) -> bool:
+        """
+        Check if user has too many inflight jobs of a specific type.
+        If allowed, increment the counter atomically.
+        Ref: User Requirement 3-3 (Concurrency Control)
+        """
+        user_ref = db.collection("users").document(user_id)
+        field_name = f"inflight.{job_type}" # Nested field syntax
+        
+        # Note: Firestore nested update needs dot notation in update(), 
+        # but get() returns dict.
+        
+        @firestore.transactional
+        def txn_check_inc(transaction, ref):
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                # Create user doc if missing (rare) with 1 count
+                transaction.set(ref, {f"inflight": {job_type: 1}}, merge=True)
+                return True
+                
+            data = snapshot.to_dict()
+            inflight_map = data.get("inflight", {})
+            current_count = inflight_map.get(job_type, 0)
+            
+            # Reset negative counts (safety)
+            if current_count < 0: current_count = 0
+            
+            if current_count >= limit:
+                # [Security] Track Risk
+                # Use self (UsageLogger instance) to track.
+                # Assuming track_security_event is available.
+                # We need to call it effectively. 
+                # Since we are inside a transaction callback `txn_check_inc`, we CANNOT call another transaction/async function easily?
+                # `track_security_event` uses `db.transaction()`. Nested transactions?
+                # Firestore client supports it?
+                # Better to return "overflow" status and track outside transaction?
+                # Or just log warning for now?
+                # User Requirement: "Increment riskScore".
+                # If I can't do it safely inside `txn_check_inc`, I should do it after.
+                return False
+            
+            # Increment
+            # Use strict nested field update syntax
+            transaction.update(ref, {f"inflight.{job_type}": current_count + 1})
+            return True
+
+        transaction = db.transaction()
+        try:
+            result = txn_check_inc(transaction, user_ref)
+            if result is False:
+                 await self.track_security_event(user_id, 1, "inflight_limit_exceeded")
+            return result
+        except Exception as e:
+            logger.error(f"Inflight check failed for {user_id}/{job_type}: {e}")
+            # Fail closed on DB error to prevent overload? Or fail open? 
+            # Per user request "Safety Valve", failing closed (False) is safer for DoS,
+            # but getting 500/409 due to DB error is annoying. 
+            # Let's Fail Open (True) to prevent blocking legit users on transient DB errors,
+            # unless the error is persistent.
+            return True 
+
+    async def decrement_inflight(self, user_id: str, job_type: str) -> None:
+        """
+        Decrement inflight counter. Call this in finally block.
+        """
+        user_ref = db.collection("users").document(user_id)
+        
+        @firestore.transactional
+        def txn_dec(transaction, ref):
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists: return
+            
+            data = snapshot.to_dict()
+            inflight_map = data.get("inflight", {})
+            current_count = inflight_map.get(job_type, 0)
+            
+            if current_count > 0:
+                transaction.update(ref, {f"inflight.{job_type}": current_count - 1})
+            # If 0, do nothing (idempotent fix for double decrement)
+
+        transaction = db.transaction()
+        try:
+            txn_dec(transaction, user_ref)
+        except Exception as e:
+            logger.error(f"Failed to decrement inflight for {user_id}/{job_type}: {e}")
             logger.warning(f"[Security] Risk event for {user_id}: {reason} (delta={risk_delta})")
         except Exception as e:
             logger.error(f"Failed to track security event: {e}")

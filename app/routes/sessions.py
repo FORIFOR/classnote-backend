@@ -11,6 +11,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
 
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
+print("DEBUG: sessions.py v2026.01.16 loaded") # [DEBUG] Force update check
 from app.dependencies import get_current_user, User, ensure_can_view, ensure_is_owner
 from app.task_queue import (
     enqueue_quiz_task,
@@ -424,42 +425,30 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
     Raises HTTPException (402/403/409) if limit reached.
 
     Plan limits:
-    - free: 1 active session, 1 cloud credit
+    - free: 1 active session (Rule 3), 1 cloud credit (Rule 2, only for Cloud)
     - basic: 20 sessions/month
     - pro (Premium): UNLIMITED
     """
-    user_snapshot = db.collection("users").document(user_uid).get()
+    try:
+        user_snapshot = db.collection("users").document(user_uid).get()
+    except Exception as e:
+        logger.error(f"Failed to fetch user plan for {user_uid}: {e}")
+        # Fail safe? Or Fail closed? 500 is technically correct here but let's re-raise as 503 if DB is down.
+        raise HTTPException(status_code=503, detail="Service unavailable (User DB).")
+
     user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
     plan = user_data.get("plan", "free")
 
     # [PREMIUM] Pro users have NO limits - early return
     if plan == "pro":
-        logger.debug(f"[Premium] User {user_uid} has unlimited access (plan=pro)")
         return True
 
-    is_cloud_request = (transcription_mode == "cloud_google")
-
     if plan == "free":
-        # 1. Cloud Credit (Atomic)
-        # If this is a cloud request, we consume a credit.
-        # If successful, we BYPASS the session count limit (Trial Feature).
-        if is_cloud_request:
-            allowed = await usage_logger.consume_free_cloud_credit(user_uid)
-            if allowed:
-                logger.info(f"User {user_uid} consumed free cloud credit (bypass enabled)")
-                return True
-            else:
-                 raise HTTPException(status_code=402, detail={
-                     "error": {
-                         "code": "upgrade_required",
-                         "message": "Cloud transcription requires Premium or free credit.",
-                         "meta": { "feature": "cloud_transcription" }
-                     }
-                 })
-
-        # 2. Active Session Limit (Device Mode or Cloud Exhausted/Blocked)
-        # Robust query: Fetch recent sessions and filter in-memory for soft-delete status.
+        # 1. Active Session Limit (Rule 3)
+        # Allows only 1 active session. (Soft delete aware)
         try:
+            # Note: In a high-scale app, we should use an aggregation counter.
+            # For now, querying 50 recent sessions is acceptable.
             docs_stream = db.collection("sessions")\
                 .where("ownerUid", "==", user_uid)\
                 .limit(50).stream()
@@ -470,6 +459,7 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
                     active_count += 1
             
             if active_count >= 1:
+                # 409 Conflict for "Limit Reached"
                 raise HTTPException(status_code=409, detail={
                     "error": {
                         "code": "session_limit",
@@ -481,24 +471,48 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error checking session limits for {user_uid}: {e}")
-            pass 
+            logger.error(f"Error checking active session limit: {e}")
+            raise HTTPException(status_code=500, detail="Failed to verify session limits.")
+
+        # 2. Cloud Credit / Mode Check (Rule 2)
+        # strictly separate: device_sherpa -> NO credit check.
+        if transcription_mode == "cloud_google":
+            # Atomic Consumption
+            allowed = await usage_logger.consume_free_cloud_credit(user_uid)
+            if allowed:
+                return True
+            else:
+                 raise HTTPException(status_code=402, detail={
+                     "error": {
+                         "code": "upgrade_required", # or free_cloud_exhausted
+                         "message": "Cloud transcription requires Premium or free credit.",
+                         "meta": { "feature": "cloud_transcription" }
+                     }
+                 })
+        else:
+            # device_sherpa, etc. -> Always allowed (aside from active limit)
+            return True
 
     elif plan == "basic":
          # Monthly limit: 20 sessions
-         today = datetime.now(timezone.utc).date()
-         first_day = today.replace(day=1).isoformat()
-         current_day = today.isoformat()
-         usage = await usage_logger.get_user_usage_summary(user_uid, first_day, current_day)
-         
-         if usage.get("session_count", 0) >= 20:
-              raise HTTPException(status_code=403, detail={
-                  "code": "PLAN_LIMIT_REACHED",
-                  "plan": "basic",
-                  "limit": {"monthlySessions": 20},
-                  "message": "Standard plan limit reached (20 sessions/mo). Upgrade to Premium."
-              })
-              
+         try:
+             today = datetime.now(timezone.utc).date()
+             first_day = today.replace(day=1).isoformat()
+             current_day = today.isoformat()
+             usage = await usage_logger.get_user_usage_summary(user_uid, first_day, current_day)
+             
+             if usage.get("session_count", 0) >= 20:
+                  raise HTTPException(status_code=403, detail={
+                      "code": "PLAN_LIMIT_REACHED",
+                      "plan": "basic",
+                      "limit": {"monthlySessions": 20},
+                      "message": "Standard plan limit reached (20 sessions/mo). Upgrade to Premium."
+                  })
+         except Exception as e:
+             logger.error(f"Error checking basic plan limits: {e}")
+             # Fail open or closed? Closed for limits.
+             raise HTTPException(status_code=500, detail="Failed to verify plan limits.")
+               
     return True
 
 
@@ -506,9 +520,18 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
 async def create_session(
     req: CreateSessionRequest, 
     current_user: User = Depends(get_current_user),
-    # Need usage_logger
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key")
 ):
+    global usage_logger
+    # [Validation] Client ID is CRITICAL for idempotency and offline sync
+    # If missing, we generate one but warn (legacy client support)
+    cid = req.clientSessionId or x_idempotency_key
+    if not cid:
+         session_id = str(uuid.uuid4())
+         logger.warning(f"clientSessionId missing from request. Generated {session_id}. Please update client.")
+    else:
+         session_id = cid
+
     # [Security] Blocked/Restricted check
     if not await usage_logger.check_security_state(current_user.uid):
          raise HTTPException(status_code=403, detail="Account restricted for security reasons.")
@@ -516,12 +539,13 @@ async def create_session(
     # [Security] Rate Limit (10 sessions/min)
     if not await usage_logger.check_rate_limit(current_user.uid, "session_create", 10):
          raise HTTPException(status_code=429, detail="Too many session creation requests. Please wait.")
-    # [OFFLINE SYNC] A-Plan Idempotency (Primary Key preference)
-    # Priority: 1. Body clientSessionId, 2. Header X-Idempotency-Key
-    cid = req.clientSessionId or x_idempotency_key
-    session_id = cid or f"{req.mode}-{int(_now_timestamp().timestamp() * 1000)}-{uuid.uuid4().hex[:6]}"
     doc_ref = _session_doc_ref(session_id)
-    doc = doc_ref.get()
+    
+    try:
+        doc = doc_ref.get()
+    except Exception as e:
+        logger.error(f"Firestore read failed for {session_id}: {e}")
+        raise HTTPException(status_code=503, detail="Database unavailable.")
 
     # Migration/Symmetry Support: If not found by primary key, check by field (legacy/concurrent)
     if not doc.exists and req.clientSessionId:
@@ -563,13 +587,15 @@ async def create_session(
 
     # TranscriptionMode already imported at module level
 
-    # [SUBSCRIPTION LIMIT] Unified check (Atomic consumption & Session/Plan limits)
-    # This helper handles Free (Cloud Credit + Active Limit) and Basic (Monthly Limit) checks.
-    # It raises 402/409/403 with appropriate details if blocked.
-    mode_str = req.transcriptionMode.value if req.transcriptionMode else "cloud_google"
-    await _check_session_creation_limits(current_user.uid, mode_str)
-             
-    # Pro = Unlimited
+    # [SUBSCRIPTION LIMIT] Check Limits BEFORE creation
+    try:
+        mode_str = req.transcriptionMode.value if hasattr(req.transcriptionMode, "value") else str(req.transcriptionMode or "cloud_google")
+        await _check_session_creation_limits(current_user.uid, mode_str)
+    except HTTPException:
+        raise # Pass through 4xx
+    except Exception as e:
+        logger.error(f"Unexpected error in limit check: {e}")
+        raise HTTPException(status_code=500, detail="Internal Limit Check Error")
 
     try:
         # session_id/doc_ref already decided at top
@@ -578,6 +604,10 @@ async def create_session(
         initial_status = _normalize_status(req.status, default="録音中")
         start_at = req.startAt or created_at
         end_at = req.endAt or (start_at + timedelta(hours=1))
+        
+        # [Security] Cloud Duration Limit (Defense against cost explosion)
+        max_duration = 7200 if mode_str == "cloud_google" else None
+        
         # Enforce ownerUid from auth token for source of truth
         owner_uid = current_user.uid
         
@@ -590,7 +620,7 @@ async def create_session(
             "ownerUid": owner_uid,   # Compat
             "status": initial_status,
             # [Fix] Robust Enum access (Pydantic models it as Enum, but runtime safety)
-            "transcriptionMode": req.transcriptionMode.value if hasattr(req.transcriptionMode, "value") else str(req.transcriptionMode or "cloud_google"),
+            "transcriptionMode": mode_str,
             "visibility": req.visibility or "private", # [NEW]
             "participantUserIds": [], # [NEW]
             "autoTags": [],          # [NEW]
@@ -618,6 +648,7 @@ async def create_session(
             data["cloudTicket"] = str(uuid.uuid4())
             data["cloudAllowedUntil"] = now + timedelta(hours=2)
             data["cloudStatus"] = "allowed"
+            data["maxCloudDurationSec"] = 7200 # [Security]
         else:
             data["cloudTicket"] = None
             data["cloudAllowedUntil"] = None
@@ -1378,8 +1409,8 @@ async def device_sync(
             final_text = body.transcriptText or data.get("transcriptText") or ""
             if final_text.strip():
                 try:
-                    enqueue_summarize_task(session_id)
-                    enqueue_playlist_task(session_id)
+                    enqueue_summarize_task(session_id, user_id=current_user.uid)
+                    enqueue_playlist_task(session_id, user_id=current_user.uid)
                     # Optionally trigger quiz if implied, but usually manual. 
                     # Given user feedback "Quiz generation fails", we ensure it's robustly available manually.
                     # But let's NOT force it here unless requested.
@@ -1540,6 +1571,7 @@ async def create_job(
     # Need background_tasks usually, but existing queues use just 'enqueue_*' functions which might spawn tasks inside or push to Cloud Tasks.
     # Looking at imports: enqueue_summarize_task... they are imported from task_queue.
 ):
+    global usage_logger
     doc_ref = _session_doc_ref(session_id)
     snapshot = doc_ref.get()
     if not snapshot.exists:
@@ -1555,6 +1587,20 @@ async def create_job(
     if not await usage_logger.check_rate_limit(current_user.uid, "job_create", 5):
          raise HTTPException(status_code=429, detail="Too many job requests. Please wait a minute.")
 
+    # [Security] Concurrency Limit (Fairness & Cost Safety)
+    # Prevent user from running multiple heavy jobs simultaneously.
+    # Limit: 1 per type (transcribe, summary, quiz)
+    # We increment here, and decrement in the Worker (tasks.py).
+    concurrency_limit = 1
+    # Allow slightly more for pro? Maybe later.
+    if req.type in ["transcribe", "summary", "quiz"]:
+         allowed_concurrency = await usage_logger.check_and_increment_inflight(current_user.uid, req.type, concurrency_limit)
+         if not allowed_concurrency:
+              raise HTTPException(
+                  status_code=409, 
+                  detail=f"Job limit reached. You can only run {concurrency_limit} {req.type} job(s) at a time."
+              )
+
     # [Security] High-Cost Duration Guard (120m)
     if req.type in ["summary", "quiz", "transcribe", "explain", "translate"]:
          duration = float(data.get("durationSec") or 0.0)
@@ -1562,17 +1608,74 @@ async def create_job(
               logger.warning(f"[Security] Rejecting high-cost job for long session {session_id} (duration={duration}s)")
               raise HTTPException(status_code=400, detail="Cloud processing is limited to 2 hours per session.")
          
-         # [Security] Cloud Ticket Guard - REMOVED for persistent jobs
-         # Summary/Quiz/Explain should be allowed anytime, not limited to 2h window.
-         # The ticket was for WebSocket streaming authorization.
-         # if data.get("transcriptionMode") == "cloud_google":
-         #      ticket = data.get("cloudTicket")
-         #      until = data.get("cloudAllowedUntil")
-         #      if not ticket:
-         #           pass # raise HTTPException(status_code=403, detail="Cloud ticket missing for this session.")
-         #      # 'until' is already a timezone-aware datetime from Firestore
-         #      if until and datetime.now(timezone.utc) > until:
-         #           pass # raise HTTPException(status_code=403, detail="Cloud ticket has expired (2 hour limit reached).")
+    # [Security] Cloud Ticket Guard - REMOVED for persistent jobs
+    # ... (Keeping comments as is or shortening)
+     
+    # [OPTIMIZATION] 1. Result Caching (Avoid Re-run)
+    # If a completed result exists and transcript hasn't changed (simplified check), return it.
+    if req.type == "summary" and data.get("summaryStatus") == "completed" and not req.force:
+        logger.info(f"[Optimization] Returning cached summary for session {session_id}")
+        return JobResponse(
+             jobId="cached", # or fetch actual ID if needed, but 'cached' is safe signal
+             status="completed",
+             type="summary",
+             result={
+                 "markdown": data.get("summaryMarkdown"),
+                 "tags": data.get("autoTags") or data.get("tags")
+             }
+        )
+    
+    # [OPTIMIZATION] 2. Deduplication (Avoid Double-Billing/Queueing)
+    # Check if a job of the same type is already running/queued.
+    try:
+        active_jobs = db.collection("sessions").document(session_id).collection("jobs")\
+            .where("type", "==", req.type)\
+            .where("status", "in", ["queued", "processing"])\
+            .limit(1).stream()
+        
+        for job_snap in active_jobs:
+            existing_job = job_snap.to_dict()
+            logger.info(f"[Optimization] Deduplicated job {req.type} for session {session_id}")
+            return JobResponse(
+                jobId=job_snap.id,
+                status=existing_job.get("status"),
+                type=existing_job.get("type"),
+                createdAt=existing_job.get("createdAt")
+            )
+    except Exception as e:
+        logger.warning(f"Deduplication check failed non-critically: {e}")
+
+    # [OPTIMIZATION] 3. Transcript Guard (Avoid Garbage In -> Garbage Out)
+    if req.type in ["summary", "quiz", "explain", "translate", "highlights"]:
+         transcript_text = data.get("transcriptText") or ""
+         segments = data.get("segments") or data.get("diarizedSegments")
+         
+         # 3a. Existence Check
+         if not transcript_text and not segments:
+              raise HTTPException(
+                  status_code=400, 
+                  detail="文字起こしが完了していません。先に文字起こしを行ってください。"
+              )
+         
+         # 3b. Length Check (Too Short for AI)
+         # Only enforce if segments are also missing/empty, as segments might be richer than text.
+         # But usually text is the source for Gemini.
+         if len(transcript_text) < 200 and not segments:
+             # Check if it's just a tiny test recording?
+             # User requested: "Guideline: Guard < 200 chars"
+             # Let's strictly enforce unless Force override is present? 
+             # No, 200 chars is very small (~30 sec of speech). Safe to block.
+             raise HTTPException(
+                 status_code=400,
+                 detail="文字起こしテキストが短すぎるため、AI処理を実施できません (200文字以上必要)。"
+             )
+
+         # 3c. Transcribe Job Check (Wait for completion)
+         if data.get("transcriptionStatus") in ["queued", "processing"]:
+             raise HTTPException(
+                 status_code=409,
+                 detail="文字起こしがまだ進行中です。完了後に実行してください。"
+             )
     
     # [SUBSCRIPTION LIMIT] Check Plan for AI Features
     user_doc = db.collection("users").document(current_user.uid).get()
@@ -1658,22 +1761,47 @@ async def create_job(
     
     try:
         if req.type == "summary":
-            enqueue_summarize_task(session_id, job_id=job_id, idempotency_key=req.idempotencyKey)
+            enqueue_summarize_task(session_id, job_id=job_id, idempotency_key=req.idempotencyKey, user_id=current_user.uid)
         elif req.type == "quiz":
             count = req.params.get("count", 5)
-            enqueue_quiz_task(session_id, count=count, job_id=job_id, idempotency_key=req.idempotencyKey)
+            enqueue_quiz_task(session_id, count=count, job_id=job_id, idempotency_key=req.idempotencyKey, user_id=current_user.uid)
         elif req.type == "explain":
-            enqueue_explain_task(session_id, job_id=job_id, idempotency_key=req.idempotencyKey)
+            enqueue_explain_task(session_id, job_id=job_id, idempotency_key=req.idempotencyKey, user_id=current_user.uid)
         elif req.type == "playlist":
-            enqueue_playlist_task(session_id)
+            enqueue_playlist_task(session_id, user_id=current_user.uid, job_id=job_id)
         elif req.type == "generate_highlights":
-            enqueue_generate_highlights_task(session_id)
+            enqueue_generate_highlights_task(session_id, user_id=current_user.uid, job_id=job_id)
         elif req.type == "diarize":
             doc_ref.update({"diarizationStatus": "queued"}) 
-        elif req.type == "translate":
-            target_lang = req.params.get("targetLanguage", "en")
-            enqueue_translate_task(session_id, target_lang, current_user.uid)
-        elif req.type == "qa":
+            pass # No queue for now? Or enqueue? 
+            # If no enqueue, we must NOT decrement? 
+            # But the logic above incremented. 
+            # If "diarize" is not in ["transcribe","summary","quiz"], it wasn't incremented.
+            # Checked above: if req.type in ["transcribe", "summary", "quiz"]
+            # So diarize is safe.
+        elif req.type == "transcribe":
+             force = req.params.get("force", False)
+             raw_engine = req.params.get("engine", "google")
+             engine = "google" if raw_engine in ["google", "google_v2", "cloud_google"] else raw_engine
+             
+             enqueue_transcribe_task(session_id, force=force, engine=engine, job_id=job_id, user_id=current_user.uid)
+             doc_ref.update({"status": "処理中"})
+             
+             # [FIX] Update artifacts/transcript for client tracking
+             artifact_ref = doc_ref.collection("artifacts").document("transcript")
+             artifact_ref.set({
+                 "status": "pending",
+                 "jobId": job_id,
+                 "updatedAt": firestore.SERVER_TIMESTAMP,
+             }, merge=True)
+
+    except Exception as e:
+        logger.error(f"Failed to enqueue job {job_id}: {e}")
+        # [Security] Rollback inflight count if enqueue failed
+        if req.type in ["transcribe", "summary", "quiz"]:
+             await usage_logger.decrement_inflight(current_user.uid, req.type)
+        raise HTTPException(status_code=500, detail=f"Failed to start job: {e}")
+        if req.type == "qa":
             # QA is special, it creates a specific results document.
             # We will alias the qaId as the jobId.
             question = req.params.get("question")
@@ -1694,22 +1822,6 @@ async def create_job(
             
             enqueue_qa_task(session_id, question, current_user.uid, job_id)
             
-        elif req.type == "transcribe":
-            force = req.params.get("force", False)
-            # Standardize engine name to 'google'
-            raw_engine = req.params.get("engine", "google")
-            engine = "google" if raw_engine in ["google", "google_v2", "cloud_google"] else raw_engine
-            
-            enqueue_transcribe_task(session_id, force=force, engine=engine, job_id=job_id)
-            doc_ref.update({"status": "処理中"})
-            
-            # [FIX] Update artifacts/transcript for client tracking
-            artifact_ref = doc_ref.collection("artifacts").document("transcript")
-            artifact_ref.set({
-                "status": "pending",
-                "jobId": job_id,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            }, merge=True)
         elif req.type == "calendar_sync":
              try:
                 google_calendar.sync_event(session_id, current_user.uid)
@@ -2302,7 +2414,7 @@ async def retry_transcription(
         
     doc_ref.update(update_data)
     
-    enqueue_transcribe_task(session_id, engine="google", force=True)
+    enqueue_transcribe_task(session_id, engine="google", force=True, user_id=current_user.uid)
     
     return {"status": "queued"}
 
@@ -2545,12 +2657,24 @@ async def prepare_audio_upload(
         data = doc.to_dict()
         ensure_is_owner(data, current_user.uid, session_id)
 
-        # [Security] Cloud Ticket Expiry Guard
+        # [Security] Cloud Ticket Expiry & Duration Guard
         if data.get("transcriptionMode") == "cloud_google":
+             # 1. Ticket Expiry
              until = data.get("cloudAllowedUntil")
              if until and datetime.now(timezone.utc) > until:
                   logger.warning(f"[Security] Rejecting audio upload for session {session_id}: expired")
+                  await usage_logger.track_security_event(current_user.uid, 5, "upload_denied_expired")
                   raise HTTPException(status_code=403, detail="Cloud processing limit reached for this session.")
+             
+             # 2. Duration Limit (7200s)
+             if body.durationSec and body.durationSec > 7200:
+                  await usage_logger.track_security_event(current_user.uid, 5, "upload_denied_duration")
+                  raise HTTPException(status_code=400, detail="Recording duration exceeds 2 hours (Cloud limit).")
+
+             # 3. File Size Limit (500MB)
+             if body.fileSize and body.fileSize > 500 * 1024 * 1024:
+                  await usage_logger.track_security_event(current_user.uid, 5, "upload_denied_size")
+                  raise HTTPException(status_code=400, detail="File size exceeds 500MB limit.")
 
         target_content_type = body.contentType
         if body.contentType in ["audio/m4a", "audio/aac", "audio/mp4"]:
@@ -2726,7 +2850,7 @@ async def commit_audio_upload(
         # 4. Enqueue tasks (Auto-start transcription on commit)
         try:
             from app.task_queue import enqueue_transcribe_task
-            enqueue_transcribe_task(session_id, force=False)
+            enqueue_transcribe_task(session_id, force=False, user_id=current_user.uid)
         except Exception as enqueue_err:
             # Commit is successful even if triggering processing fails.
             # We log it, and could potentially set a flag in Firestore to retry later.

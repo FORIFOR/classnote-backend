@@ -227,3 +227,85 @@ def ensure_is_owner(session_data: dict, uid: str, session_id: Optional[str] = No
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the owner can perform this operation"
         )
+
+
+# --- Admin Authentication ---
+
+# 管理者UIDリスト（環境変数から読み込み、またはハードコード）
+import os
+ADMIN_UIDS = set(filter(None, (os.environ.get("ADMIN_UIDS") or "").split(",")))
+
+
+class AdminUser(User):
+    """管理者ユーザー"""
+    def __init__(self, uid: str, email: str = None, display_name: str = None, is_super_admin: bool = False):
+        super().__init__(uid, email, display_name)
+        self.is_super_admin = is_super_admin
+
+
+def _check_admin_claims(token: str) -> tuple[bool, bool]:
+    """
+    トークンから管理者権限をチェック。
+
+    Returns:
+        tuple[bool, bool]: (is_admin, is_super_admin)
+    """
+    try:
+        decoded_token = auth.verify_id_token(token)
+        uid = decoded_token.get("uid")
+
+        # 方法1: Custom Claims をチェック
+        is_admin = decoded_token.get("admin", False)
+        is_super_admin = decoded_token.get("superAdmin", False)
+
+        # 方法2: ADMIN_UIDS 環境変数でチェック（フォールバック）
+        if not is_admin and uid in ADMIN_UIDS:
+            is_admin = True
+
+        # 方法3: Firestore users コレクションでチェック（フォールバック）
+        if not is_admin:
+            user_doc = db.collection("users").document(uid).get()
+            if user_doc.exists:
+                user_data = user_doc.to_dict() or {}
+                is_admin = user_data.get("isAdmin", False) or user_data.get("admin", False)
+                is_super_admin = is_super_admin or user_data.get("isSuperAdmin", False)
+
+        return is_admin, is_super_admin
+    except Exception:
+        return False, False
+
+
+async def get_admin_user(
+    background_tasks: BackgroundTasks,
+    token: Optional[str] = Depends(oauth2_scheme)
+) -> AdminUser:
+    """
+    管理者ユーザーを取得。管理者でない場合は403エラー。
+    """
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # まず通常のユーザー認証
+    user = _resolve_user_from_token(token)
+
+    # 管理者権限チェック
+    is_admin, is_super_admin = _check_admin_claims(token)
+
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+
+    _track_activity(user.uid, background_tasks)
+
+    return AdminUser(
+        uid=user.uid,
+        email=user.email,
+        display_name=user.display_name,
+        is_super_admin=is_super_admin
+    )

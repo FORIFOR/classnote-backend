@@ -1,4 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from datetime import datetime, timezone
+from app.services.ops_logger import OpsLogger, Severity, EventType
+
 print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -31,6 +34,39 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
+
+# [NEW] Ops Logger Middleware
+@app.middleware("http")
+async def ops_logger_middleware(request: Request, call_next):
+    start_time = datetime.now(timezone.utc)
+    response = await call_next(request)
+    process_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+
+    # Log API Error or suspicious latency
+    if response.status_code >= 500:
+        OpsLogger().log(
+            severity=Severity.ERROR,
+            event_type=EventType.API_ERROR,
+            endpoint=request.url.path,
+            status_code=response.status_code,
+            message=f"API 500 Error: {request.url.path}",
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host},
+            trace_id=request.headers.get("X-Cloud-Trace-Context")
+        )
+    # 400系は INFO/WARN レベル (認証エラーなどは除外してもよいが、ここでは全て記録しフィルタで分ける)
+    # ただし大量になるので 401/403/429/402 など重要なものに絞るのが一般的
+    elif response.status_code in [402, 409, 429]:
+         OpsLogger().log(
+            severity=Severity.WARN,
+            event_type=EventType.API_ERROR,
+            endpoint=request.url.path,
+            status_code=response.status_code,
+            message=f"API Client Error: {response.status_code}",
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host},
+             trace_id=request.headers.get("X-Cloud-Trace-Context")
+        )
+
+    return response
 
 # CORS Setup
 app.add_middleware(

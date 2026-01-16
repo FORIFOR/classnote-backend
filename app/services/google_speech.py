@@ -28,7 +28,7 @@ except Exception as e:
     storage_client = None
     speech_client = None
 
-def _get_or_create_recognizer(recognizer_id: str = "classnote-general-v2") -> str:
+def _get_or_create_recognizer(recognizer_id: str = "classnote-v2-20260116") -> str:
     """
     Get or Create a V2 Recognizer resource.
     """
@@ -48,7 +48,7 @@ def _get_or_create_recognizer(recognizer_id: str = "classnote-general-v2") -> st
         recognizer_id=recognizer_id,
         recognizer=cloud_speech.Recognizer(
             default_recognition_config=cloud_speech.RecognitionConfig(
-                auto_decoding_config=cloud_speech.AutoDecodingConfig(),  # [FIX] Required for V2
+                auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
                 language_codes=["ja-JP"],
                 model="long",  # V2 model name (long, short, telephony, medical, etc.)
                 features=cloud_speech.RecognitionFeatures(
@@ -260,15 +260,18 @@ def transcribe_audio_google_with_segments(
         
         files = [cloud_speech.BatchRecognizeFileMetadata(uri=converted_gcs_uri)]
         
+        # Config provided by Recognizer resource (classnote-general-v2-new)
+        
         config = cloud_speech.RecognitionConfig(
-            language_codes=[language_code],
+            auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
+            language_codes=["ja-JP"],
             model="long",
             features=cloud_speech.RecognitionFeatures(
-               enable_automatic_punctuation=True,
-               enable_word_time_offsets=True,
-            )
+                enable_automatic_punctuation=True,
+                enable_word_time_offsets=True,
+            ),
         )
-
+        
         request = cloud_speech.BatchRecognizeRequest(
             recognizer=recognizer_name,
             config=config,

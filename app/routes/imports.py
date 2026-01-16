@@ -161,9 +161,9 @@ async def import_youtube(req: ImportYouTubeRequest, current_user: User = Depends
     if has_transcript:
         # Transcript provided: Bypass download/STT and trigger Summary/Quiz directly
         try:
-            enqueue_summarize_task(session_id)
-            enqueue_quiz_task(session_id)
-            enqueue_playlist_task(session_id)
+            enqueue_summarize_task(session_id, user_id=owner_uid)
+            enqueue_quiz_task(session_id, user_id=owner_uid)
+            enqueue_playlist_task(session_id, user_id=owner_uid)
         except Exception as exc:
             logger.exception(f"Failed to enqueue summary/quiz for {session_id}: {exc}")
             # Non-blocking error?
@@ -171,7 +171,7 @@ async def import_youtube(req: ImportYouTubeRequest, current_user: User = Depends
         # No transcript: Enqueue Import Task (Server-side) - Likely to fail if IP blocked
         from app.task_queue import enqueue_youtube_import_task
         try:
-            enqueue_youtube_import_task(session_id, req.url, language=req.language or "ja")
+            enqueue_youtube_import_task(session_id, req.url, language=req.language or "ja", user_id=owner_uid)
         except Exception as exc:
             # If enqueue fails, mark as failed
             logger.exception(f"Failed to enqueue youtube import for {session_id}: {exc}")

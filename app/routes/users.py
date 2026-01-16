@@ -122,6 +122,24 @@ async def get_me(current_user: User = Depends(get_current_user)):
         data = doc.to_dict() or {}
         
     is_shareable = data.get("isShareable", data.get("allowSearch", True))
+    # [NEW] Count active sessions for Free plan paywall
+    active_session_count = None
+    if data.get("plan", "free") == "free":
+        try:
+            # Query sessions without complex filters to avoid missing index errors
+            active_sessions_query = db.collection("sessions")\
+                .where("ownerUid", "==", current_user.uid)\
+                .limit(50).stream()
+            
+            # Count only active (deletedAt is None)
+            count = 0
+            for d in active_sessions_query:
+                if d.to_dict().get("deletedAt") is None:
+                    count += 1
+            active_session_count = count
+        except Exception as e:
+            logger.warning(f"Error counting active sessions: {e}")
+            active_session_count = 0
     
     return MeResponse(
         id=current_user.uid,
@@ -140,7 +158,10 @@ async def get_me(current_user: User = Depends(get_current_user)):
         createdAt=data.get("createdAt"),
         securityState=data.get("securityState", "normal"),
         riskScore=data.get("riskScore", 0),
-        freeCloudCreditsRemaining=data.get("freeCloudCreditsRemaining", 1) if data.get("plan", "free") == "free" else None
+        freeCloudCreditsRemaining=data.get("freeCloudCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
+        freeSummaryCreditsRemaining=data.get("freeSummaryCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
+        freeQuizCreditsRemaining=data.get("freeQuizCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
+        activeSessionCount=active_session_count
     )
 
 @router.get("/me/entitlement", response_model=EntitlementResponse)
