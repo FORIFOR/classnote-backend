@@ -407,6 +407,9 @@ class MeResponse(BaseModel):
     
     # [NEW] Free Plan Credits
     freeCloudCreditsRemaining: Optional[int] = None
+    freeSummaryCreditsRemaining: Optional[int] = None
+    freeQuizCreditsRemaining: Optional[int] = None
+    activeSessionCount: Optional[int] = None  # For client-side paywall checks
 
 class MeUpdateRequest(BaseModel):
     displayName: Optional[str] = None
@@ -692,6 +695,22 @@ class DeviceSyncRequest(BaseModel):
     audioPath: Optional[str] = None
     audioMeta: Optional[AudioMeta] = None  # [NEW]
     needsPlaylist: bool = True
+    # [OFFLINE-FIRST] Session creation fields - used when session doesn't exist yet
+    createIfMissing: bool = True  # If True, create session if not found (upsert behavior)
+    title: Optional[str] = None  # Required if createIfMissing and session doesn't exist
+    mode: Optional[str] = "lecture"  # lecture / meeting
+    transcriptionMode: Optional[TranscriptionMode] = TranscriptionMode.DEVICE_SHERPA
+    deviceId: Optional[str] = None
+    clientCreatedAt: Optional[datetime] = None  # Original creation timestamp from device
+    source: Optional[str] = "ios"
+
+
+class DeviceSyncResponse(BaseModel):
+    """[OFFLINE-FIRST] Response from /device_sync endpoint"""
+    status: str = "accepted"
+    sessionCreated: bool = False  # True if session was created during this sync
+    sessionId: str
+
 
 class CapabilitiesResponse(BaseModel):
     id: str = "capabilities"  # iOS expects this field

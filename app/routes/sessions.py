@@ -70,6 +70,8 @@ from app.util_models import (
     QaResponse,
     BatchDeleteRequest,
     DeviceSyncRequest,
+    DeviceSyncResponse,
+    TranscriptionMode,
     SessionMetaUpdateRequest,
     DerivedEnqueueRequest,
     DerivedEnqueueResponse,
@@ -324,6 +326,174 @@ def normalize_tags(tags: List[str], max_tags: int = 4) -> List[str]:
 
 # ---------- セッション管理 ---------- #
 
+async def _create_session_internal(
+    session_id: str,
+    owner_uid: str,
+    title: str,
+    mode: str = "lecture",
+    transcription_mode: str = "device_sherpa",
+    visibility: str = "private",
+    device_id: Optional[str] = None,
+    client_created_at: Optional[datetime] = None,
+    source: str = "ios",
+    tags: Optional[List[str]] = None,
+    display_name: Optional[str] = None,
+) -> dict:
+    """
+    [OFFLINE-FIRST] Internal session creation helper.
+    Used by both POST /sessions and POST /device_sync for upsert behavior.
+    Returns the created session data dict.
+    """
+    now = _now_timestamp()
+    created_at = client_created_at or now
+    start_at = created_at
+    end_at = start_at + timedelta(hours=1)
+
+    data = {
+        "title": title,
+        "mode": mode,
+        "userId": owner_uid,
+        "ownerId": owner_uid,
+        "ownerUserId": owner_uid,
+        "ownerUid": owner_uid,
+        "status": "録音中",
+        "transcriptionMode": transcription_mode,
+        "visibility": visibility,
+        "participantUserIds": [],
+        "autoTags": [],
+        "topicSummary": None,
+        "createdAt": created_at,
+        "startedAt": start_at,
+        "startAt": start_at,
+        "endAt": end_at,
+        "endedAt": None,
+        "durationSec": None,
+        "audioPath": None,
+        "transcriptText": None,
+        "summaryStatus": None,
+        "quizStatus": None,
+        "sharedWith": {},
+        "clientSessionId": session_id,
+        "deviceId": device_id,
+        "source": source,
+    }
+
+    # Cloud ticket only for cloud transcription
+    if transcription_mode == "cloud_google":
+        data["cloudTicket"] = str(uuid.uuid4())
+        data["cloudAllowedUntil"] = now + timedelta(hours=2)
+        data["cloudStatus"] = "allowed"
+    else:
+        data["cloudTicket"] = None
+        data["cloudAllowedUntil"] = None
+        data["cloudStatus"] = "none"
+
+    if tags:
+        data["tags"] = normalize_tags(tags)
+
+    doc_ref = _session_doc_ref(session_id)
+    doc_ref.set(data)
+
+    # Create sessionMeta for owner
+    meta_ref = db.collection("users").document(owner_uid).collection("sessionMeta").document(session_id)
+    meta_ref.set({
+        "sessionId": session_id,
+        "role": "OWNER",
+        "isPinned": False,
+        "isArchived": False,
+        "lastOpenedAt": now,
+        "createdAt": now,
+        "updatedAt": now
+    })
+
+    _upsert_session_member(
+        session_id=session_id,
+        user_id=owner_uid,
+        role="owner",
+        source="owner",
+        display_name=display_name,
+    )
+
+    return data
+
+
+async def _check_session_creation_limits(user_uid: str, transcription_mode: str = "device_sherpa") -> bool:
+    """
+    [OFFLINE-FIRST] Check if user can create a new session.
+    Returns True if allowed.
+    Raises HTTPException (402/403/409) if limit reached.
+    """
+    # txn = db.transaction() # Not used here, using usage_logger
+    
+    user_snapshot = db.collection("users").document(user_uid).get()
+    user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
+    plan = user_data.get("plan", "free")
+
+    is_cloud_request = (transcription_mode == "cloud_google")
+
+    if plan == "free":
+        # 1. Cloud Credit (Atomic)
+        # If this is a cloud request, we consume a credit.
+        # If successful, we BYPASS the session count limit (Trial Feature).
+        if is_cloud_request:
+            allowed = await usage_logger.consume_free_cloud_credit(user_uid)
+            if allowed:
+                logger.info(f"User {user_uid} consumed free cloud credit (bypass enabled)")
+                return True
+            else:
+                 raise HTTPException(status_code=402, detail={
+                     "error": {
+                         "code": "upgrade_required",
+                         "message": "Cloud transcription requires Premium or free credit.",
+                         "meta": { "feature": "cloud_transcription" }
+                     }
+                 })
+
+        # 2. Active Session Limit (Device Mode or Cloud Exhausted/Blocked)
+        # Robust query: Fetch recent sessions and filter in-memory for soft-delete status.
+        try:
+            docs_stream = db.collection("sessions")\
+                .where("ownerUid", "==", user_uid)\
+                .limit(50).stream()
+
+            active_count = 0
+            for d in docs_stream:
+                if d.to_dict().get("deletedAt") is None:
+                    active_count += 1
+            
+            if active_count >= 1:
+                raise HTTPException(status_code=409, detail={
+                    "error": {
+                        "code": "session_limit",
+                        "feature": "session",
+                        "message": "Free plan allows only 1 active session. Delete existing session or upgrade.",
+                        "meta": {"maxActiveSessions": 1, "plan": "free"}
+                    }
+                })
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error checking session limits for {user_uid}: {e}")
+            pass 
+
+    elif plan == "basic":
+         # Monthly limit: 20 sessions
+         today = datetime.now(timezone.utc).date()
+         first_day = today.replace(day=1).isoformat()
+         current_day = today.isoformat()
+         usage = await usage_logger.get_user_usage_summary(user_uid, first_day, current_day)
+         
+         if usage.get("session_count", 0) >= 20:
+              raise HTTPException(status_code=403, detail={
+                  "code": "PLAN_LIMIT_REACHED",
+                  "plan": "basic",
+                  "limit": {"monthlySessions": 20},
+                  "message": "Standard plan limit reached (20 sessions/mo). Upgrade to Premium."
+              })
+              
+    return True
+
+
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def create_session(
     req: CreateSessionRequest, 
@@ -347,21 +517,27 @@ async def create_session(
 
     # Migration/Symmetry Support: If not found by primary key, check by field (legacy/concurrent)
     if not doc.exists and req.clientSessionId:
-        existing_q = db.collection("sessions").where("ownerUserId", "==", current_user.uid)\
-            .where("clientSessionId", "==", req.clientSessionId).limit(1).stream()
-        for edoc in existing_q:
-            doc = edoc
-            session_id = doc.id
-            break
+        try:
+            # Use ownerUid (more standard) and wrap to prevent 500 on missing index
+            existing_q = db.collection("sessions").where("ownerUid", "==", current_user.uid)\
+                .where("clientSessionId", "==", req.clientSessionId).limit(1).stream()
+            for edoc in existing_q:
+                doc = edoc
+                session_id = doc.id
+                break
+        except Exception as e:
+            logger.warning(f"Idempotency/Legacy check failed for {req.clientSessionId}: {e}")
 
     if doc.exists:
+        # [IDEMPOTENCY] Session already exists - return existing (no credit consumed)
+        logger.info(f"[Idempotency] Returning existing session {session_id} for user {current_user.uid}")
         data = doc.to_dict()
         ensure_can_view(data, current_user.uid, session_id)
-        
+
         created_at_dt = data.get("createdAt")
         if created_at_dt and hasattr(created_at_dt, 'isoformat'):
             data["createdAt"] = created_at_dt.isoformat()
-        
+
         return SessionResponse(
             id=session_id,
             clientSessionId=data.get("clientSessionId"),
@@ -377,52 +553,13 @@ async def create_session(
             cloudStatus=data.get("cloudStatus")
         )
 
-    from app.services.usage import usage_logger
-    from app.util_models import TranscriptionMode
+    # TranscriptionMode already imported at module level
 
-    # [SUBSCRIPTION LIMIT] Check Plan
-    user_snapshot = db.collection("users").document(current_user.uid).get()
-    user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
-    plan = user_data.get("plan", "free")
-    
-    # [NEW] Cloud Trial Bypass
-    # If user requests Cloud STT AND has a free trial credit, we allow them to create 
-    # the session even if they already reached the "Max 1 Session" limit for free users.
-    is_cloud_request = (req.transcriptionMode == TranscriptionMode.CLOUD_GOOGLE)
-    credit_consumed = False
-    
-    if is_cloud_request and plan == "free":
-        # Atomic consumption
-        if await usage_logger.consume_free_cloud_credit(current_user.uid):
-            credit_consumed = True
-            logger.info(f"User {current_user.uid} consumed free cloud credit for session {session_id} creation (bypass enabled)")
-
-    if plan == "free":
-        # Lifetime limit: 1 session (Skipped if we just used a cloud credit successfully)
-        if not credit_consumed:
-            existing_docs = db.collection("sessions").where("ownerUid", "==", current_user.uid).limit(1).stream()
-            if any(True for _ in existing_docs):
-                 raise HTTPException(status_code=403, detail={
-                     "code": "SUBSCRIPTION_REQUIRED",
-                     "plan": "free",
-                     "limit": {"maxSessions": 1},
-                     "message": "Free plan limit reached (Max 1 session). Subscription required."
-                 })
-             
-    elif plan == "basic":
-        # Monthly limit: 20 sessions
-        today = datetime.now(timezone.utc).date()
-        first_day = today.replace(day=1).isoformat()
-        current_day = today.isoformat()
-        
-        usage = await usage_logger.get_user_usage_summary(current_user.uid, first_day, current_day)
-        if usage.get("session_count", 0) >= 20:
-             raise HTTPException(status_code=403, detail={
-                 "code": "PLAN_LIMIT_REACHED",
-                 "plan": "basic",
-                 "limit": {"monthlySessions": 20},
-                 "message": "Standard plan limit reached (20 sessions/mo). Upgrade to Premium."
-             })
+    # [SUBSCRIPTION LIMIT] Unified check (Atomic consumption & Session/Plan limits)
+    # This helper handles Free (Cloud Credit + Active Limit) and Basic (Monthly Limit) checks.
+    # It raises 402/409/403 with appropriate details if blocked.
+    mode_str = req.transcriptionMode.value if req.transcriptionMode else "cloud_google"
+    await _check_session_creation_limits(current_user.uid, mode_str)
              
     # Pro = Unlimited
 
@@ -444,7 +581,8 @@ async def create_session(
             "ownerUserId": owner_uid, # [NEW] Source of Truth
             "ownerUid": owner_uid,   # Compat
             "status": initial_status,
-            "transcriptionMode": req.transcriptionMode.value if req.transcriptionMode else "cloud_google", # [NEW]
+            # [Fix] Robust Enum access (Pydantic models it as Enum, but runtime safety)
+            "transcriptionMode": req.transcriptionMode.value if hasattr(req.transcriptionMode, "value") else str(req.transcriptionMode or "cloud_google"),
             "visibility": req.visibility or "private", # [NEW]
             "participantUserIds": [], # [NEW]
             "autoTags": [],          # [NEW]
@@ -553,9 +691,19 @@ async def create_session(
             cloudAllowedUntil=data.get("cloudAllowedUntil"),
             cloudStatus=data.get("cloudStatus")
         )
+    except HTTPException:
+        # Re-raise HTTP exceptions (402, 403, 409, etc.) without modification
+        raise
     except Exception as e:
-        logger.exception(f"create_session failed for uid={current_user.uid} req={req.dict()}")
-        raise HTTPException(status_code=500, detail="Failed to create session")
+        # Log unexpected errors with full context for debugging
+        logger.exception(f"[500] create_session failed for uid={current_user.uid} session_id={session_id} error={type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail={
+            "error": {
+                "code": "internal_error",
+                "message": "Failed to create session. Please try again.",
+                "trace": session_id  # Include session_id for debugging
+            }
+        })
 
 @router.get("/sessions", response_model=List[SessionResponse])
 async def list_sessions(
@@ -665,6 +813,10 @@ async def list_sessions(
     for doc in unique_docs:
         data = doc.to_dict()
         data["id"] = doc.id
+        
+        # [SOFT DELETE] Skip deleted sessions
+        if data.get("deletedAt") is not None:
+            continue
         
         # Merge Meta
         meta = meta_map.get(doc.id, {})
@@ -1096,7 +1248,7 @@ async def replace_transcript_chunks(
         status="accepted",
     )
 
-@router.post("/sessions/{session_id}/device_sync", status_code=202)
+@router.post("/sessions/{session_id}/device_sync", response_model=DeviceSyncResponse, status_code=202)
 async def device_sync(
     session_id: str,
     body: DeviceSyncRequest,
@@ -1114,14 +1266,54 @@ async def device_sync(
     """
     端末側で生成された音声・文字起こし・話者分離結果をサーバへ同期し、
     必要に応じてプレイリスト生成をトリガーする。
+
+    [OFFLINE-FIRST] If session doesn't exist and createIfMissing=True,
+    creates the session first (upsert behavior).
     """
     doc_ref = _session_doc_ref(session_id)
     snapshot = doc_ref.get()
-    if not snapshot.exists:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session_created = False
 
-    data = snapshot.to_dict()
-    ensure_is_owner(data, current_user.uid, session_id)
+    if not snapshot.exists:
+        # [OFFLINE-FIRST] Upsert behavior - create session if it doesn't exist
+        if body.createIfMissing:
+            if not body.title:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "code": "MISSING_TITLE",
+                            "message": "Title is required when creating session via device_sync"
+                        }
+                    }
+                )
+
+            # Check session creation limits
+            await _check_session_creation_limits(
+                current_user.uid,
+                body.transcriptionMode.value if body.transcriptionMode else "device_sherpa"
+            )
+
+            # Create the session
+            transcription_mode_str = body.transcriptionMode.value if body.transcriptionMode else "device_sherpa"
+            data = await _create_session_internal(
+                session_id=session_id,
+                owner_uid=current_user.uid,
+                title=body.title,
+                mode=body.mode or "lecture",
+                transcription_mode=transcription_mode_str,
+                device_id=body.deviceId,
+                client_created_at=body.clientCreatedAt,
+                source=body.source or "ios",
+                display_name=current_user.display_name,
+            )
+            session_created = True
+            logger.info(f"[OFFLINE-FIRST] Created session {session_id} via device_sync for user {current_user.uid}")
+        else:
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        data = snapshot.to_dict()
+        ensure_is_owner(data, current_user.uid, session_id)
 
     update_data = {
         "audioPath": body.audioPath,
@@ -1222,7 +1414,11 @@ async def device_sync(
             }
         )
 
-    return {"status": "accepted"}
+    return {
+        "status": "accepted",
+        "sessionCreated": session_created,  # [OFFLINE-FIRST] True if session was created during this sync
+        "sessionId": session_id,
+    }
 
 @router.patch("/sessions/{session_id}", response_model=SessionResponse)
 async def update_session(session_id: str, req: UpdateSessionRequest, current_user: User = Depends(get_current_user)):
@@ -1358,15 +1554,17 @@ async def create_job(
               logger.warning(f"[Security] Rejecting high-cost job for long session {session_id} (duration={duration}s)")
               raise HTTPException(status_code=400, detail="Cloud processing is limited to 2 hours per session.")
          
-         # [Security] Cloud Ticket Guard
-         if data.get("transcriptionMode") == "cloud_google":
-              ticket = data.get("cloudTicket")
-              until = data.get("cloudAllowedUntil")
-              if not ticket:
-                   raise HTTPException(status_code=403, detail="Cloud ticket missing for this session.")
-              # 'until' is already a timezone-aware datetime from Firestore
-              if until and datetime.now(timezone.utc) > until:
-                   raise HTTPException(status_code=403, detail="Cloud ticket has expired (2 hour limit reached).")
+         # [Security] Cloud Ticket Guard - REMOVED for persistent jobs
+         # Summary/Quiz/Explain should be allowed anytime, not limited to 2h window.
+         # The ticket was for WebSocket streaming authorization.
+         # if data.get("transcriptionMode") == "cloud_google":
+         #      ticket = data.get("cloudTicket")
+         #      until = data.get("cloudAllowedUntil")
+         #      if not ticket:
+         #           pass # raise HTTPException(status_code=403, detail="Cloud ticket missing for this session.")
+         #      # 'until' is already a timezone-aware datetime from Firestore
+         #      if until and datetime.now(timezone.utc) > until:
+         #           pass # raise HTTPException(status_code=403, detail="Cloud ticket has expired (2 hour limit reached).")
     
     # [SUBSCRIPTION LIMIT] Check Plan for AI Features
     user_doc = db.collection("users").document(current_user.uid).get()
@@ -1385,14 +1583,33 @@ async def create_job(
         # This consumes the 1-time credit if not already used.
         # User confirmed: "Cloud processing 1 time = Cloud STT + Summary + Quiz".
         # If user did NOT use Cloud STT (e.g. device recording), they can use their 1 credit here.
-        if req.type in ["summary", "quiz"]:
-             allowed = await usage_logger.consume_free_cloud_credit(current_user.uid)
+        if req.type == "summary":
+             allowed = await usage_logger.consume_free_summary_credit(current_user.uid)
              if not allowed:
-                 raise HTTPException(status_code=403, detail="Free plan cloud credit exhausted.")
+                 raise HTTPException(status_code=402, detail={
+                     "error": {
+                         "code": "upgrade_required",
+                         "feature": "summary",
+                         "message": "Free plan summary limit reached (1 per account). Upgrade to Premium.",
+                         "meta": {"freeSummaryCreditsRemaining": 0}
+                     }
+                 })
+        elif req.type == "quiz":
+             allowed = await usage_logger.consume_free_quiz_credit(current_user.uid)
+             if not allowed:
+                 raise HTTPException(status_code=402, detail={
+                     "error": {
+                         "code": "upgrade_required",
+                         "feature": "quiz",
+                         "message": "Free plan quiz limit reached (1 per account). Upgrade to Premium.",
+                         "meta": {"freeQuizCreditsRemaining": 0}
+                     }
+                 })
+
 
     # [Standard Plan Limits]
     if plan == "basic":
-        from app.services.usage import usage_logger
+        # usage_logger already imported globally
         today = datetime.now(timezone.utc).date()
         first_day = today.replace(day=1).isoformat()
         current_day = today.isoformat()
@@ -1400,10 +1617,24 @@ async def create_job(
         
         if req.type == "summary":
             if usage.get("summary_invocations", 0) >= 20:
-                raise HTTPException(status_code=403, detail="Standard plan limit reached (20 summaries/mo). Upgrade to Premium.")
+                raise HTTPException(status_code=409, detail={
+                    "error": {
+                        "code": "feature_limit",
+                        "feature": "summary",
+                        "message": "Standard plan limit reached (20 summaries/mo). Upgrade to Premium.",
+                        "meta": {"maxMonthlySummaries": 20, "plan": "basic", "currentCount": usage.get("summary_invocations", 0)}
+                    }
+                })
         elif req.type == "quiz":
             if usage.get("quiz_invocations", 0) >= 10:
-                raise HTTPException(status_code=403, detail="Standard plan limit reached (10 quizzes/mo). Upgrade to Premium.")
+                raise HTTPException(status_code=409, detail={
+                    "error": {
+                        "code": "feature_limit",
+                        "feature": "quiz",
+                        "message": "Standard plan limit reached (10 quizzes/mo). Upgrade to Premium.",
+                        "meta": {"maxMonthlyQuizzes": 10, "plan": "basic", "currentCount": usage.get("quiz_invocations", 0)}
+                    }
+                })
         elif req.type in ["explain", "translate"]:
              raise HTTPException(status_code=403, detail=f"{req.type} is only available on Premium plan.")
 
@@ -2144,7 +2375,13 @@ async def delete_session(session_id: str, current_user: User = Depends(get_curre
         raise HTTPException(status_code=404, detail="Session not found")
     session_data = snap.to_dict()
     ensure_is_owner(session_data, current_user.uid, session_id)
-    doc_ref.delete()
+    
+    # [SOFT DELETE] Set deletedAt instead of hard delete
+    # This allows Free users to "delete and create new" while preserving data for analytics
+    doc_ref.update({
+        "deletedAt": datetime.now(timezone.utc),
+        "status": "deleted"
+    })
     return {"ok": True, "deleted": session_id}
 
 @router.post("/sessions/batch_delete")
@@ -2152,13 +2389,15 @@ async def batch_delete_sessions(body: BatchDeleteRequest, current_user: User = D
     if not body.ids: return {"ok": True, "deleted": 0}
     batch_write = db.batch()
     deleted_count = 0
+    now = datetime.now(timezone.utc)
     for sid in body.ids:
         ref = db.collection("sessions").document(sid)
         snap = ref.get()
         if not snap.exists:
             continue
         ensure_is_owner(snap.to_dict(), current_user.uid, sid)
-        batch_write.delete(ref)
+        # [SOFT DELETE]
+        batch_write.update(ref, {"deletedAt": now, "status": "deleted"})
         deleted_count += 1
     batch_write.commit()
     return {"ok": True, "deleted": deleted_count}

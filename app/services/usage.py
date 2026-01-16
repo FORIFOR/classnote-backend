@@ -244,6 +244,56 @@ class UsageLogger:
             logger.error(f"Credit consumption failed: {e}")
             return False # Fail closed on error
 
+    async def consume_free_summary_credit(self, user_id: str) -> bool:
+        """
+        Atomically decrement 'freeSummaryCreditsRemaining' for Free plan users.
+        Returns True if allowed (decremented or not applicable).
+        Returns False if credit exhausted.
+        """
+        return await self._consume_credit(user_id, "freeSummaryCreditsRemaining")
+
+    async def consume_free_quiz_credit(self, user_id: str) -> bool:
+        """
+        Atomically decrement 'freeQuizCreditsRemaining' for Free plan users.
+        Returns True if allowed (decremented or not applicable).
+        Returns False if credit exhausted.
+        """
+        return await self._consume_credit(user_id, "freeQuizCreditsRemaining")
+
+    async def _consume_credit(self, user_id: str, field_name: str) -> bool:
+        """Generic credit consumption for any field."""
+        user_ref = db.collection("users").document(user_id)
+        
+        @firestore.transactional
+        def txn_consume(transaction, ref):
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                transaction.set(ref, {field_name: 0}, merge=True)
+                return True
+                
+            data = snapshot.to_dict()
+            plan = data.get("plan", "free")
+            
+            if plan != "free":
+                return True # Not limited
+                
+            credits = data.get(field_name)
+            if credits is None:
+                credits = 1  # Default to 1 for new fields
+                
+            if credits > 0:
+                transaction.update(ref, {field_name: credits - 1})
+                return True
+            else:
+                return False
+
+        transaction = db.transaction()
+        try:
+            return txn_consume(transaction, user_ref)
+        except Exception as e:
+            logger.error(f"Credit consumption failed for {field_name}: {e}")
+            return False
+
     async def check_rate_limit(self, user_id: str, key: str, limit: int, window_sec: int = 60) -> bool:
         """
         Check if a user has exceeded a rate limit for a specific key.
