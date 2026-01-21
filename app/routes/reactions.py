@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from app.firebase import db
 from app.dependencies import get_current_user, User, ensure_can_view
 from app.util_models import SetReactionRequest, ReactionStateResponse
+from app.services.session_event_bus import publish_session_event
 
 router = APIRouter()
 
@@ -32,7 +33,15 @@ async def get_reaction_state(session_id: str, current_user: User = Depends(get_c
     my_doc = my_ref.get()
     my_emoji = my_doc.to_dict().get("emoji") if my_doc.exists else None
 
-    return ReactionStateResponse(myEmoji=my_emoji, counts=counts)
+    # Fetch all reactions to build user-emoji map
+    users_map = {}
+    reacts = sess_ref.collection("reactions").stream()
+    for r in reacts:
+        r_data = r.to_dict()
+        if r_data.get("emoji"):
+            users_map[r.id] = r_data["emoji"]
+
+    return ReactionStateResponse(myEmoji=my_emoji, counts=counts, users=users_map)
 
 @router.put("/sessions/{session_id}/reaction", response_model=ReactionStateResponse)
 async def set_reaction(
@@ -92,5 +101,7 @@ async def set_reaction(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transaction failed: {e}")
+
+    await publish_session_event(session_id, "reactions.updated", {"userId": uid, "emoji": my_emoji})
         
     return ReactionStateResponse(myEmoji=my_emoji, counts=counts)

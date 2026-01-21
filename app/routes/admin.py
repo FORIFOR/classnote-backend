@@ -59,9 +59,10 @@ async def get_dashboard_stats(
     kpi = {
         "error5xx": 0,
         "sttFailures": 0,
-        "jobStuck": 0, # Difficult to calc from events alone, maybe check "started" vs "completed" diffs? Skipped for now.
+        "jobStuck": 0,
         "abuseDetected": 0,
-        "activeJobs": 0
+        "activeJobs": 0,
+        "totalCloudMin": 0.0 # [NEW] vNext tracking
     }
     
     recent_alerts = []
@@ -88,26 +89,46 @@ async def get_dashboard_stats(
             # e already has "id" from doc.id
             recent_alerts.append(e)
 
-    # Chart Data (Simple buckets)
-    # Group by hour
-    chart_data = {} # "HH:00" -> {errors: 0, jobs: 0}
+    # Chart Data (Continuous buckets)
+    JST = timezone(timedelta(hours=9))
     
+    # 1. Initialize all buckets for the period
+    chart_data = {} # "YYYY-MM-DD HH:00" -> {time: "HH:00", errors: 0, jobs: 0, sortKey: dt}
+    
+    current = start_time.astimezone(JST).replace(minute=0, second=0, microsecond=0)
+    end = now.astimezone(JST).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    
+    while current < end:
+        key = current.strftime("%Y-%m-%d %H:00")
+        chart_data[key] = {
+            "time": current.strftime("%H:00"), # Label for UI
+            "errors": 0,
+            "jobs": 0,
+            "sortKey": current
+        }
+        current += timedelta(hours=1)
+
+    # 2. Fill with event data
     for e in events:
         ts = e.get("ts")
         if not ts: continue
-        # ts is datetime with timezone
-        hour_key = ts.astimezone(timezone.utc).strftime("%H:00")
         
-        if hour_key not in chart_data:
-            chart_data[hour_key] = {"time": hour_key, "errors": 0, "jobs": 0}
-            
-        if e.get("severity") == "ERROR":
-            chart_data[hour_key]["errors"] += 1
-            
-        if "JOB" in (e.get("type") or ""):
-            chart_data[hour_key]["jobs"] += 1
+        # Convert to JST
+        ts_jst = ts.astimezone(JST)
+        key = ts_jst.strftime("%Y-%m-%d %H:00")
+        
+        if key in chart_data:
+            if e.get("severity") == "ERROR":
+                chart_data[key]["errors"] += 1
+            if "JOB" in (e.get("type") or ""):
+                chart_data[key]["jobs"] += 1
 
-    sorted_chart = sorted(chart_data.values(), key=lambda x: x["time"])
+    # 3. Sort by actual datetime
+    sorted_chart = sorted(chart_data.values(), key=lambda x: x["sortKey"])
+    
+    # Remove sortKey before returning (optional but cleaner)
+    for item in sorted_chart:
+        del item["sortKey"]
 
     return {
         "kpi": kpi,
@@ -180,18 +201,17 @@ async def get_user_detail(uid: str, admin_user: dict = Depends(get_current_admin
         
     user_data = user_doc.to_dict()
     
-    # 2. Stats (Mock or aggregate)
-    # Phase 2: Read from ops_aggregates_user/{uid}
+    # 2. Monthly Usage (vNext Triple Lock)
+    from app.services.cost_guard import cost_guard
+    monthly_report = await cost_guard.get_usage_report(uid)
+
+    # 3. Stats (Legacy/Basic)
     stats = {
-        "totalRecordingSec": 0, # Need to sum up sessions? Expensive.
+        "totalRecordingSec": monthly_report.get("usedSeconds", 0),
         "sessionCount": 0
     }
     
-    # Simple count of sessions (limit to check)
-    sessions = db.collection("sessions").where("ownerUserId", "==", uid).count().get()
-    stats["sessionCount"] = sessions[0][0].value
-    
-    # 3. Recent Events
+    # 4. Recent Events
     events_query = db.collection("ops_events").where("uid", "==", uid).order_by("ts", direction=firestore.Query.DESCENDING).limit(20)
     events = [d.to_dict() for d in events_query.stream()]
     

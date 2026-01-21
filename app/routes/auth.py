@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 import requests
 import os
 import logging
@@ -78,4 +79,3 @@ async def auth_line(req: LineAuthRequest):
         raise HTTPException(status_code=500, detail="Failed to create custom token")
 
     return LineAuthResponse(firebaseCustomToken=custom_token)
-

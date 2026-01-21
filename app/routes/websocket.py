@@ -1,4 +1,4 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 import asyncio
 import struct
 import uuid
@@ -13,6 +13,9 @@ from app.streaming_stt_v2 import StreamingSTTV2, compute_audio_stats
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME
 from google.cloud import firestore
 from app.services.usage import usage_logger
+from app.dependencies import ensure_can_view, _resolve_user_from_token
+from app.services.session_event_bus import session_event_bus
+from app.services.cost_guard import cost_guard  # [FIX] Add Cost Guard for proper limit checking
 
 router = APIRouter()
 logger = logging.getLogger("app.websocket")
@@ -24,6 +27,33 @@ STT_DRAIN_TIMEOUT_SEC = 5.0
 
 def _session_doc_ref(session_id: str):
     return db.collection("sessions").document(session_id)
+
+
+def _resolve_session_ws(session_id: str):
+    """
+    Resolve session by server ID or clientSessionId fallback (WebSocket version).
+    Returns (doc_ref, snapshot, resolved_session_id) or (None, None, None) if not found.
+    """
+    # 1. Direct lookup
+    doc_ref = _session_doc_ref(session_id)
+    snapshot = doc_ref.get()
+    if snapshot.exists:
+        return doc_ref, snapshot, session_id
+
+    # 2. Fallback: Query by clientSessionId
+    try:
+        results = list(db.collection("sessions")
+            .where("clientSessionId", "==", session_id)
+            .limit(1).stream())
+        if results:
+            resolved_doc = results[0]
+            resolved_id = resolved_doc.id
+            logger.info(f"[WS] Resolved clientSessionId {session_id} -> serverId {resolved_id}")
+            return _session_doc_ref(resolved_id), resolved_doc, resolved_id
+    except Exception as e:
+        logger.warning(f"[WS] clientSessionId fallback failed for {session_id}: {e}")
+
+    return None, None, None
 
 
 def _extract_seq_and_pcm(data: bytes) -> tuple[Optional[int], bytes]:
@@ -42,6 +72,73 @@ def _extract_seq_and_pcm(data: bytes) -> tuple[Optional[int], bytes]:
     return None, data
 
 
+@router.websocket("/ws/sessions")
+async def ws_session_events(websocket: WebSocket):
+    await websocket.accept()
+    auth_header = websocket.headers.get("authorization") or ""
+    token = auth_header
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+
+    if not token:
+        await websocket.send_json({"type": "error", "code": "unauthorized"})
+        await websocket.close(code=4401, reason="unauthorized")
+        return
+
+    try:
+        user = _resolve_user_from_token(token)
+    except HTTPException:
+        await websocket.send_json({"type": "error", "code": "unauthorized"})
+        await websocket.close(code=4401, reason="unauthorized")
+        return
+
+    conn_id = await session_event_bus.register(websocket, user.uid)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "code": "invalid_json"})
+                continue
+
+            msg_type = msg.get("type")
+            if msg_type == "subscribe":
+                requested_id = msg.get("sessionId")
+                if not requested_id:
+                    await websocket.send_json({"type": "error", "code": "missing_session_id"})
+                    continue
+                doc_ref, snapshot, resolved_id = _resolve_session_ws(requested_id)
+                if snapshot is None or not snapshot.exists:
+                    await websocket.send_json({"type": "error", "code": "session_not_found"})
+                    continue
+                try:
+                    ensure_can_view(snapshot.to_dict() or {}, user.uid, resolved_id)
+                except HTTPException:
+                    await websocket.send_json({"type": "error", "code": "forbidden"})
+                    await websocket.close(code=4403, reason="forbidden")
+                    return
+                await session_event_bus.subscribe(conn_id, resolved_id)
+                await websocket.send_json({"type": "subscribed", "sessionId": resolved_id})
+            elif msg_type == "unsubscribe":
+                requested_id = msg.get("sessionId")
+                if not requested_id:
+                    await websocket.send_json({"type": "error", "code": "missing_session_id"})
+                    continue
+                doc_ref, snapshot, resolved_id = _resolve_session_ws(requested_id)
+                if resolved_id:
+                    await session_event_bus.unsubscribe(conn_id, resolved_id)
+                await websocket.send_json({"type": "unsubscribed", "sessionId": requested_id})
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+            else:
+                await websocket.send_json({"type": "error", "code": "unsupported_type"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await session_event_bus.unregister(conn_id)
+
+
 @router.websocket("/ws/stream/{session_id}")
 async def ws_stream(websocket: WebSocket, session_id: str):
     await websocket.accept()
@@ -51,14 +148,20 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     session_data = {}
     uid = None
     start_time = time.time()
-    MAX_STREAM_DURATION = 7200 # Default 2h
+    limit_sec = 0.0
+    used_sec = 0.0
+    remaining_sec = 0.0
+    plan = "free"
+    NO_AUDIO_TIMEOUT = 20.0
+    audio_started_at = None
+    frame_count = 0
 
     # --- Connection Phase (Validation & Locks) ---
     try:
-        doc_ref = _session_doc_ref(session_id)
-        doc = doc_ref.get()
+        # [FIX] Support clientSessionId fallback for offline-first clients
+        doc_ref, doc, session_id = _resolve_session_ws(session_id)
 
-        if not doc.exists:
+        if doc is None or not doc.exists:
             logger.warning(f"[/ws/stream] Session not found: {session_id}")
             await websocket.close(code=4000, reason="session_not_found")
             return
@@ -77,14 +180,18 @@ async def ws_stream(websocket: WebSocket, session_id: str):
             # [Security] Concurrent connection lock (Atomic)
             lock_ref = db.collection("active_streams").document(uid)
             
+            # [FIX] Reduced timeout from 3 hours (10800s) to 5 minutes (300s)
+            # to prevent users being locked out after crashes
+            CONCURRENT_LOCK_TIMEOUT_SEC = 300
+
             @firestore.transactional
             def txn_lock(transaction, ref):
                 snap = ref.get(transaction=transaction)
                 if snap.exists:
                     last_active = snap.get("updatedAt")
-                    if last_active and (datetime.utcnow() - last_active.replace(tzinfo=None)).total_seconds() < 10800:
+                    if last_active and (datetime.now(timezone.utc) - last_active.replace(tzinfo=timezone.utc)).total_seconds() < CONCURRENT_LOCK_TIMEOUT_SEC:
                         return False # Active connection exists
-                
+
                 transaction.set(ref, {
                     "sessionId": session_id,
                     "updatedAt": firestore.SERVER_TIMESTAMP
@@ -96,27 +203,70 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 await websocket.close(code=4003, reason="concurrent_stream_limit")
                 return
 
-            # Atomic consume (Only if this session doesn't already have an issued Cloud Ticket)
-            has_ticket = bool(session_data.get("cloudTicket"))
-            if not has_ticket:
-                allowed = await usage_logger.consume_free_cloud_credit(uid)
+            # [FIX] Use Atomic Transaction for ticket issuance to prevent double-counting
+            @firestore.transactional
+            def txn_issue_ticket(transaction, s_ref, u_uid):
+                s_snap = s_ref.get(transaction=transaction)
+                s_data = s_snap.to_dict() or {}
+                
+                # 1. Already has ticket?
+                if s_data.get("cloudTicket"):
+                    return True, s_data.get("cloudTicket")
+                
+                # 2. Check and increment usage (passing transaction)
+                # Note: cost_guard.guard_can_consume (transactional)
+                # However, guard_can_consume is async and transactional decorator is sync.
+                # We should use _check_and_reserve_logic directly if we are inside a sync txn.
+                
+                m_ref = cost_guard._get_monthly_doc_ref(u_uid)
+                u_ref = db.collection("users").document(u_uid)
+                
+                allowed, meta = cost_guard._check_and_reserve_logic(
+                    transaction, u_ref, m_ref, u_uid, "cloud_sessions_started", 1, cost_guard._get_month_key()
+                )
+                
                 if not allowed:
-                    lock_ref.delete()
-                    logger.info(f"[/ws/stream] User {uid} exhausted Free tier Cloud credits. Rejecting connection.")
-                    await websocket.close(code=4003, reason="free_cloud_credit_exhausted")
-                    return
+                    return False, "cloud_session_limit_exceeded"
+                
+                # 3. Issue and persist ticket
+                new_ticket = str(uuid.uuid4())
+                transaction.update(s_ref, {
+                    "cloudTicket": new_ticket, 
+                    "cloudTicketIssuedAt": firestore.SERVER_TIMESTAMP,
+                    "transcriptionMode": "cloud_google" # Auto-upgrade mode
+                })
+                return True, new_ticket
 
-        # Duration & Timeout Calculation
-        cloud_allowed_until = session_data.get("cloudAllowedUntil")
-        if cloud_allowed_until:
-            if hasattr(cloud_allowed_until, 'timestamp'):
-                 MAX_STREAM_DURATION = max(0, cloud_allowed_until.timestamp() - time.time())
-        else:
-            created_at = session_data.get("createdAt")
-            if created_at and hasattr(created_at, 'timestamp'):
-                MAX_STREAM_DURATION = max(0, (created_at.timestamp() + 7200) - time.time())
+            # Execute ticket issuance
+            success, result_or_ticket = txn_issue_ticket(db.transaction(), doc_ref, uid)
+            if not success:
+                lock_ref.delete()
+                logger.info(f"[/ws/stream] User {uid} rejected: {result_or_ticket}")
+                await websocket.close(code=4003, reason=result_or_ticket)
+                return
+            
+            # Refresh session_data with the new ticket/mode
+            if not session_data.get("cloudTicket"):
+                session_data["cloudTicket"] = result_or_ticket
+                session_data["transcriptionMode"] = "cloud_google"
 
-        logger.info(f"[/ws/stream] Setup complete for session_id={session_id}, duration_limit={MAX_STREAM_DURATION:.0f}s")
+            # [FIX] Check remaining cloud_stt_sec quota and enforce monthly limits
+            usage_report = await cost_guard.get_usage_report(uid)
+            limit_sec = float(usage_report.get("limitSeconds", 0.0))
+            used_sec = float(usage_report.get("usedSeconds", 0.0))
+            remaining_sec = float(usage_report.get("remainingSeconds", 0.0))
+            can_start = usage_report.get("canStart", True)
+            plan = usage_report.get("plan", "free")
+
+            if not can_start or remaining_sec <= 0:
+                lock_ref.delete()
+                reason = usage_report.get("reasonIfBlocked", "cloud_minutes_limit")
+                logger.info(f"[/ws/stream] User {uid} has no remaining cloud STT quota. Rejecting. reason={reason}")
+                await websocket.close(code=4003, reason=reason)
+                return
+            logger.info(f"[/ws/stream] User {uid} remaining quota: {remaining_sec:.0f}s (limit={limit_sec:.0f}s, used={used_sec:.0f}s, plan={plan})")
+
+        logger.info(f"[/ws/stream] Setup complete for session_id={session_id}, quota_remaining={remaining_sec:.0f}s, plan={plan}")
     except Exception as e:
         logger.error(f"[/ws/stream] Initial setup failed: {e}", exc_info=True)
         await websocket.close(code=1011, reason="internal_setup_error")
@@ -135,14 +285,22 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     # Session State
     started = False
     stop_requested = False
+    segment_index = 0
     last_seq = -1
     audio_chunk_count = 0
     total_audio_bytes = 0
     max_audio_amplitude = 0
     last_recv_time = time.time()
+    consumed_quota_sec = 0.0 # [NEW] Track real-time consumption
+    quota_warning_sent = False
 
-    # Transcript Accumulator - CRITICAL for persistence
-    final_transcripts: list[str] = []
+
+    # Transcript Accumulator - Segment-based for proper persistence
+    # Each segment: {"id": str, "text": str, "startMs": int, "endMs": int, "isFinal": bool, "segmentIndex": int}
+    transcript_segments: list[dict] = []
+    current_partial: str = ""  # Latest partial for draft saving
+    segment_counter = 0
+    last_final_end_ms = 0  # Track end time for next segment
 
     # Config defaults
     language_code = "ja-JP"
@@ -174,7 +332,7 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 continue
 
     async def run_stt(lang: str, rate: int):
-        nonlocal final_transcripts
+        nonlocal transcript_segments, current_partial, segment_counter, last_final_end_ms
         logger.info(f"[/ws/stream] Starting V2 STT task (lang={lang})")
 
         try:
@@ -187,11 +345,29 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 if "transcript" in event:
                     transcript_text = event.get("transcript", "")
                     is_final = event.get("is_final", False)
+                    
+                    # Estimate timing based on audio bytes received
+                    current_time_ms = int((total_audio_bytes / 32.0))  # 16kHz * 2bytes = 32000 bytes/sec
 
-                    # Accumulate Final Transcripts for Persistence
                     if is_final and transcript_text:
-                        final_transcripts.append(transcript_text)
-                        logger.debug(f"[/ws/stream] Final transcript accumulated: {len(final_transcripts)} segments")
+                        # Save as confirmed segment
+                        segment_counter += 1
+                        segment = {
+                            "id": f"seg_{segment_counter:04d}",
+                            "text": transcript_text,
+                            "startMs": last_final_end_ms,
+                            "endMs": current_time_ms,
+                            "isFinal": True,
+                            "segmentIndex": segment_index,
+                            "seq": last_seq
+                        }
+                        transcript_segments.append(segment)
+                        last_final_end_ms = current_time_ms
+                        current_partial = ""  # Clear partial after final
+                        logger.debug(f"[/ws/stream] Final segment #{segment_counter}: {len(transcript_text)} chars")
+                    else:
+                        # Update current partial (for draft)
+                        current_partial = transcript_text
 
                     resp = {
                         "event": "final" if is_final else "partial",
@@ -219,15 +395,10 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 except Exception:
                     pass
         finally:
-            logger.info(f"[/ws/stream] V2 STT task finished. Accumulated {len(final_transcripts)} final segments.")
+            logger.info(f"[/ws/stream] V2 STT task finished. Accumulated {len(transcript_segments)} final segments.")
 
     try:
         while True:
-            # [Security] Forced Disconnect check (Absolute 120m limit)
-            if time.time() - start_time > MAX_STREAM_DURATION:
-                 logger.warning(f"[/ws/stream] Session {session_id} exceeded absolute duration limit. Forced disconnect.")
-                 break
-            
             # [Security] No-Audio Timeout (20s)
             # If start was received but no audio bytes arrived within 20s
             if started and total_audio_bytes == 0 and audio_started_at:
@@ -246,6 +417,10 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                     if event == "start":
                         client_config = data.get("config", {})
                         client_ticket = data.get("cloudTicket") # [NEW] Authorization Ticket
+                        try:
+                            segment_index = int(data.get("segmentIndex", 0))
+                        except (TypeError, ValueError):
+                            segment_index = 0
                         
                         logger.info(f"[/ws/stream] START: {json.dumps(client_config)} ticket={client_ticket}")
 
@@ -332,15 +507,66 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 with tmp_file.open("ab") as f:
                     f.write(pcm)
 
-                # Push to Queue (Backpressure)
+                # [NEW] Real-time Quota Check
                 if started:
+                    # Calculate consumed seconds (16kHz, 16bit = 32000 bytes/sec)
+                    consumed_quota_sec += len(pcm) / 32000.0
+                    
+                    remaining_now = max(0.0, remaining_sec - consumed_quota_sec)
+                    if remaining_sec > 0 and not quota_warning_sent and remaining_now <= 300.0:
+                        try:
+                            await websocket.send_json({
+                                "event": "quota_warning",
+                                "remainingSeconds": remaining_now,
+                                "limitSeconds": limit_sec,
+                                "usedSeconds": used_sec + consumed_quota_sec,
+                                "plan": plan,
+                                "thresholdSeconds": 300
+                            })
+                            quota_warning_sent = True
+                        except Exception:
+                            pass
+
+                    if remaining_sec > 0 and consumed_quota_sec >= remaining_sec:
+                        logger.warning(f"[/ws/stream] Quota exhausted during stream. Consumed: {consumed_quota_sec:.2f}s, Limit: {remaining_sec:.2f}s")
+                        
+                        # Calculate Next Month 1st
+                        from datetime import timedelta
+                        JST = timezone(timedelta(hours=9))
+                        now_jst = datetime.now(JST)
+                        if now_jst.month == 12:
+                            next_month = now_jst.replace(year=now_jst.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                        else:
+                            next_month = now_jst.replace(month=now_jst.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                        
+                        # 1. Send Event
+                        try:
+                            await websocket.send_json({
+                                "event": "quota_exhausted",
+                                "lockedUntil": next_month.isoformat(),
+                                "consumedSeconds": consumed_quota_sec,
+                                "remainingSeconds": 0.0,
+                                "limitSeconds": limit_sec,
+                                "usedSeconds": used_sec + consumed_quota_sec,
+                                "plan": plan
+                            })
+                            # Small delay to ensure client receives the message
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+                            
+                        # 2. Force Disconnect (Stop STT)
+                        stop_requested = True
+                        if started:
+                            await audio_queue.put(None) # Signal generator to stop
+                        break
+
+                    # Push to Queue (Backpressure)
                     if audio_queue.full():
-                        # Drop oldest to keep latency low
                         try:
                             _ = audio_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             pass
-
                     await audio_queue.put(pcm)
 
     except WebSocketDisconnect:
@@ -349,6 +575,7 @@ async def ws_stream(websocket: WebSocket, session_id: str):
         logger.error(f"[/ws/stream] Unexpected: {e}", exc_info=True)
     finally:
         # Cleanup
+        logger.info(f"[/ws/stream] Closing WebSocket for session {session_id}. started={started}, stop_requested={stop_requested}")
         stop_event.set()
         if stt_task and not stt_task.done():
             stt_task.cancel()
@@ -411,20 +638,48 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 logger.error(f"[/ws/stream] Failed to log usage: {e}")
 
         # ====== CRITICAL: Persist Transcript to Firestore ======
-        if final_transcripts:
-            full_text = "".join(final_transcripts)
-            logger.info(f"[/ws/stream] Persisting transcript ({len(full_text)} chars) for session {session_id}")
+        try:
+            current_doc = doc_ref.get()
+            current_data = current_doc.to_dict() if current_doc.exists else {}
+        except Exception:
+            current_doc = None
+            current_data = {}
+
+        existing_segments = current_data.get("transcriptSegments", []) or []
+        if transcript_segments:
+            existing_segments = [
+                seg for seg in existing_segments
+                if seg.get("segmentIndex", 0) != segment_index
+            ]
+            merged_segments = existing_segments + transcript_segments
+        else:
+            merged_segments = existing_segments
+
+        merged_segments.sort(key=lambda seg: (seg.get("segmentIndex", 0), seg.get("startMs", 0)))
+
+        full_text = "".join(seg.get("text", "") for seg in merged_segments)
+        draft_text = full_text + current_partial if current_partial else full_text
+        total_chars = len(full_text)
+
+        logger.info(
+            f"[/ws/stream] Persisting transcript: segments={len(merged_segments)}, chars={total_chars}, "
+            f"draft={len(draft_text)} chars, segmentIndex={segment_index}"
+        )
+
+        if merged_segments or current_partial:
             try:
                 update_data = {
-                    "transcriptText": full_text,
-                    "hasTranscript": True,
+                    "transcriptText": full_text,  # Confirmed finals only
+                    "transcriptDraft": draft_text if current_partial else None,  # Include trailing partial
+                    "transcriptSegments": merged_segments,
+                    "transcriptSegmentCount": len(merged_segments),
+                    "hasTranscript": total_chars > 0,
                     "transcriptSource": "cloud_streaming_v2",
                     "transcriptUpdatedAt": datetime.now(timezone.utc),
                     "updatedAt": datetime.now(timezone.utc),
                 }
                 # Only update status if not already beyond "transcribed"
-                current_doc = doc_ref.get()
-                current_status = current_doc.to_dict().get("status", "") if current_doc.exists else ""
+                current_status = current_data.get("status", "") if current_data else ""
                 if current_status not in ["summarized", "processed", "completed"]:
                     update_data["status"] = "transcribed"
 
@@ -433,7 +688,7 @@ async def ws_stream(websocket: WebSocket, session_id: str):
             except Exception as e:
                 logger.error(f"[/ws/stream] Failed to persist transcript: {e}", exc_info=True)
         else:
-            logger.warning(f"[/ws/stream] No final transcripts to persist for session {session_id}")
+            logger.warning(f"[/ws/stream] No transcripts to persist for session {session_id}")
 
         # Upload Backup Audio
         if total_audio_bytes > 0 and tmp_file.exists():

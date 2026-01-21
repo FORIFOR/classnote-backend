@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
 from app.dependencies import get_current_user, User, ensure_can_view, ensure_is_owner
 from app.routes.sessions import _session_doc_ref, _derived_doc_ref, _map_derived_status
-from app.task_queue import enqueue_summarize_task, enqueue_quiz_task, enqueue_explain_task, enqueue_playlist_task
+from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
 from app.util_models import (
     AssetManifest,
     AssetItem,
@@ -152,8 +152,6 @@ async def get_session_assets(session_id: str, current_user: User = Depends(get_c
     derived_refs = [
         _derived_doc_ref(session_id, "summary"),
         _derived_doc_ref(session_id, "quiz"),
-        _derived_doc_ref(session_id, "playlist"),
-        _derived_doc_ref(session_id, "explain"),
     ]
     derived_snaps = db.get_all(derived_refs)
     derived_map = {}
@@ -195,10 +193,7 @@ async def get_session_assets(session_id: str, current_user: User = Depends(get_c
     # 4. Quiz
     manifest.quiz = _get_asset_item_from_derived(session_id, "quiz", data, derived_map)
     
-    # 5. Playlist
-    manifest.playlist = _get_asset_item_from_derived(session_id, "playlist", data, derived_map)
-    
-    # 6. Images (Placeholder for now, assumes specific structure in future)
+    # 5. Images (Placeholder for now, assumes specific structure in future)
     # For now, if we have imageNotes collection or similar?
     # Keeping empty as per current implementation status.
     
@@ -332,7 +327,6 @@ async def ensure_asset_generation(
         _derived_doc_ref(session_id, "summary"),
         _derived_doc_ref(session_id, "quiz"),
         _derived_doc_ref(session_id, "playlist"),
-        _derived_doc_ref(session_id, "explain"),
     ]
     derived_snaps = db.get_all(derived_refs)
     derived_map = {s.id: s.to_dict() for s in derived_snaps if s.exists}
@@ -349,10 +343,6 @@ async def ensure_asset_generation(
         enqueue_summarize_task(session_id, user_id=current_user.uid)
     elif asset_type == "quiz":
         enqueue_quiz_task(session_id, user_id=current_user.uid)
-    elif asset_type == "playlist":
-        enqueue_playlist_task(session_id, user_id=current_user.uid)
-    elif asset_type == "explain":
-        enqueue_explain_task(session_id, user_id=current_user.uid)
     else:
         raise HTTPException(400, f"Unsupported asset type for ensure: {asset_type}")
         

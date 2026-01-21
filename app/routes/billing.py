@@ -49,14 +49,16 @@ def _ms_to_datetime(value: Optional[int]) -> Optional[datetime]:
 
 
 def _plan_for_product_id(product_id: Optional[str]) -> str:
+    # [SECURITY FIX] Return "free" instead of "pro" when product_id is missing
     if not product_id:
-        return "pro"
+        return "free"
     lowered = product_id.lower()
     if "pro" in lowered or "premium" in lowered:
         return "pro"
     if "basic" in lowered or "standard" in lowered:
         return "basic"
-    return "pro"
+    # Default to free for unknown product IDs
+    return "free"
 
 
 def _resolve_status(

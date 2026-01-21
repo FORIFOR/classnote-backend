@@ -12,6 +12,42 @@ from app.services import llm
 from app.services.usage import usage_logger
 from app.services.transcripts import resolve_transcript_text
 
+def enqueue_cleanup_sessions_task(user_id: str, background_tasks: BackgroundTasks = None):
+    """
+    [TRIPLE LOCK] Enqueue cleanup task to delete old sessions if limit exceeded.
+    """
+    payload = {"userId": user_id}
+    
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"[Cleanup] Enqueuing local task for user: {user_id}")
+        # Note: We don't have a local runner for this yet in task_queue. 
+        # But we can import it inside the runner or sim. 
+        # For now, just log usage since local cleanup isn't critical for dev?
+        # actually we should run it.
+        # Let's assume we can call the function directly if needed, but it's an API handler.
+        # We can skip local execution for cleanup or mock it.
+        # "cleanup is safe to auto-run".
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/cleanup_sessions"
+    
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        }
+    }
+    
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"[Cleanup] Enqueued task for {user_id}")
+    except Exception as e:
+        logger.error(f"[Cleanup] Failed to enqueue: {e}")
+
+
 logger = logging.getLogger("app.task_queue")
 
 PROJECT_ID = os.environ.get("GCP_PROJECT", "classnote-x-dev")
@@ -33,12 +69,19 @@ def enqueue_summarize_task(
     background_tasks: BackgroundTasks = None,
     idempotency_key: str | None = None,
     user_id: str | None = None,
+    usage_reserved: bool = False,
 ):
     """
     要約タスクをキューに入れる。
     ローカル環境などで Client がない場合は FastAPI の BackgroundTasks にフォールバックする（デバッグ用）。
     """
-    payload = {"sessionId": session_id, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+        "usageReserved": usage_reserved,
+    }
     
     # 1. ローカルデバッグ (No Cloud Tasks Client or Explicit Local Mode)
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
@@ -73,7 +116,14 @@ def enqueue_summarize_task(
         logger.error(f"Failed to create task: {e}")
         raise e
 
-def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None, idempotency_key: str | None = None, user_id: str | None = None):
+def enqueue_quiz_task(
+    session_id: str,
+    count: int = 5,
+    job_id: str | None = None,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+    usage_reserved: bool = False,
+):
     # 同様に実装
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
         logger.info("Running quiz task locally")
@@ -82,7 +132,14 @@ def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     url = f"{CLOUD_RUN_URL}/internal/tasks/quiz"
-    payload = {"sessionId": session_id, "count": count, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
+    payload = {
+        "sessionId": session_id,
+        "count": count,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+        "usageReserved": usage_reserved,
+    }
     
     task = {
         "http_request": {
@@ -93,28 +150,6 @@ def enqueue_quiz_task(session_id: str, count: int = 5, job_id: str | None = None
         }
     }
     
-    tasks_client.create_task(parent=parent, task=task)
-
-def enqueue_explain_task(session_id: str, job_id: str | None = None, idempotency_key: str | None = None, user_id: str | None = None):
-    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
-        logger.info("Running explain task locally")
-        asyncio.create_task(_run_local_explain(session_id, job_id=job_id))
-        return
-
-    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
-    url = f"{CLOUD_RUN_URL}/internal/tasks/explain"
-    payload = {"sessionId": session_id, "jobId": job_id, "idempotencyKey": idempotency_key, "userId": user_id}
-
-    task = {
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": url,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps(payload).encode(),
-        },
-        "dispatch_deadline": {"seconds": 1800},
-    }
-
     tasks_client.create_task(parent=parent, task=task)
 
 def enqueue_qa_task(session_id: str, question: str, user_id: str, qa_id: str):
@@ -185,7 +220,6 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             return
         data = doc.to_dict()
         transcript = resolve_transcript_text(session_id, data)
-        segments = data.get("segments") or data.get("diarizedSegments") or []
         if not transcript:
             logger.warning(f"[local summarize] transcript empty: {session_id}")
             doc_ref.update({
@@ -203,18 +237,27 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             "summaryError": None,
             "summaryUpdatedAt": datetime.utcnow()
         })
-        duration = float(data.get("durationSec") or 0.0)
-        result = await llm.generate_summary_and_tags(transcript, mode=data.get("mode", "lecture"), segments=segments, duration=duration)
+        result = await llm.generate_summary_and_tags(
+            transcript,
+            mode=data.get("mode", "lecture"),
+        )
         summary_md = result.get("summaryMarkdown")
+        summary_json = result.get("summaryJson") or {}
+        summary_type = result.get("summaryType") or data.get("mode", "lecture")
+        summary_json_version = result.get("summaryJsonVersion") or 1
         tags = result.get("tags") or []
-        doc_ref.update({
+        update_payload = {
             "summaryStatus": "completed",
             "summaryMarkdown": summary_md,
+            "summaryJson": summary_json,
+            "summaryJsonVersion": summary_json_version,
+            "summaryType": summary_type,
             "summaryUpdatedAt": datetime.utcnow(),
             "summaryError": None,
-            "tags": tags[:4],
+            "autoTags": tags[:4],
             "status": "要約済み",
-        })
+        }
+        doc_ref.update(update_payload)
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
         # Log usage
@@ -277,40 +320,6 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
         logger.exception(f"[local quiz] failed: {e}")
         doc_ref.update({"quizStatus": "failed", "quizError": str(e), "status": "録音済み"})
 
-async def _run_local_explain(session_id: str, job_id: str | None = None):
-    doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        logger.warning(f"[local explain] session not found: {session_id}")
-        return
-    data = doc.to_dict()
-    transcript = resolve_transcript_text(session_id, data)
-    if not transcript:
-        doc_ref.update({
-            "explainStatus": "failed",
-            "explainError": "Transcript is empty",
-            "status": "録音済み",
-        })
-        return
-    doc_ref.update({"explainStatus": "running", "explainError": None})
-    try:
-        explanation = await llm.generate_explanation(transcript, mode=data.get("mode", "lecture"))
-        doc_ref.update({
-            "explainStatus": "completed",
-            "explainMarkdown": explanation,
-            "explainUpdatedAt": datetime.utcnow(),
-            "explainError": None,
-        })
-        if job_id:
-            db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
-    except Exception as e:
-        logger.exception(f"[local explain] failed: {e}")
-        doc_ref.update({
-            "explainStatus": "failed",
-            "explainError": str(e),
-            "explainUpdatedAt": datetime.utcnow(),
-        })
-
 
 async def _run_local_highlights(session_id: str):
     doc_ref = db.collection("sessions").document(session_id)
@@ -318,33 +327,11 @@ async def _run_local_highlights(session_id: str):
     if not doc.exists:
         logger.warning(f"[local highlights] session not found: {session_id}")
         return
-    data = doc.to_dict()
-    transcript = resolve_transcript_text(session_id, data) or ""
-    segments = data.get("segments") or data.get("diarizedSegments") or []
-    if not transcript:
-        doc_ref.update({
-            "highlightsStatus": "failed",
-            "highlightsError": "Transcript is empty",
-            "highlightsUpdatedAt": datetime.utcnow()
-        })
-        return
-    doc_ref.update({"highlightsStatus": "running", "highlightsError": None})
-    try:
-        result = await llm.generate_highlights_and_tags(transcript, segments)
-        doc_ref.update({
-            "highlightsStatus": "completed",
-            "highlights": result.get("highlights", []),
-            "tags": result.get("tags", []),
-            "highlightsUpdatedAt": datetime.utcnow(),
-            "highlightsError": None
-        })
-    except Exception as e:
-        logger.exception(f"[local highlights] failed: {e}")
-        doc_ref.update({
-            "highlightsStatus": "failed",
-            "highlightsError": str(e),
-            "highlightsUpdatedAt": datetime.utcnow()
-        })
+    doc_ref.update({
+        "highlightsStatus": "failed",
+        "highlightsError": "deprecated",
+        "highlightsUpdatedAt": datetime.utcnow()
+    })
 
 
 async def _run_local_playlist(session_id: str):
@@ -353,79 +340,39 @@ async def _run_local_playlist(session_id: str):
     if not doc.exists:
         logger.warning(f"[local playlist] session not found: {session_id}")
         return
-    data = doc.to_dict()
-    transcript = resolve_transcript_text(session_id, data) or ""
-    segments = data.get("diarizedSegments") or data.get("segments") or []
-    if not transcript:
-        doc_ref.update({
-            "playlistStatus": "failed",
-            "playlistError": "Transcript is empty",
-            "playlistUpdatedAt": datetime.utcnow()
-        })
-        return
     doc_ref.update({
-        "playlistStatus": "running",
-        "playlistError": None,
+        "playlistStatus": "failed",
+        "playlistError": "deprecated",
         "playlistUpdatedAt": datetime.utcnow()
     })
-    try:
-        duration = data.get("durationSec")
-        raw = await llm.generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
-        try:
-            items_raw = json.loads(raw)
-        except Exception:
-            items_raw = []
-        from app.services.playlist_utils import normalize_playlist_items
-        normalized = normalize_playlist_items(items_raw, segments=segments, duration_sec=duration)
-        doc_ref.update({
-            "playlistStatus": "completed",
-            "playlist": normalized,
-            "playlistUpdatedAt": datetime.utcnow(),
-            "playlistError": None
-        })
-    except Exception as e:
-        logger.exception(f"[local playlist] failed: {e}")
-        doc_ref.update({
-            "playlistStatus": "failed",
-            "playlistError": str(e),
-            "playlistUpdatedAt": datetime.utcnow()
-        })
 def enqueue_generate_highlights_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
     """
     ハイライト生成タスクをキューに入れる。
     """
-    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
-        logger.info("Running highlights task locally")
-        asyncio.create_task(_run_local_highlights(session_id))
+    logger.info("Highlights task is deprecated; skipping enqueue.")
+
+def enqueue_nuke_user_task(user_id: str):
+    """
+    [CRITICAL] Enqueue a task to completely wipe a user's account and data.
+    """
+    payload = {"userId": user_id}
+
+    # Lock Safety: Local execution not supported for safety (always async)
+    # But if no queue client, we must log error or use background_tasks if passed
+    # For now, if no client, we just log error as this is critical op.
+    
+    if tasks_client is None:
+        if os.environ.get("USE_LOCAL_TASKS") == "1":
+             # Local dev mode - just spawn async task? 
+             # Or maybe we need to support it for testing.
+             logger.info(f"Running NUKE task locally for {user_id}")
+             asyncio.create_task(_run_local_nuke(user_id))
+             return
+        logger.error("Cloud Tasks client missing, cannot enqueue Nuke User task.")
         return
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
-    url = f"{CLOUD_RUN_URL}/internal/tasks/highlights"
-    payload = {"sessionId": session_id, "userId": user_id, "jobId": job_id}
-
-    task = {
-        "http_request": {
-            "http_method": tasks_v2.HttpMethod.POST,
-            "url": url,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps(payload).encode(),
-        }
-    }
-
-    tasks_client.create_task(parent=parent, task=task)
-
-def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
-    """
-    プレイリスト生成タスクをキューに入れる。
-    """
-    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
-        logger.info("Running playlist task locally")
-        asyncio.create_task(_run_local_playlist(session_id))
-        return
-
-    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
-    url = f"{CLOUD_RUN_URL}/internal/tasks/playlist"
-    payload = {"sessionId": session_id, "userId": user_id, "jobId": job_id}
+    url = f"{CLOUD_RUN_URL}/internal/tasks/nuke_user"
 
     task = {
         "http_request": {
@@ -434,15 +381,21 @@ def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: s
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps(payload).encode(),
         },
-        "dispatch_deadline": {"seconds": 1800},
+        "dispatch_deadline": {"seconds": 1800}, # 30 mins max
     }
 
     try:
         tasks_client.create_task(parent=parent, task=task)
-        logger.info(f"Enqueued playlist task for session {session_id}")
+        logger.info(f"Enqueued NUKE task for {user_id}")
     except Exception as e:
-        logger.error(f"Failed to enqueue playlist task: {e}")
+        logger.error(f"Failed to enqueue Nuke task for {user_id}: {e}")
         raise e
+
+def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
+    """
+    プレイリスト生成タスクをキューに入れる。
+    """
+    logger.info("Playlist task is deprecated; skipping enqueue.")
 
 def enqueue_transcribe_task(
     session_id: str,

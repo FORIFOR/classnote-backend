@@ -305,7 +305,7 @@ def log_stt_event(
 
 def log_llm_event(
     session_id: str,
-    llm_type: str,  # "summary", "quiz", "explain", etc.
+    llm_type: str,  # "summary", "quiz", "qa", etc.
     status: str,  # "started", "completed", "failed"
     *,
     uid: Optional[str] = None,

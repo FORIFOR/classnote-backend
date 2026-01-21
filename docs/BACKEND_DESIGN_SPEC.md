@@ -37,7 +37,7 @@ A session represents a single class recording or meeting.
 
 ### 2.3 Jobs (`sessions/{id}/jobs` sub-collection)
 Asynchronous tasks for heavy processing.
-- **Types**: `transcribe`, `summary`, `quiz`, `explain`, `translate`
+- **Types**: `transcribe`, `summary`, `quiz`, `translate`
 - **State Machine**: `queued` -> `processing` -> `completed` / `failed` (w/ `error` field)
 - **Worker**: Background tasks run within the generic API instance (via `app.task_queue`), utilizing Cloud Run's CPU allocation for async IO waiting, but offloading heavy compute (STT/LLM) to GCP APIs.
 

@@ -14,11 +14,66 @@ from app.routes.sessions import (
     _session_doc_ref,
     _upsert_session_member,
 )
-from app.task_queue import enqueue_quiz_task, enqueue_summarize_task, enqueue_playlist_task
-from app.util_models import ImportYouTubeRequest, ImportYouTubeResponse
+from app.task_queue import enqueue_quiz_task, enqueue_summarize_task
+from app.util_models import ImportYouTubeRequest, ImportYouTubeResponse, YouTubeCheckRequest, YouTubeCheckResponse, YouTubeTrack
 
 router = APIRouter()
 logger = logging.getLogger("app.imports")
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import (
+        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+    )
+    YT_TRANSCRIPT_AVAILABLE = True
+except ImportError:
+    YouTubeTranscriptApi = None
+    TranscriptsDisabled = NoTranscriptFound = VideoUnavailable = None
+    YT_TRANSCRIPT_AVAILABLE = False
+
+@router.post("/imports/youtube/check", response_model=YouTubeCheckResponse)
+async def check_youtube_transcript(req: YouTubeCheckRequest):
+    """
+    [vNext] Verifies if a YouTube video has available transcripts before import.
+    """
+    if not YT_TRANSCRIPT_AVAILABLE:
+        raise HTTPException(status_code=503, detail="youtube-transcript-api is not installed")
+
+    try:
+        video_id = _parse_youtube_video_id(req.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        # Utilizing the library to list available transcripts
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        tracks = []
+        for t in transcript_list:
+            tracks.append(YouTubeTrack(
+                language=t.language,
+                language_code=t.language_code,
+                is_generated=t.is_generated,
+                is_translatable=t.is_translatable
+            ))
+            
+        return YouTubeCheckResponse(
+            videoId=video_id,
+            available=len(tracks) > 0,
+            tracks=tracks
+        )
+
+    except TranscriptsDisabled:
+        return YouTubeCheckResponse(videoId=video_id, available=False, reason="transcripts_disabled")
+    except NoTranscriptFound:
+        return YouTubeCheckResponse(videoId=video_id, available=False, reason="no_transcript")
+    except VideoUnavailable:
+        return YouTubeCheckResponse(videoId=video_id, available=False, reason="video_unavailable")
+    except Exception as e:
+        logger.error(f"Unexpected error checking YouTube video {video_id}: {e}")
+        return YouTubeCheckResponse(videoId=video_id, available=False, reason="internal_error")
+
+
 
 
 def _parse_youtube_video_id(url: str) -> str:
@@ -108,6 +163,8 @@ async def import_youtube(req: ImportYouTubeRequest, current_user: User = Depends
 
     # Determine status based on provided transcript
     has_transcript = bool(req.transcriptText and req.transcriptText.strip())
+    if not has_transcript and not YT_TRANSCRIPT_AVAILABLE:
+        raise HTTPException(status_code=503, detail="youtube-transcript-api is not installed")
     initial_status = "recording_finished" if has_transcript else "queued"
     
     # Initial Session Data
@@ -163,7 +220,6 @@ async def import_youtube(req: ImportYouTubeRequest, current_user: User = Depends
         try:
             enqueue_summarize_task(session_id, user_id=owner_uid)
             enqueue_quiz_task(session_id, user_id=owner_uid)
-            enqueue_playlist_task(session_id, user_id=owner_uid)
         except Exception as exc:
             logger.exception(f"Failed to enqueue summary/quiz for {session_id}: {exc}")
             # Non-blocking error?

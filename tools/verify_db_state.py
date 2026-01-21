@@ -37,7 +37,7 @@ print(f"quizMarkdown (len): {len(data.get('quizMarkdown') or '')}")
 print("-" * 20)
 
 # Derived Docs
-for kind in ["summary", "quiz", "explain"]:
+for kind in ["summary", "quiz"]:
     dd = db.collection("sessions").document(SESSION_ID).collection("derived").document(kind).get()
     if dd.exists:
         ddata = dd.to_dict()

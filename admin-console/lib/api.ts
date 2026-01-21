@@ -26,13 +26,25 @@ export async function fetchApi(path: string, options: RequestInit = {}) {
     });
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const errorMessage = errorData.detail || `API request failed: ${response.status} ${response.statusText}`;
+      const contentType = response.headers.get("content-type") || "";
+      const rawBody = await response.text().catch(() => "");
+      let errorData: any = {};
+      if (rawBody && contentType.includes("application/json")) {
+        try {
+          errorData = JSON.parse(rawBody);
+        } catch {
+          errorData = {};
+        }
+      }
+      const errorMessage =
+        errorData.detail || `API request failed: ${response.status} ${response.statusText}`;
       console.error("API Error Details:", {
         path,
         status: response.status,
         statusText: response.statusText,
-        detail: errorData
+        contentType,
+        detail: errorData,
+        body: rawBody.slice(0, 500),
       });
       throw new Error(errorMessage);
     }

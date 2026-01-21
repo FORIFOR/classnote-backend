@@ -74,6 +74,13 @@ class UsageLogger:
                 event_type=event_type,
                 payload=payload
             )
+            # [TRIPLE LOCK] Update Monthly Aggregates for Cost Control
+            await self._update_monthly_aggregate(
+                user_id=user_id,
+                feature=feature,
+                event_type=event_type,
+                payload=payload
+            )
         except Exception as e:
             logger.exception(f"[UsageLogger] Failed to log usage: {e}")
     
@@ -199,100 +206,67 @@ class UsageLogger:
             doc_ref.set(increments, merge=True)
             logger.debug(f"[UsageLogger] Daily usage updated: {doc_id}")
 
+    async def _update_monthly_aggregate(
+        self,
+        user_id: str,
+        feature: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]]
+    ) -> None:
+        """
+        [TRIPLE LOCK] Update monthly usage counters.
+        Path: users/{uid}/monthly_usage/{YYYY-MM} (JST)
+        """
+        from datetime import timezone, timedelta
+        JST = timezone(timedelta(hours=9))
+        month_str = datetime.now(JST).strftime("%Y-%m")
+        doc_ref = db.collection("users").document(user_id).collection("monthly_usage").document(month_str)
+        
+        increments = {}
+        
+        # 1. Cloud STT (Seconds) - Only track success
+        if feature == "transcribe" and event_type == "success" and payload:
+            rec_sec = float(payload.get("recording_sec", 0))
+            rec_type = payload.get("type", "cloud")
+            if rec_type == "cloud" and rec_sec > 0:
+                increments["cloud_stt_sec"] = firestore.Increment(rec_sec)
+                
+        # 2. Cloud Sessions Started
+        if feature == "recording" and event_type == "invoke" and payload:
+            rec_type = payload.get("type", "cloud")
+            if rec_type == "cloud":
+                increments["cloud_sessions_started"] = firestore.Increment(1)
+
+        # 3. AI Generated (Summary/Quiz)
         if event_type == "success":
-             pass # No flag tracking needed, we consume at start.
+            if feature == "summary":
+                increments["summary_generated"] = firestore.Increment(1)
+                increments["llm_calls"] = firestore.Increment(1)
+            elif feature == "quiz":
+                increments["quiz_generated"] = firestore.Increment(1)
+                increments["llm_calls"] = firestore.Increment(1)
+            elif feature == "qa":
+                increments["llm_calls"] = firestore.Increment(1)
+             
+        if increments:
+             increments["updated_at"] = datetime.now(timezone.utc)
+             doc_ref.set(increments, merge=True)
 
     async def consume_free_cloud_credit(self, user_id: str) -> bool:
-        """
-        Atomically decrement 'freeCloudCreditsRemaining' for Free plan users.
-        Returns True if allowed (decremented or not applicable).
-        Returns False if credit exhausted.
-        """
-        user_ref = db.collection("users").document(user_id)
-        
-        @firestore.transactional
-        def txn_consume(transaction, ref):
-            snapshot = ref.get(transaction=transaction)
-            if not snapshot.exists:
-                # Implicit create? Or just fail? 
-                # Better to assume user exists if we are here (auth passed)
-                # But if doc missing, default to 1 -> 0
-                transaction.set(ref, {"freeCloudCreditsRemaining": 0}, merge=True)
-                return True
-                
-            data = snapshot.to_dict()
-            plan = data.get("plan", "free")
-            
-            if plan != "free":
-                return True # Not limited
-                
-            # Default to 1 if not present
-            credits = data.get("freeCloudCreditsRemaining")
-            if credits is None:
-                credits = 1
-                
-            if credits > 0:
-                transaction.update(ref, {"freeCloudCreditsRemaining": credits - 1})
-                return True
-            else:
-                return False
-
-        transaction = db.transaction()
-        try:
-            return txn_consume(transaction, user_ref)
-        except Exception as e:
-            logger.error(f"Credit consumption failed: {e}")
-            return False # Fail closed on error
+        """[DEPRECATED] vNext uses CostGuard. Always returns True."""
+        return True
 
     async def consume_free_summary_credit(self, user_id: str) -> bool:
-        """
-        Atomically decrement 'freeSummaryCreditsRemaining' for Free plan users.
-        Returns True if allowed (decremented or not applicable).
-        Returns False if credit exhausted.
-        """
-        return await self._consume_credit(user_id, "freeSummaryCreditsRemaining")
+        """[DEPRECATED] vNext uses CostGuard. Always returns True."""
+        return True
 
     async def consume_free_quiz_credit(self, user_id: str) -> bool:
-        """
-        Atomically decrement 'freeQuizCreditsRemaining' for Free plan users.
-        Returns True if allowed (decremented or not applicable).
-        Returns False if credit exhausted.
-        """
-        return await self._consume_credit(user_id, "freeQuizCreditsRemaining")
+        """[DEPRECATED] vNext uses CostGuard. Always returns True."""
+        return True
 
     async def _consume_credit(self, user_id: str, field_name: str) -> bool:
-        """Generic credit consumption for any field."""
-        user_ref = db.collection("users").document(user_id)
-        
-        @firestore.transactional
-        def txn_consume(transaction, ref):
-            snapshot = ref.get(transaction=transaction)
-            if not snapshot.exists:
-                transaction.set(ref, {field_name: 0}, merge=True)
-                return True
-                
-            data = snapshot.to_dict()
-            plan = data.get("plan", "free")
-            
-            if plan != "free":
-                return True # Not limited
-                
-            credits = data.get(field_name)
-            if credits is None:
-                credits = 1  # Default to 1 for new fields
-                
-            if credits > 0:
-                transaction.update(ref, {field_name: credits - 1})
-                return True
-            else:
-                return False
-
-        transaction = db.transaction()
-        try:
-            return txn_consume(transaction, user_ref)
-        except Exception as e:
-            logger.error(f"Credit consumption failed for {field_name}: {e}")
-            return False
+        """[DEPRECATED] vNext always allowed here."""
+        return True
 
     async def check_rate_limit(self, user_id: str, key: str, limit: int, window_sec: int = 60) -> bool:
         """

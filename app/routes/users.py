@@ -21,6 +21,13 @@ from app.util_models import (
     EntitlementResponse,
 )
 from app.firebase import db
+from app.services.account_deletion import (
+    LOCKS_COLLECTION,
+    REQUESTS_COLLECTION,
+    deletion_lock_id,
+    deletion_schedule_at,
+)
+from app.services.cost_guard import cost_guard, FREE_LIMITS, BASIC_LIMITS, PREMIUM_LIMITS
 import re
 import logging
 
@@ -122,24 +129,46 @@ async def get_me(current_user: User = Depends(get_current_user)):
         data = doc.to_dict() or {}
         
     is_shareable = data.get("isShareable", data.get("allowSearch", True))
-    # [NEW] Count active sessions for Free plan paywall
-    active_session_count = None
-    if data.get("plan", "free") == "free":
-        try:
-            # Query sessions without complex filters to avoid missing index errors
-            active_sessions_query = db.collection("sessions")\
-                .where("ownerUid", "==", current_user.uid)\
-                .limit(50).stream()
-            
-            # Count only active (deletedAt is None)
-            count = 0
-            for d in active_sessions_query:
-                if d.to_dict().get("deletedAt") is None:
-                    count += 1
-            active_session_count = count
-        except Exception as e:
-            logger.warning(f"Error counting active sessions: {e}")
-            active_session_count = 0
+    
+    # Normalize plan (pro -> premium, standard -> basic)
+    plan = data.get("plan", "free")
+    if plan in ("pro", "premium"):
+        plan = "premium"
+    elif plan in ("basic", "standard"):
+        plan = "basic"
+    else:
+        plan = "free"
+    
+    # [vNext] Consolidated Cloud Usage Report
+    usage_report = await cost_guard.get_usage_report(current_user.uid)
+    month_ref = cost_guard._get_monthly_doc_ref(current_user.uid)
+    month_snap = month_ref.get()
+    month_data = month_snap.to_dict() if month_snap.exists else {}
+
+    if plan == "premium":
+        summary_limit = PREMIUM_LIMITS["llm_calls"]
+        quiz_limit = PREMIUM_LIMITS["llm_calls"]
+        used_llm = int(month_data.get("llm_calls", 0))
+        free_summary_remaining = max(0, summary_limit - used_llm)
+        free_quiz_remaining = max(0, quiz_limit - used_llm)
+    elif plan == "basic":
+        summary_limit = BASIC_LIMITS["summary_generated"]
+        quiz_limit = BASIC_LIMITS["quiz_generated"]
+        used_summary = int(month_data.get("summary_generated", 0))
+        used_quiz = int(month_data.get("quiz_generated", 0))
+        free_summary_remaining = max(0, summary_limit - used_summary)
+        free_quiz_remaining = max(0, quiz_limit - used_quiz)
+    else:
+        summary_limit = FREE_LIMITS["summary_generated"]
+        quiz_limit = FREE_LIMITS["quiz_generated"]
+        used_summary = int(month_data.get("summary_generated", 0))
+        used_quiz = int(month_data.get("quiz_generated", 0))
+        free_summary_remaining = max(0, summary_limit - used_summary)
+        free_quiz_remaining = max(0, quiz_limit - used_quiz)
+    
+    # Extract compatibility fields
+    server_session_count = int(data.get("serverSessionCount", 0))
+    cloud_session_count = usage_report.get("sessionsStarted", 0)
     
     return MeResponse(
         id=current_user.uid,
@@ -151,17 +180,24 @@ async def get_me(current_user: User = Depends(get_current_user)):
         photoUrl=data.get("photoUrl"),
         providers=data.get("providers", []),
         provider=data.get("provider"),
-        allowSearch=data.get("allowSearch", True),
+        allowSearch=is_shareable, # allowSearch is now linked to isShareable
         shareCode=data.get("shareCode"),
         isShareable=is_shareable,
-        plan=data.get("plan", "free"),
+        plan=plan,
         createdAt=data.get("createdAt"),
         securityState=data.get("securityState", "normal"),
         riskScore=data.get("riskScore", 0),
-        freeCloudCreditsRemaining=data.get("freeCloudCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
-        freeSummaryCreditsRemaining=data.get("freeSummaryCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
-        freeQuizCreditsRemaining=data.get("freeQuizCreditsRemaining", 1) if data.get("plan", "free") == "free" else None,
-        activeSessionCount=active_session_count
+        # [vNext] Consolidated Report
+        cloud=usage_report,
+        # [Legacy Compat]
+        serverSessionCount=server_session_count,
+        serverSessionLimit=5 if plan == "free" else 300,
+        cloudSessionCount=cloud_session_count,
+        cloudSessionLimit=3 if plan == "free" else 999999,
+        activeSessionCount=server_session_count,
+        freeCloudCreditsRemaining=1 if cloud_session_count < 3 else 0, # Best effort mapping
+        freeSummaryCreditsRemaining=free_summary_remaining,
+        freeQuizCreditsRemaining=free_quiz_remaining
     )
 
 @router.get("/me/entitlement", response_model=EntitlementResponse)
@@ -704,4 +740,131 @@ async def search_by_share_code(code: str, current_user: User = Depends(get_curre
         found=True,
         targetUserId=doc.id,
         displayName=data.get("displayName"),
+    )
+
+
+@router.delete("/me", status_code=204)
+async def delete_me(current_user: User = Depends(get_current_user)):
+    """
+    [ASYNC] Request account deletion.
+    Records a deletion request and schedules hard delete after a grace period.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        delete_after = deletion_schedule_at(now)
+
+        user_ref = db.collection("users").document(current_user.uid)
+        user_doc = user_ref.get()
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+
+        email = user_data.get("email") or current_user.email
+        email_lower = email.lower() if email else None
+        provider_id = user_data.get("provider")
+        providers = user_data.get("providers") or []
+        if not provider_id and providers:
+            provider_id = providers[0]
+
+        req_data = {
+            "uid": current_user.uid,
+            "email": email,
+            "emailLower": email_lower,
+            "providerId": provider_id,
+            "providers": providers,
+            "status": "requested",
+            "requestedAt": now,
+            "deleteAfterAt": delete_after,
+        }
+        req_data = {k: v for k, v in req_data.items() if v is not None}
+        db.collection(REQUESTS_COLLECTION).document(current_user.uid).set(req_data, merge=True)
+
+        user_ref.set(
+            {
+                "deletionRequestedAt": now,
+                "deletionScheduledAt": delete_after,
+                "deletionStatus": "requested",
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        if email_lower and provider_id:
+            lock_data = {
+                "uid": current_user.uid,
+                "emailLower": email_lower,
+                "providerId": provider_id,
+                "status": "requested",
+                "requestedAt": now,
+                "deleteAfterAt": delete_after,
+            }
+            db.collection(LOCKS_COLLECTION).document(deletion_lock_id(email_lower, provider_id)).set(
+                lock_data,
+                merge=True,
+            )
+
+        logger.info(f"Account deletion requested for {current_user.uid}.")
+        
+        # We return 204 immediately. 
+        # Hard delete is scheduled after the grace period.
+        return 
+        
+    except Exception as e:
+        logger.error(f"Failed to request deletion for {current_user.uid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to request account deletion")
+        # Build logic: Do we fail the request? Usually 204 implies success.
+        
+    return
+
+
+# --- Consent Log API --- #
+from app.util_models import ConsentRequest, ConsentResponse
+
+@router.post("/me/consents", response_model=ConsentResponse)
+async def post_consent(
+    body: ConsentRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Record user consent to Terms of Service and Privacy Policy.
+    Stores in Firestore subcollection for audit trail.
+    """
+    now = datetime.now(timezone.utc)
+    
+    consent_data = {
+        "uid": current_user.uid,
+        "termsVersion": body.termsVersion,
+        "privacyVersion": body.privacyVersion,
+        "acceptedAt": now,  # Server timestamp (authoritative)
+        "clientAcceptedAt": body.acceptedAt,  # Client timestamp (for reference)
+        "appVersion": body.appVersion,
+        "build": body.build,
+        "platform": body.platform or "ios",
+        "locale": body.locale,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+    
+    # Store in subcollection: users/{uid}/consents/{docId}
+    # Using termsVersion_privacyVersion as doc ID for idempotency
+    doc_id = f"{body.termsVersion}_{body.privacyVersion}"
+    consent_ref = db.collection("users").document(current_user.uid).collection("consents").document(doc_id)
+    
+    consent_ref.set(consent_data, merge=True)
+    
+    # Also update user doc with latest consent info (for quick lookup)
+    user_ref = db.collection("users").document(current_user.uid)
+    user_ref.update({
+        "consent": {
+            "termsVersion": body.termsVersion,
+            "privacyVersion": body.privacyVersion,
+            "acceptedAt": now,
+        },
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    
+    logger.info(f"Consent logged for {current_user.uid}: terms={body.termsVersion}, privacy={body.privacyVersion}")
+    
+    return ConsentResponse(
+        ok=True,
+        termsVersion=body.termsVersion,
+        privacyVersion=body.privacyVersion,
+        acceptedAt=now,
     )

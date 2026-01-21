@@ -17,6 +17,9 @@ def get_current_admin_user(credentials: HTTPAuthorizationCredentials = Depends(s
     Returns the decoded token if valid and admin.
     """
     token = credentials.credentials
+
+    # [SECURITY] Admin bypass removed - use proper Firebase custom claims for admin access
+
     try:
         decoded_token = auth.verify_id_token(token)
         

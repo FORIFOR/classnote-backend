@@ -5,8 +5,9 @@ import firebase_admin
 from firebase_admin import auth
 from google.cloud import firestore
 from app.firebase import db
+from app.services.account_deletion import LOCKS_COLLECTION, deletion_lock_id
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
@@ -19,10 +20,19 @@ USER_ACTIVITY_CACHE = {}
 USER_ACTIVITY_THROTTLE_SEC = 300  # 5 minutes
 
 class User:
-    def __init__(self, uid: str, email: str = None, display_name: str = None):
+    def __init__(self, uid: str, email: str = None, display_name: str = None, photo_url: str = None):
         self.uid = uid
         self.email = email
         self.display_name = display_name
+        self.photo_url = photo_url
+
+
+def _normalize_ts(ts: datetime | None) -> datetime | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
 
 
 def _update_last_seen(uid: str):
@@ -86,11 +96,29 @@ def _resolve_user_from_token(token: str) -> User:
             # print(f"Auth get_user error: {e}") # Suppress noise
             pass
 
+        email_lower = email.lower() if email else None
+        if not provider_id and providers:
+            provider_id = providers[0]
+
+        if not user_doc.exists and email_lower and provider_id:
+            lock_ref = db.collection(LOCKS_COLLECTION).document(deletion_lock_id(email_lower, provider_id))
+            lock_doc = lock_ref.get()
+            if lock_doc.exists:
+                lock_data = lock_doc.to_dict() or {}
+                delete_after = _normalize_ts(lock_data.get("deleteAfterAt"))
+                now_dt = datetime.now(timezone.utc)
+                if not delete_after or delete_after > now_dt:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="account_deletion_pending",
+                    )
+                lock_ref.delete()
+
         now_ts = firestore.SERVER_TIMESTAMP
         if not user_doc.exists:
             user_data = {
                 "email": email,
-                "emailLower": email.lower() if email else None,
+                "emailLower": email_lower,
                 "displayName": default_name,
                 "photoUrl": photo_url,
                 "providers": providers,
@@ -126,7 +154,7 @@ def _resolve_user_from_token(token: str) -> User:
                 update_data["updatedAt"] = now_ts
                 user_ref.update(update_data)
 
-        return User(uid=uid, email=email, display_name=name)
+        return User(uid=uid, email=email, display_name=name, photo_url=photo_url)
 
     except HTTPException:
         raise
@@ -293,6 +321,36 @@ async def get_admin_user(
     user = _resolve_user_from_token(token)
 
     # 管理者権限チェック
+    is_admin, is_super_admin = _check_admin_claims(token)
+
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+
+    _track_activity(user.uid, background_tasks)
+
+    return AdminUser(
+        uid=user.uid,
+        email=user.email,
+        display_name=user.display_name,
+        is_super_admin=is_super_admin
+    )
+
+
+async def get_admin_user_optional(
+    background_tasks: BackgroundTasks,
+    token: Optional[str] = Depends(oauth2_scheme)
+) -> Optional[AdminUser]:
+    """
+    Optional admin auth. Returns None if no token is provided.
+    Raises 401/403 when a token is present but invalid or non-admin.
+    """
+    if not token:
+        return None
+
+    user = _resolve_user_from_token(token)
     is_admin, is_super_admin = _check_admin_claims(token)
 
     if not is_admin:

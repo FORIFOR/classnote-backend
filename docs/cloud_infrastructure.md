@@ -32,7 +32,6 @@ All workers are implemented as HTTP POST endpoints within the main API service.
 |-----------|-----------------|---------|--------------|
 | **Summarize** | `/internal/tasks/summarize` | Generate summary, tags, playlist | `POST /sessions/{id}/summarize` |
 | **Quiz** | `/internal/tasks/quiz` | Generate quizzes | `POST /sessions/{id}/quizzes` |
-| **Explain** | `/internal/tasks/explain` | Generate detailed explanation | `POST /sessions/{id}/explain` |
 | **Highlights** | `/internal/tasks/highlights` | Generate highlights | `POST /sessions/{id}/highlights` |
 | **Playlist** | `/internal/tasks/playlist` | Generate playlist timeline | Device Sync / `POST /sessions/{id}/events` |
 | **QA** | `/internal/tasks/qa` | Answer user question (LLM) | `POST /sessions/{id}/qa` |

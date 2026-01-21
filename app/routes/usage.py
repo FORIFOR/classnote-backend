@@ -5,7 +5,8 @@ from datetime import date, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
 
-from app.dependencies import get_current_user, get_current_user_optional
+import os
+from app.dependencies import get_current_user, get_admin_user, get_admin_user_optional
 from app.usage_models import UsageSummaryResponse
 from app.services.usage import usage_logger
 from app.firebase import db
@@ -17,17 +18,19 @@ router = APIRouter(prefix="/usage", tags=["Usage"])
 @router.post("/admin/backfill")
 async def backfill_usage(
     secret: Optional[str] = Query(None),
-    admin_user: Optional[object] = Depends(get_current_user_optional)
+    admin_user: Optional[object] = Depends(get_admin_user_optional)
 ):
     """
     Admin-only: Backfill usage data from sessions collection.
     Scans all sessions and populates user_daily_usage.
     """
     # Allow bypass with secret key (for curl usage without token)
-    if secret != "classnote-admin-secret-123":
-        # If secret doesn't match, ensure user is authenticated
+    # [SECURITY] No default secret - must be set via environment variable
+    admin_secret = os.environ.get("USAGE_BACKFILL_SECRET")
+    if not admin_secret or secret != admin_secret:
+        # If secret doesn't match, require admin auth
         if not admin_user:
-             raise HTTPException(status_code=401, detail="Unauthorized")
+            raise HTTPException(status_code=401, detail="Unauthorized")
     
     from collections import defaultdict
     from datetime import datetime
@@ -243,16 +246,11 @@ async def get_user_usage_summary_admin(
     user_id: str,
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
-    admin_user: object = Depends(get_current_user)
+    admin_user: object = Depends(get_admin_user)
 ):
     """
     Admin endpoint to view any user's usage.
-    
-    TODO: Add proper admin role check
     """
-    # TODO: Verify admin_user has admin role
-    # For now, just allow any authenticated user (should be restricted in production)
-    
     if not to_date:
         to_date = date.today().isoformat()
     if not from_date:
@@ -264,7 +262,6 @@ async def get_user_usage_summary_admin(
         to_date=to_date
     )
     
-    return UsageSummaryResponse(**summary)
     return UsageSummaryResponse(**summary)
 
 @router.get("/analytics/me/timeline")
@@ -299,4 +296,4 @@ async def get_usage_timeline(
             "sessionCount": d.get("session_count", 0)
         })
         
-    return {"timeline": timeline}
+    return timeline

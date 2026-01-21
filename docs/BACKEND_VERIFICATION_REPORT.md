@@ -18,7 +18,7 @@ This document summarizes the verification of the current backend implementation 
 *   **Requirement:** Frontend-friendly endpoints for Upload, Async Jobs, and Sharing.
 *   **Verification:** Inspected `app/routes/sessions.py`.
     *   **Audio Upload:** `POST /sessions/{id}/audio:prepareUpload` and `:commit` are implemented. **(OK)**
-    *   **Async Logic:** `POST /sessions/{id}/summary:enqueue` (and quiz/explain) returns `200` immediately with `queued` status, delegating to `task_queue`. **(OK)**
+*   **Async Logic:** `POST /sessions/{id}/summary:enqueue` (and quiz) returns `200` immediately with `queued` status, delegating to `task_queue`. **(OK)**
     *   **Sharing:** `POST /sessions/{id}/share:invite` and `join` (with code) are implemented with proper Role (`owner`/`editor`/`viewer`) handling. **(OK)**
     *   **Result:** **PASSED**
 

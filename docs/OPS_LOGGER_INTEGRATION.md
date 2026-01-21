@@ -128,7 +128,7 @@ log_stt_event(
 # LLM 呼び出し完了時
 log_llm_event(
     session_id=session_id,
-    llm_type="summary",  # "quiz", "explain", etc.
+    llm_type="summary",  # "quiz", "qa", etc.
     status="completed",
     uid=user_id,
     model="gemini-1.5-flash"

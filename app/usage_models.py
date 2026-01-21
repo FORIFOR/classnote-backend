@@ -75,6 +75,21 @@ class UserDailyUsage(BaseModel):
     share_count: int = 0
     export_count: int = 0
 
+class UserMonthlyUsage(BaseModel):
+    """Aggregate monthly usage for billing limits (Triple Lock)"""
+    user_id: str
+    month: str # yyyy-MM
+    updated_at: datetime
+    
+    # Cost Control Limits
+    cloud_stt_sec: float = 0.0      # Limit: 100h (360,000s)
+    llm_calls: int = 0              # Limit: 1000 calls
+    translate_chars: int = 0        # Future limit
+    
+    # Additional Stats (Optional)
+    session_count: int = 0
+
+
 
 # ---------- API Response Models ---------- #
 

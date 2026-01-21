@@ -2,10 +2,24 @@ from fastapi import APIRouter, HTTPException, Request
 from google.cloud import firestore
 # from app.firebase import db
 from app.firebase import AUDIO_BUCKET_NAME
-from app.services.llm import generate_quiz, generate_summary_and_tags, generate_explanation, clean_quiz_markdown, answer_question, translate_text
+from app.services.llm import (
+    GEMINI_MODEL_NAME,
+    generate_quiz,
+    generate_summary_and_tags,
+    clean_quiz_markdown,
+    answer_question,
+    translate_text,
+)
 from app.services.transcripts import resolve_transcript_text
 from app.services.usage import usage_logger
 from app.services.ops_logger import log_job_transition, log_llm_event, log_stt_event, ErrorCode
+from app.services.cost_guard import cost_guard
+from app.services.session_event_bus import publish_session_event
+from app.services.account_deletion import (
+    LOCKS_COLLECTION,
+    REQUESTS_COLLECTION,
+    deletion_lock_id,
+)
 import logging
 import json
 from datetime import datetime, timezone
@@ -49,6 +63,7 @@ async def _handle_summarize_task_core(request: Request):
     job_id = payload.get("jobId")
     idempotency_key = payload.get("idempotencyKey")
     user_id = payload.get("userId") # [Security]
+    usage_reserved = bool(payload.get("usageReserved"))
 
     if not session_id:
         logger.error("sessionId is missing")
@@ -85,7 +100,6 @@ async def _handle_summarize_task_core(request: Request):
 
         transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
-        segments = data.get("segments") or data.get("diarizedSegments") or []
         derived_ref = doc_ref.collection("derived").document("summary")
 
         if idempotency_key:
@@ -113,6 +127,7 @@ async def _handle_summarize_task_core(request: Request):
                 "updatedAt": datetime.now(timezone.utc),
                 "idempotencyKey": idempotency_key,
             }, merge=True)
+            await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
             return {"status": "failed", "reason": "empty_transcript"}
         
         # Start Processing
@@ -127,14 +142,31 @@ async def _handle_summarize_task_core(request: Request):
             "idempotencyKey": idempotency_key,
         }, merge=True)
 
+        # [TRIPLE LOCK] Monthly Cost Guard
+        if not usage_reserved:
+            allowed, meta = await cost_guard.guard_can_consume(final_user_id, "summary_generated", 1)
+            if not allowed:
+
+                 logger.warning(f"[CostGuard] BLOCKED summary {session_id} for user {final_user_id}. Monthly limit exceeded.")
+                 err_msg = "Monthly Summary limit exceeded (Free: 3, Premium: 1000 AI pool)"
+                 doc_ref.update({"summaryStatus": "failed", "summaryError": err_msg, "status": "録音済み"})
+                 if job_id:
+                     db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "error": err_msg}, merge=True)
+                 derived_ref.set({"status": "failed", "errorReason": err_msg, "updatedAt": datetime.now(timezone.utc)}, merge=True)
+                 await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
+                 return {"status": "failed", "error": err_msg}
+
         # ops_logger: job started
         log_job_transition(session_id, "summarize", "started", uid=final_user_id, job_id=job_id)
 
-        result = await generate_summary_and_tags(transcript, mode=mode, segments=segments)
+        result = await generate_summary_and_tags(transcript, mode=mode)
 
         # ops_logger: LLM call completed
-        log_llm_event(session_id, "summary", "completed", uid=final_user_id, model="gemini-1.5-flash")
+        log_llm_event(session_id, "summary", "completed", uid=final_user_id, model=GEMINI_MODEL_NAME)
         summary_markdown = result.get("summaryMarkdown")
+        summary_json = result.get("summaryJson") or {}
+        summary_type = result.get("summaryType") or mode
+        summary_json_version = result.get("summaryJsonVersion") or 1
         tags = (result.get("tags") or [])[:4]
 
         topic_summary = None
@@ -145,21 +177,30 @@ async def _handle_summarize_task_core(request: Request):
                      topic_summary = line.strip()[:100]
                      break
         
-        doc_ref.update({
+        update_payload = {
             "summaryStatus": "completed",
             "summaryMarkdown": summary_markdown,
+            "summaryJson": summary_json,
+            "summaryJsonVersion": summary_json_version,
+            "summaryType": summary_type,
             "topicSummary": topic_summary,
             "summaryUpdatedAt": datetime.now(timezone.utc),
             "summaryError": None,
             "autoTags": tags,
             "status": "要約済み",
-        })
+        }
+        doc_ref.update(update_payload)
         derived_ref.set({
             "status": "succeeded",
             "result": {
+                "json": summary_json,
                 "markdown": summary_markdown,
                 "tags": tags,
                 "topicSummary": topic_summary,
+            },
+            "meta": {
+                "schemaVersion": summary_json_version,
+                "type": summary_type,
             },
             "modelInfo": {"provider": "vertexai"},
             "updatedAt": datetime.now(timezone.utc),
@@ -173,6 +214,7 @@ async def _handle_summarize_task_core(request: Request):
 
         # ops_logger: job completed
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)
+        await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
         return {"status": "completed"}
 
     except Exception as e:
@@ -205,7 +247,9 @@ async def _handle_summarize_task_core(request: Request):
                  "updatedAt": datetime.now(timezone.utc),
                  "idempotencyKey": idempotency_key,
              }, merge=True)
-        except: pass
+             await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
+        except Exception as db_err:
+            logger.warning(f"[summarize] Failed to update error status in DB: {db_err}")
 
         # ops_logger: job failed
         log_job_transition(session_id, "summarize", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
@@ -272,21 +316,20 @@ async def handle_import_youtube_task(request: Request):
         # or we run in threadpool if we want concurrency (FastAPI handles def as threadpool)
         transcript = process_youtube_import(session_id, url, language=language)
         
-        # Success
+        # Success - Note: No audioPath since we use transcript API instead of audio download
         doc_ref.update({
             "transcriptText": transcript,
             "status": "録音済み",
-            "audioPath": f"imports/{session_id}.flac",
+            "transcriptSource": "youtube_caption",
             "updatedAt": datetime.now(timezone.utc)
         })
         
         # Trigger Next Steps
-        from app.task_queue import enqueue_summarize_task, enqueue_quiz_task, enqueue_playlist_task
+        from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
         # [Security] Pass userId to keep inflight tracking correct if they implement handling
         uid = final_user_id
         enqueue_summarize_task(session_id, user_id=uid)
         enqueue_quiz_task(session_id, user_id=uid)
-        enqueue_playlist_task(session_id, user_id=uid)
         
         logger.info(f"YouTube Import Success for {session_id}")
 
@@ -340,6 +383,7 @@ async def _handle_quiz_task_core(request: Request):
     idempotency_key = payload.get("idempotencyKey")
     count = payload.get("count", 5)
     user_id = payload.get("userId") # [Security]
+    usage_reserved = bool(payload.get("usageReserved"))
 
     if not session_id:
         return {"status": "error", "message": "session_id required"}
@@ -389,6 +433,7 @@ async def _handle_quiz_task_core(request: Request):
                 "updatedAt": datetime.now(timezone.utc),
                 "idempotencyKey": idempotency_key,
             }, merge=True)
+            await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
             return {"status": "failed"}
 
         # generate_quiz, clean_quiz_markdown imported at top level now
@@ -400,6 +445,20 @@ async def _handle_quiz_task_core(request: Request):
             "quizError": None,
             "status": "テスト生成",
         })
+
+        # [TRIPLE LOCK] Monthly Cost Guard
+        if not usage_reserved:
+            allowed, meta = await cost_guard.guard_can_consume(final_user_id, "quiz_generated", 1)
+            if not allowed:
+
+                 logger.warning(f"[CostGuard] BLOCKED quiz {session_id} for user {final_user_id}. Monthly limit exceeded.")
+                 err_msg = "Monthly Quiz limit exceeded (Free: 3, Premium: 1000 AI pool)"
+                 doc_ref.update({"quizStatus": "failed", "quizError": err_msg})
+                 if job_id:
+                     db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "error": err_msg}, merge=True)
+                 derived_ref.set({"status": "failed", "errorReason": err_msg, "updatedAt": datetime.now(timezone.utc)}, merge=True)
+                 await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
+                 return {"status": "failed", "error": err_msg}
 
         # ops_logger: job started
         log_job_transition(session_id, "quiz", "started", uid=final_user_id, job_id=job_id)
@@ -430,6 +489,7 @@ async def _handle_quiz_task_core(request: Request):
 
         # ops_logger: job completed
         log_job_transition(session_id, "quiz", "completed", uid=final_user_id, job_id=job_id)
+        await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
         return {"status": "completed"}
 
     except Exception as e:
@@ -455,7 +515,9 @@ async def _handle_quiz_task_core(request: Request):
                 "updatedAt": datetime.now(timezone.utc),
                 "idempotencyKey": idempotency_key,
             }, merge=True)
-        except: pass
+            await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
+        except Exception as db_err:
+            logger.warning(f"[quiz] Failed to update error status in DB: {db_err}")
 
         # ops_logger: job failed
         log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
@@ -464,142 +526,11 @@ async def _handle_quiz_task_core(request: Request):
 
     # finally: removed
 
-@router.post("/internal/tasks/explain")
-async def handle_explain_task(request: Request):
-    """
-    Cloud Tasks から呼び出される Explanation Worker エンドポイント。
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    session_id = payload.get("sessionId")
-    job_id = payload.get("jobId")
-    idempotency_key = payload.get("idempotencyKey")
-    user_id = payload.get("userId")
-
-    if not session_id:
-        logger.error("sessionId is missing")
-        return {"status": "error", "message": "sessionId required"}
-
-    final_user_id = user_id
-
-    # [FIX] Initialize DB locally with STANDALONE Client
-    from google.cloud import firestore
-    import os
-    try:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
-    except Exception as e:
-        return {"status": "failed", "error": f"DB Init Failed: {e}"}
-
-    doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-
-    if not doc.exists:
-        return {"status": "skipped"}
-
-    data = doc.to_dict()
-    # [Security] Resolve User ID if missing
-    if not final_user_id:
-        final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
-
-    transcript = resolve_transcript_text(session_id, data) or ""
-    mode = data.get("mode", "lecture")
-    derived_ref = doc_ref.collection("derived").document("explain")
-
-    if idempotency_key:
-        derived_snap = derived_ref.get()
-        if derived_snap.exists:
-            current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-            # If same key, return cached success. If different key, PROCEED (Overwrite).
-            if current_key and current_key == idempotency_key:
-                if job_id:
-                     db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
-                return {"status": "skipped", "reason": "idempotent_hit"}
-
-    if not transcript:
-        doc_ref.update({"explainStatus": "failed", "explainError": "Transcript empty"})
-        derived_ref.set({
-            "status": "failed",
-            "errorReason": "Transcript empty",
-            "updatedAt": datetime.now(timezone.utc),
-            "idempotencyKey": idempotency_key,
-        }, merge=True)
-        return {"status": "failed"}
-
-    try:
-        doc_ref.update({"explainStatus": "running", "explainError": None})
-        derived_ref.set({
-            "status": "running",
-            "errorReason": None,
-            "updatedAt": datetime.now(timezone.utc),
-            "idempotencyKey": idempotency_key,
-        }, merge=True)
-        if job_id:
-            db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "running"}, merge=True)
-
-        # ops_logger: job started
-        log_job_transition(session_id, "explain", "started", uid=final_user_id, job_id=job_id)
-
-        explanation = await generate_explanation(transcript, mode=mode)
-
-        # ops_logger: LLM call completed
-        log_llm_event(session_id, "explain", "completed", uid=final_user_id, model="gemini-1.5-flash")
-
-        doc_ref.update({
-            "explainStatus": "completed",
-            "explainMarkdown": explanation,
-            "explainUpdatedAt": datetime.now(timezone.utc),
-            "explainError": None,
-        })
-        derived_ref.set({
-            "status": "succeeded",
-            "result": {"markdown": explanation},
-            "modelInfo": {"provider": "vertexai"},
-            "updatedAt": datetime.now(timezone.utc),
-            "errorReason": None,
-            "idempotencyKey": idempotency_key,
-        }, merge=True)
-        if job_id:
-            db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
-
-        # ops_logger: job completed
-        log_job_transition(session_id, "explain", "completed", uid=final_user_id, job_id=job_id)
-        return {"status": "completed"}
-    except BaseException as e:
-        logger.exception(f"Explain generation failed for session {session_id}")
-
-        # ops_logger: LLM/job failed
-        log_llm_event(session_id, "explain", "failed", uid=final_user_id, error_code=ErrorCode.VERTEX_SCHEMA_PARSE_ERROR, error_message=str(e))
-
-        error_str = str(e)
-        is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
-        if is_transient:
-            logger.warning(f"Transient error detected for explain {session_id}, raising 503 for retry.")
-            raise HTTPException(status_code=503, detail="Transient error, retrying...")
-
-        doc_ref.update({"explainStatus": "failed", "explainError": str(e)})
-        if job_id:
-             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
-        derived_ref.set({
-            "status": "failed",
-            "errorReason": str(e),
-            "updatedAt": datetime.now(timezone.utc),
-            "idempotencyKey": idempotency_key,
-        }, merge=True)
-
-        # ops_logger: job failed
-        log_job_transition(session_id, "explain", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
-
-        return {"status": "failed", "error": str(e)}
-
 @router.post("/internal/tasks/highlights")
 async def handle_generate_highlights(request: Request):
     """
     Cloud Tasks から呼び出される Worker エンドポイント。
-    ハイライトとタグを生成する。
+    ハイライト生成は廃止。
     """
     try:
         payload = await request.json()
@@ -607,89 +538,23 @@ async def handle_generate_highlights(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     session_id = payload.get("sessionId")
-    user_id = payload.get("userId")
-    job_id = payload.get("jobId")
 
     if not session_id:
         logger.error("sessionId is missing")
         return {"status": "error", "message": "sessionId required"}
 
-    final_user_id = user_id
-
-    logger.info(f"Processing highlights task for session: {session_id}")
-    
-    # [FIX] Initialize DB locally with STANDALONE Client
     from google.cloud import firestore
     import os
-    try:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
-    except Exception as e:
-        return {"status": "failed", "error": f"DB Init Failed: {e}"}
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+    db = firestore.Client(project=project_id)
 
     doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        logger.warning(f"Session {session_id} not found.")
-        return {"status": "skipped", "reason": "not_found"}
-        
-    data = doc.to_dict()
-    # [Security] Resolve User ID if missing
-    if not final_user_id:
-        final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
-
-    transcript = resolve_transcript_text(session_id, data) or ""
-    segments = data.get("segments", [])
-    
-    if not transcript:
-        logger.error(f"Transcript empty for session {session_id}, cannot generate highlights")
-        doc_ref.update({
-            "highlightsStatus": "failed",
-            "highlightsError": "Transcript is empty",
-            "highlightsUpdatedAt": datetime.now(timezone.utc)
-        })
-        return {"status": "failed", "reason": "empty_transcript"}
-
-    try:
-        from app.services.llm import generate_highlights_and_tags
-
-        # ops_logger: job started
-        log_job_transition(session_id, "highlights", "started", uid=final_user_id, job_id=job_id)
-
-        result = await generate_highlights_and_tags(transcript, segments)
-
-        # ops_logger: LLM call completed
-        log_llm_event(session_id, "highlights", "completed", uid=final_user_id, model="gemini-1.5-flash")
-            
-        doc_ref.update({
-            "highlightsStatus": "completed",
-            "highlights": result.get("highlights", []),
-            "tags": result.get("tags", []),
-            "highlightsUpdatedAt": datetime.now(timezone.utc),
-            "highlightsError": None
-        })
-        logger.info(f"Successfully generated highlights for session {session_id}")
-
-        # ops_logger: job completed
-        log_job_transition(session_id, "highlights", "completed", uid=final_user_id, job_id=job_id)
-
-        return {"status": "completed"}
-    except Exception as e:
-        logger.exception(f"Highlights generation failed for session {session_id}")
-
-        # ops_logger: LLM/job failed
-        log_llm_event(session_id, "highlights", "failed", uid=final_user_id, error_code=ErrorCode.VERTEX_SCHEMA_PARSE_ERROR, error_message=str(e))
-
-        doc_ref.update({
-            "highlightsStatus": "failed",
-            "highlightsError": str(e),
-            "highlightsUpdatedAt": datetime.now(timezone.utc)
-        })
-
-        # ops_logger: job failed
-        log_job_transition(session_id, "highlights", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
-
-        return {"status": "failed", "error": str(e)}
+    doc_ref.update({
+        "highlightsStatus": "failed",
+        "highlightsError": "deprecated",
+        "highlightsUpdatedAt": datetime.now(timezone.utc)
+    })
+    return {"status": "failed", "reason": "deprecated"}
 
 
 @router.post("/internal/tasks/playlist")
@@ -703,93 +568,21 @@ async def handle_playlist_task(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     session_id = payload.get("sessionId")
-    user_id = payload.get("userId")
-    job_id = payload.get("jobId")
-
     if not session_id:
         return {"status": "error", "message": "sessionId required"}
 
-    final_user_id = user_id
-
-    # [FIX] Initialize DB locally with STANDALONE Client
     from google.cloud import firestore
     import os
-    try:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
-    except Exception as e:
-        return {"status": "failed", "error": f"DB Init Failed: {e}"}
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+    db = firestore.Client(project=project_id)
 
     doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return {"status": "skipped", "reason": "not_found"}
-
-    data = doc.to_dict()
-    # [Security] Resolve User ID if missing
-    if not final_user_id:
-        final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
-
-    transcript = resolve_transcript_text(session_id, data) or ""
-    segments = data.get("diarizedSegments") or data.get("segments") or []
-
-    if not transcript:
-        doc_ref.update({
-            "playlistStatus": "failed",
-            "playlistError": "Transcript is empty",
-            "playlistUpdatedAt": datetime.now(timezone.utc)
-        })
-        return {"status": "failed", "reason": "empty_transcript"}
-
-    try:
-        # ops_logger: job started
-        log_job_transition(session_id, "playlist", "started", uid=final_user_id, job_id=job_id)
-
-        duration = data.get("durationSec")
-        from app.services.llm import generate_playlist_timeline
-        raw = await generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
-
-        # ops_logger: LLM call completed
-        log_llm_event(session_id, "playlist", "completed", uid=final_user_id, model="gemini-1.5-flash")
-
-        if isinstance(raw, str):
-            try:
-                items_raw = json.loads(raw)
-            except Exception:
-                items_raw = []
-        else:
-            items_raw = raw or []
-
-        from app.services.playlist_utils import normalize_playlist_items
-        normalized = normalize_playlist_items(items_raw, segments=segments, duration_sec=duration)
-
-        doc_ref.update({
-            "playlistStatus": "completed",
-            "playlist": normalized,
-            "playlistUpdatedAt": datetime.now(timezone.utc),
-            "playlistError": None
-        })
-
-        # ops_logger: job completed
-        log_job_transition(session_id, "playlist", "completed", uid=final_user_id, job_id=job_id)
-
-        return {"status": "completed", "items": len(normalized)}
-    except Exception as e:
-        logger.exception(f"Playlist generation failed for session {session_id}")
-
-        # ops_logger: LLM/job failed
-        log_llm_event(session_id, "playlist", "failed", uid=final_user_id, error_code=ErrorCode.VERTEX_SCHEMA_PARSE_ERROR, error_message=str(e))
-
-        doc_ref.update({
-            "playlistStatus": "failed",
-            "playlistError": str(e),
-            "playlistUpdatedAt": datetime.now(timezone.utc)
-        })
-
-        # ops_logger: job failed
-        log_job_transition(session_id, "playlist", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
-
-        return {"status": "failed", "error": str(e)}
+    doc_ref.update({
+        "playlistStatus": "failed",
+        "playlistError": "deprecated",
+        "playlistUpdatedAt": datetime.now(timezone.utc),
+    })
+    return {"status": "failed", "reason": "deprecated"}
 
 
 @router.post("/internal/tasks/audio-cleanup")
@@ -825,6 +618,68 @@ async def handle_daily_usage_aggregation(request: Request):
     except Exception as e:
         logger.exception("Daily usage aggregation failed")
         return {"status": "failed", "error": str(e)}
+
+
+@router.post("/internal/tasks/account-deletion-sweep")
+async def handle_account_deletion_sweep():
+    """
+    Cloud Scheduler から呼び出される Account Deletion Sweep.
+    deleteAfterAt を過ぎた削除リクエストをNUKEに回す。
+    """
+    from app.task_queue import enqueue_nuke_user_task
+    import os
+
+    try:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+    except Exception as e:
+        logger.error(f"[AccountDeletion] DB Init Failed: {e}")
+        return {"status": "failed", "error": f"DB Init Failed: {e}"}
+
+    now = datetime.now(timezone.utc)
+    reqs_ref = db.collection(REQUESTS_COLLECTION)
+
+    try:
+        docs = list(reqs_ref.where("deleteAfterAt", "<=", now).stream())
+    except Exception as e:
+        logger.error(f"[AccountDeletion] Query failed: {e}")
+        return {"status": "failed", "error": f"Query Failed: {e}"}
+
+    enqueued = 0
+    failed = 0
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        if data.get("status") != "requested":
+            continue
+        uid = data.get("uid") or doc.id
+        if not uid:
+            continue
+        try:
+            enqueue_nuke_user_task(uid)
+            doc.reference.update(
+                {
+                    "status": "enqueued",
+                    "nukeEnqueuedAt": now,
+                    "updatedAt": now,
+                }
+            )
+            enqueued += 1
+        except Exception as e:
+            logger.error(f"[AccountDeletion] Failed to enqueue {uid}: {e}")
+            try:
+                doc.reference.update(
+                    {
+                        "status": "failed",
+                        "lastError": str(e),
+                        "updatedAt": now,
+                    }
+                )
+            except Exception:
+                pass
+            failed += 1
+
+    return {"status": "completed", "enqueued": enqueued, "failed": failed}
 
 
 @router.post("/internal/tasks/qa")
@@ -879,6 +734,14 @@ async def handle_qa_task(request: Request):
         
         qa_ref.set({"status": "running", "question": question, "updatedAt": datetime.now(timezone.utc)}, merge=True)
         
+        # [TRIPLE LOCK] Monthly Cost Guard
+        allowed = await cost_guard.guard_can_consume(final_user_id, "llm_calls", 1)
+        if not allowed:
+             logger.warning(f"[CostGuard] BLOCKED qa {session_id} for user {final_user_id}. Monthly limit exceeded.")
+             err_msg = "Monthly LLM limit exceeded (1000 calls)"
+             qa_ref.set({"status": "failed", "error": err_msg, "updatedAt": datetime.now(timezone.utc)}, merge=True)
+             return {"status": "failed", "error": err_msg}
+
         # ops_logger: job started
         log_job_transition(session_id, "qa", "started", uid=final_user_id, job_id=qa_id)
 
@@ -1078,6 +941,38 @@ async def _handle_transcribe_task_core(request: Request):
             # Simplified: Proceed for now mostly.
             pass
 
+        # [POLICY] STRICT Transcription Mode Enforcement
+        # - Cloud Mode (cloud_google): ONLY use Google STT V2 Streaming. NEVER batch transcribe.
+        # - On-Device Mode: ONLY use SFSpeechRecognizer/sherpa-onnx. No cloud.
+        transcription_mode = data.get("transcriptionMode") or ""
+        transcript_source = data.get("transcriptSource") or ""
+        existing_transcript = data.get("transcriptText") or ""
+        
+        # Cloud mode: Streaming is the ONLY source. Skip batch entirely.
+        if transcription_mode == "cloud_google" or transcript_source == "cloud_streaming_v2":
+            logger.info(f"[Transcribe] SKIPPED for session {session_id}: Cloud mode uses streaming only (policy). Has {len(existing_transcript)} chars.")
+            if job_ref:
+                job_ref.set({
+                    "status": "completed",
+                    "result": "skipped_cloud_mode_policy",
+                    "reason": "Cloud mode uses only live streaming transcription",
+                    "completedAt": datetime.now(timezone.utc)
+                }, merge=True)
+            return {"status": "skipped", "reason": "cloud_mode_streaming_only", "chars": len(existing_transcript)}
+        
+        # On-Device mode: This job should not be queued in the first place.
+        # But if it is, reject it since on-device doesn't use cloud batch.
+        if transcription_mode in ["on_device", "local", "offline"]:
+            logger.info(f"[Transcribe] SKIPPED for session {session_id}: On-Device mode does not use cloud batch (policy).")
+            if job_ref:
+                job_ref.set({
+                    "status": "completed",
+                    "result": "skipped_on_device_mode_policy",
+                    "reason": "On-Device mode uses only local transcription",
+                    "completedAt": datetime.now(timezone.utc)
+                }, merge=True)
+            return {"status": "skipped", "reason": "on_device_mode_local_only"}
+
         audio_info = data.get("audio") or {}
         gcs_path = audio_info.get("gcsPath") or data.get("audioPath") # audioPath usually is 'sessions/...', need full GS?
         
@@ -1108,11 +1003,30 @@ async def _handle_transcribe_task_core(request: Request):
         duration = float(data.get("durationSec") or 0.0)
         if duration > 7200:
              logger.error(f"[Security] Skipping batch transcription for session {session_id}: Duration {duration}s exceeds 2h limit.")
+             err_msg = "Duration exceeds 2 hour limit"
              doc_ref.update({
                  "transcriptionStatus": "failed",
-                 "transcriptionError": "Duration exceeds 2 hour limit"
+                 "transcriptionError": err_msg
              })
-             if job_ref: job_ref.set({"status": "failed", "error": "Duration exceeds 2 hour limit"}, merge=True)
+             if job_ref: job_ref.set({"status": "failed", "error": err_msg}, merge=True)
+             return
+
+        # [TRIPLE LOCK] Monthly Cost Guard
+        if duration <= 0:
+             # Safety: Block unknown duration to prevent billing leak
+             logger.error(f"[CostGuard] Blocking session {session_id} due to unknown duration ({duration}s).")
+             err_msg = "Duration metadata missing (Cost Guard)"
+             doc_ref.update({"transcriptionStatus": "failed", "transcriptionError": err_msg})
+             if job_ref: job_ref.set({"status": "failed", "error": err_msg}, merge=True)
+             return
+
+        allowed = await cost_guard.guard_can_consume(final_user_id, "cloud_stt_sec", duration)
+        if not allowed:
+             logger.warning(f"[CostGuard] BLOCKED session {session_id} for user {final_user_id}. Monthly limit exceeded.")
+             err_msg = "Monthly transcription limit exceeded (100h)"
+             doc_ref.update({"transcriptionStatus": "failed", "transcriptionError": err_msg})
+             if job_ref: job_ref.set({"status": "failed", "error": err_msg}, merge=True)
+             # Should we return or raise? Return prevents retryloop.
              return
 
         doc_ref.update({
@@ -1155,7 +1069,9 @@ async def _handle_transcribe_task_core(request: Request):
         updates = {
              "transcriptionStatus": "completed",
              "transcriptionUpdatedAt": now,
-             "transcriptionError": None
+             "transcriptionError": None,
+             "batchRetranscribeState": "completed", # [NEW]
+             "batchRetranscribeUsed": True,         # [NEW] Lock after success
         }
         
         should_update_main = (transcription_mode == "cloud_google") or (not data.get("transcriptText")) or force
@@ -1269,7 +1185,8 @@ async def _handle_transcribe_task_core(request: Request):
         doc_ref.update({
             "transcriptionStatus": "failed",
             "transcriptionError": error_msg,
-            "transcriptionUpdatedAt": datetime.now(timezone.utc)
+            "transcriptionUpdatedAt": datetime.now(timezone.utc),
+            "batchRetranscribeState": "failed", # [NEW]
         })
         if job_ref: job_ref.set({"status": "failed", "errorReason": error_msg}, merge=True)
 
@@ -1402,3 +1319,282 @@ async def handle_transcribe_task_deprecated(request: Request):
             return {"status": "failed", "error": str(e)}
 
     return {"status": "skipped", "reason": f"unknown_engine: {engine}"}
+
+@router.post("/internal/tasks/cleanup_sessions")
+async def handle_cleanup_sessions_task(request: Request):
+    """
+    [TRIPLE LOCK] Cleanup Worker.
+    Deletes old sessions if user exceeds SERVER_SESSION_LIMIT (300).
+    Input: { userId: "..." }
+    """
+    try:
+        payload = await request.json()
+        user_id = payload.get("userId")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if not user_id:
+        return {"status": "error", "message": "userId required"}
+
+    SERVER_SESSION_LIMIT = 300
+    SAFE_WINDOW_DAYS = 7  # Don't delete sessions created in last 7 days
+
+    logger.info(f"[Cleanup] Starting session cleanup for {user_id}")
+    
+    # [FIX] Initialize DB locally
+    from google.cloud import firestore
+    import os
+    try:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+    except Exception as e:
+        logger.error(f"Failed to init local DB: {e}")
+        return {"status": "failed", "error": f"DB Init Failed: {e}"}
+
+    # 1. Count Active Sessions
+    sessions_ref = db.collection("sessions")
+    docs = sessions_ref.where("ownerUid", "==", user_id).stream()
+    
+    active_sessions = []
+    for d in docs:
+        d_dict = d.to_dict()
+        if d_dict.get("deletedAt") is None:
+            active_sessions.append((d.id, d_dict))
+            
+    current_count = len(active_sessions)
+    if current_count <= SERVER_SESSION_LIMIT:
+        logger.info(f"[Cleanup] User {user_id} has {current_count} sessions. Within limit ({SERVER_SESSION_LIMIT}).")
+        
+        # Update user count just in case
+        try:
+             db.collection("users").document(user_id).update({
+                 "serverSessionCount": current_count,
+                 "serverSessionLimit": SERVER_SESSION_LIMIT
+             })
+        except Exception as db_err:
+            logger.warning(f"[cleanup] Failed to update user session count: {db_err}")
+        return {"status": "skipped", "count": current_count}
+
+    # 2. Exceeds limit -> Identify cleanup candidates
+    excess_count = current_count - SERVER_SESSION_LIMIT
+    logger.info(f"[Cleanup] User {user_id} has {current_count} sessions. Excess: {excess_count} (Deleting {excess_count})")
+    
+    # Sort: Oldest first (Delete target)
+    # Priority: lastOpenedAt (if available) -> updatedAt -> createdAt
+    def sort_key(item):
+        sid, data = item
+        ts = data.get("lastOpenedAt") or data.get("updatedAt") or data.get("createdAt")
+        if not ts: return datetime.min
+        if isinstance(ts, str):
+             try: return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+             except: return datetime.min
+        return ts
+
+    sorted_sessions = sorted(active_sessions, key=sort_key)
+    
+    now = datetime.now(timezone.utc)
+    deleted_count = 0
+    
+    batch = db.batch()
+    
+    for sid, data in sorted_sessions:
+        if deleted_count >= excess_count:
+            break
+            
+        # Protection Rules (Safe Window)
+        created_at = data.get("createdAt")
+        if created_at:
+             if isinstance(created_at, str):
+                 try: created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                 except: pass
+             if isinstance(created_at, datetime):
+                 age = now - created_at
+                 if age.days < SAFE_WINDOW_DAYS:
+                     # Too new, skip deletion even if limit exceeded?
+                     # Ideally we should find another candidate.
+                     # But if ALL are new, we might be forced to delete or skip.
+                     # "Triple Lock" priority is COST > User Convenience.
+                     # Start with skipping, but if truly overflowed, we should delete.
+                     # For Phase 3, let's respect window but log warning.
+                     continue
+
+        ref = db.collection("sessions").document(sid)
+        batch.update(ref, {
+             "deletedAt": now,
+             "status": "deleted_by_limit_cleanup",
+             "audioPath": None, # Wipe reference
+             "transcriptText": None, # Wipe text
+             "summaryMarkdown": None,
+             "quizMarkdown": None,
+             "playlist": None
+        })
+        deleted_count += 1
+        
+    if deleted_count > 0:
+        batch.commit()
+        logger.info(f"[Cleanup] Deleted {deleted_count} sessions for {user_id}")
+        
+    # Update final count
+    new_count = current_count - deleted_count
+    try:
+        db.collection("users").document(user_id).update({
+            "serverSessionCount": new_count
+        })
+    except Exception as db_err:
+        logger.warning(f"[cleanup] Failed to update user session count after cleanup: {db_err}")
+
+    return {"status": "completed", "deleted": deleted_count}
+
+
+@router.post("/internal/tasks/nuke_user")
+async def handle_nuke_user_task(request: Request):
+    """
+    [DANGER] Completely wipe a user account and all associated data.
+    1. List all sessions
+    2. For each session:
+       - Delete GCS Objects (Audio/Images)
+       - Delete Subcollections (jobs, derived, etc)
+       - Delete Session Doc
+    3. Delete User Data (sessionMeta, Claims, User Doc, Auth)
+    """
+    try:
+        payload = await request.json()
+        user_id = payload.get("userId")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if not user_id:
+        return {"status": "error", "message": "userId required"}
+
+    logger.warning(f"[NUKE] Starting Account Deletion for {user_id}")
+    
+    # Init DB & Storage
+    from google.cloud import firestore, storage
+    import os
+    from app.firebase import AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
+    
+    try:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+        storage_client = storage.Client(project=project_id)
+    except Exception as e:
+        logger.error(f"[NUKE] DB/Storage Init Failed: {e}")
+        return {"status": "failed", "error": f"Init Failed: {e}"}
+
+    # --- Helper: Recursive Delete Collection ---
+    def delete_collection(coll_ref, batch_size=50):
+        docs = list(coll_ref.limit(batch_size).stream())
+        deleted = 0
+
+        while len(docs) > 0:
+            batch = db.batch()
+            for doc in docs:
+                batch.delete(doc.reference)
+            batch.commit()
+            deleted += len(docs)
+            logger.info(f"[NUKE] Deleted {len(docs)} docs from {coll_ref.path}")
+            docs = list(coll_ref.limit(batch_size).stream())  # Fetch next batch
+
+    # --- Step 1: List All Sessions ---
+    sessions_ref = db.collection("sessions")
+    # Query by both ownerUid and userId (legacy) to be safe
+    # But mostly ownerUid is the new standard
+    # To be extremely thorough, we'll do two passes or one large query if possible
+    # We will iterate and handle each session.
+    
+    # Strategy: Get IDs first
+    session_ids = set()
+    for field in ["ownerUid", "userId", "ownerUserId"]:
+        docs = sessions_ref.where(field, "==", user_id).stream()
+        for d in docs:
+            session_ids.add(d.id)
+            
+    logger.info(f"[NUKE] Found {len(session_ids)} sessions to delete.")
+
+    audio_bucket = storage_client.bucket(AUDIO_BUCKET_NAME)
+    media_bucket = storage_client.bucket(MEDIA_BUCKET_NAME)
+
+    for sid in session_ids:
+        try:
+            doc_ref = sessions_ref.document(sid)
+            
+            # A. GCS Cleanup (Prefix-based)
+            # Audio Bucket: sessions/{sid}/
+            blobs_audio = list(audio_bucket.list_blobs(prefix=f"sessions/{sid}/"))
+            for b in blobs_audio: b.delete()
+            
+            # Media Bucket: sessions/{sid}/ (Images)
+            blobs_media = list(media_bucket.list_blobs(prefix=f"sessions/{sid}/"))
+            for b in blobs_media: b.delete()
+            
+            logger.info(f"[NUKE] Wiped GCS for session {sid}")
+
+            # B. Subcollections
+            sub_colls = ["jobs", "derived", "calendar_sync", "transcript_chunks", "vectors", "artifacts"]
+            for sub in sub_colls:
+                delete_collection(doc_ref.collection(sub))
+                
+            # C. Delete Session Doc
+            doc_ref.delete()
+            
+        except Exception as e:
+             logger.error(f"[NUKE] Failed to delete session {sid}: {e}")
+             # Continue to next session even if one fails
+    
+    logger.info("[NUKE] All sessions wiped.")
+
+    # --- Step 2: Delete User Subcollections ---
+    user_ref = db.collection("users").document(user_id)
+    delete_collection(user_ref.collection("sessionMeta"))
+    delete_collection(user_ref.collection("devices")) # If exists
+
+    # --- Step 3: Delete Username Claim ---
+    # Need to read user doc first to know username
+    user_doc = user_ref.get()
+    if user_doc.exists:
+        u_data = user_doc.to_dict()
+        username = u_data.get("username") or u_data.get("usernameLower")
+        if username:
+            try:
+                db.collection("username_claims").document(username).delete()
+                logger.info(f"[NUKE] Released username {username}")
+            except Exception as e:
+                logger.error(f"[NUKE] Failed username release: {e}")
+
+    # --- Step 4: Delete User Doc ---
+    user_ref.delete()
+    logger.info(f"[NUKE] User doc {user_id} deleted.")
+
+    # --- Step 5: Firebase Auth ---
+    try:
+        from firebase_admin import auth
+        auth.delete_user(user_id)
+        logger.info(f"[NUKE] Firebase Auth user {user_id} deleted.")
+    except Exception as e:
+        # Ignore if already deleted
+        logger.warning(f"[NUKE] Auth deletion warning (might be already deleted): {e}")
+
+    # --- Step 6: Finalize deletion request/lock ---
+    try:
+        req_ref = db.collection(REQUESTS_COLLECTION).document(user_id)
+        req_doc = req_ref.get()
+        if req_doc.exists:
+            req_data = req_doc.to_dict() or {}
+            email_lower = req_data.get("emailLower")
+            provider_id = req_data.get("providerId") or req_data.get("provider")
+            if email_lower and provider_id:
+                lock_id = deletion_lock_id(email_lower, provider_id)
+                db.collection(LOCKS_COLLECTION).document(lock_id).delete()
+            now = datetime.now(timezone.utc)
+            req_ref.update(
+                {
+                    "status": "deleted",
+                    "deletedAt": now,
+                    "updatedAt": now,
+                }
+            )
+    except Exception as e:
+        logger.warning(f"[NUKE] Failed to finalize deletion request for {user_id}: {e}")
+
+    logger.info(f"[NUKE] SUCCESS. Account {user_id} is gone.")
+    return {"status": "completed", "user_id": user_id}

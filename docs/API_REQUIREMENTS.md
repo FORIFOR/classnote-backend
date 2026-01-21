@@ -86,7 +86,7 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 - `errorReason`, `idempotencyKey`, `progress`
 
 ### 5.3 Artifact（成果物）
-- `type` = `transcript` / `playlist` / `summary` / `quiz` / `explain` / `highlights`
+- `type` = `transcript` / `playlist` / `summary` / `quiz` / `highlights`
 - `status`, `updatedAt`, `jobId`, `result`, `modelInfo`
 
 重い成果物（全文 transcript など）は **GCS 参照** とし、Firestore には参照パスのみ保存する。
@@ -127,7 +127,7 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 - playlist は `GET /sessions/{id}/artifacts/playlist` を使用する
 
 ### 6.7 要約・クイズ・QA
-- `POST /sessions/{id}/jobs` で `type=summary/quiz/explain`
+- `POST /sessions/{id}/jobs` で `type=summary/quiz`
 - `POST /sessions/{id}/qa` で QA
 
 ### 6.7 iOS 課金確認

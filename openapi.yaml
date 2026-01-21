@@ -3,7 +3,7 @@ info:
   title: ClassnoteX API
   description: Backend API for ClassnoteX - AI-powered recording and transcription
     app.
-  version: 0.4.0
+  version: 1.0.0
 paths:
   /sessions/{session_id}/assets:
     get:
@@ -188,6 +188,23 @@ paths:
       operationId: create_session_sessions_post
       security:
       - OAuth2PasswordBearer: []
+      parameters:
+      - name: X-Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Idempotency-Key
+      - name: X-Cloud-Trace-Context
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Cloud-Trace-Context
       requestBody:
         required: true
         content:
@@ -532,15 +549,10 @@ paths:
       tags:
       - Sessions
       summary: Device Sync
-      description: '端末側で生成された音声・文字起こし・話者分離結果をサーバへ同期し、
-
-        必要に応じてプレイリスト生成をトリガーする。'
       operationId: device_sync_sessions__session_id__device_sync_post
       security:
       - OAuth2PasswordBearer: []
       parameters:
-      - $ref: '#/components/parameters/RequestIdHeader'
-      - $ref: '#/components/parameters/IdempotencyKeyHeader'
       - name: session_id
         in: path
         required: true
@@ -558,7 +570,8 @@ paths:
           description: Successful Response
           content:
             application/json:
-              schema: {}
+              schema:
+                $ref: '#/components/schemas/DeviceSyncResponse'
         '422':
           description: Validation Error
           content:
@@ -610,8 +623,6 @@ paths:
       security:
       - OAuth2PasswordBearer: []
       parameters:
-      - $ref: '#/components/parameters/RequestIdHeader'
-      - $ref: '#/components/parameters/IdempotencyKeyHeader'
       - name: session_id
         in: path
         required: true
@@ -770,34 +781,6 @@ paths:
       - Sessions
       summary: Get Artifact Quiz
       operationId: get_artifact_quiz_sessions__session_id__artifacts_quiz_get
-      security:
-      - OAuth2PasswordBearer: []
-      parameters:
-      - name: session_id
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Session Id
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DerivedStatusResponse'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-  /sessions/{session_id}/artifacts/explain:
-    get:
-      tags:
-      - Sessions
-      summary: Get Artifact Explain
-      operationId: get_artifact_explain_sessions__session_id__artifacts_explain_get
       security:
       - OAuth2PasswordBearer: []
       parameters:
@@ -1061,8 +1044,6 @@ paths:
       security:
       - OAuth2PasswordBearer: []
       parameters:
-      - $ref: '#/components/parameters/RequestIdHeader'
-      - $ref: '#/components/parameters/IdempotencyKeyHeader'
       - name: session_id
         in: path
         required: true
@@ -1097,8 +1078,6 @@ paths:
       security:
       - OAuth2PasswordBearer: []
       parameters:
-      - $ref: '#/components/parameters/RequestIdHeader'
-      - $ref: '#/components/parameters/IdempotencyKeyHeader'
       - name: session_id
         in: path
         required: true
@@ -1450,12 +1429,16 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - OAuth2PasswordBearer: []
-  /sessions/{session_id}/image_notes/upload_url:
+  /sessions/{session_id}/images:prepare:
     post:
       tags:
       - Sessions
-      summary: Get Image Upload Url
-      operationId: get_image_upload_url_sessions__session_id__image_notes_upload_url_post
+      summary: Prepare Image Upload
+      description: 'Step 1: Prepare image upload. Generates signed URL and records
+        pending state.
+
+        Limits to max 3 images (ready or pending) per session.'
+      operationId: prepare_image_upload_sessions__session_id__images_prepare_post
       security:
       - OAuth2PasswordBearer: []
       parameters:
@@ -1470,14 +1453,50 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ImageUploadUrlRequest'
+              $ref: '#/components/schemas/ImagePrepareRequest'
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ImageUploadUrlResponse'
+                $ref: '#/components/schemas/ImagePrepareResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/images:commit:
+    post:
+      tags:
+      - Sessions
+      summary: Commit Image Upload
+      description: 'Step 2: Commit image upload. Verifies file exists in GCS and marks
+        as ready.'
+      operationId: commit_image_upload_sessions__session_id__images_commit_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageCommitRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageNoteDTO'
         '422':
           description: Validation Error
           content:
@@ -1489,9 +1508,7 @@ paths:
       tags:
       - Sessions
       summary: List Image Notes
-      description: 'Get image notes with cached signed URLs.
-
-        Optimized: Caches signed URLs in Firestore to avoid regenerating each request.'
+      description: Get ready image notes with signed URLs.
       operationId: list_image_notes_sessions__session_id__image_notes_get
       security:
       - OAuth2PasswordBearer: []
@@ -1519,6 +1536,102 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/images/{image_id}:
+    delete:
+      tags:
+      - Sessions
+      summary: Delete Image Note
+      description: Delete image note from Firestore and GCS.
+      operationId: delete_image_note_sessions__session_id__images__image_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: image_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Image Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /sessions/{session_id}/cloud_stt:start:
+    post:
+      tags:
+      - Sessions
+      summary: Start Cloud Stt
+      description: 'Check if user can start Cloud STT (High Accuracy).
+
+        Returns allowed=True with a ticket if quota is available.
+
+        Returns allowed=False with lockedUntil if quota exceeded.'
+      operationId: start_cloud_stt_sessions__session_id__cloud_stt_start_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudSTTStartResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /stt/high:start:
+    post:
+      tags:
+      - Sessions
+      summary: Start Stt High Global Alias
+      description: Alias for /sessions/{id}/cloud_stt:start to support iOS flat path
+        expectations.
+      operationId: start_stt_high_global_alias_stt_high_start_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartSTTGlobalRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudSTTStartResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
   /sessions/{session_id}/tags:
     patch:
       tags:
@@ -1624,6 +1737,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MeResponse'
+      security:
+      - OAuth2PasswordBearer: []
+    delete:
+      tags:
+      - Users
+      summary: Delete Me
+      description: '[ASYNC] Request account deletion.
+
+        Records a deletion request and schedules hard delete after a grace period.'
+      operationId: delete_me_users_me_delete
+      responses:
+        '204':
+          description: Successful Response
       security:
       - OAuth2PasswordBearer: []
     patch:
@@ -1953,15 +2079,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /users/me/consents:
+    post:
+      tags:
+      - Users
+      summary: Post Consent
+      description: 'Record user consent to Terms of Service and Privacy Policy.
+
+        Stores in Firestore subcollection for audit trail.'
+      operationId: post_consent_users_me_consents_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsentRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsentResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - OAuth2PasswordBearer: []
   /billing/ios/confirm:
     post:
       tags:
       - Billing
       summary: Confirm Ios Purchase
       operationId: confirm_ios_purchase_billing_ios_confirm_post
-      parameters:
-      - $ref: '#/components/parameters/RequestIdHeader'
-      - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         content:
           application/json:
@@ -1971,9 +2124,6 @@ paths:
       responses:
         '200':
           description: Successful Response
-          headers:
-            X-Request-Id:
-              $ref: '#/components/headers/RequestId'
           content:
             application/json:
               schema:
@@ -2617,128 +2767,113 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /admin/overview:
+  /admin/stats/dashboard:
     get:
       tags:
       - Admin
-      - Admin
-      summary: Get Admin Overview
-      description: 'Get KPI overview for admin dashboard.
+      - admin
+      summary: Get Dashboard Stats
+      description: 'ダッシュボード用のKPIとチャートデータを返す。
 
-        TODO: Add proper admin role check.'
-      operationId: get_admin_overview_admin_overview_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OverviewResponse'
+        本来は ops_aggregates_daily を参照すべきだが、
+
+        初期実装として ops_events を直近分クエリして簡易集計する。'
+      operationId: get_dashboard_stats_admin_stats_dashboard_get
       security:
-      - OAuth2PasswordBearer: []
-  /admin/users:
-    get:
-      tags:
-      - Admin
-      - Admin
-      summary: Get Admin Users
-      description: Get paginated user list with filters.
-      operationId: get_admin_users_admin_users_get
-      security:
-      - OAuth2PasswordBearer: []
+      - HTTPBearer: []
       parameters:
-      - name: query
+      - name: period
         in: query
         required: false
         schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: Search by name, email, or UID
-          title: Query
-        description: Search by name, email, or UID
-      - name: plan
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: Filter by plan
-          title: Plan
-        description: Filter by plan
-      - name: active
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: 'Filter by activity: 7d, 30d, inactive'
-          title: Active
-        description: 'Filter by activity: 7d, 30d, inactive'
-      - name: limit
-        in: query
-        required: false
-        schema:
-          type: integer
-          maximum: 200
-          default: 50
-          title: Limit
+          type: string
+          pattern: ^(24h|7d)$
+          default: 24h
+          title: Period
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/UserSummary'
-                title: Response Get Admin Users Admin Users Get
+              schema: {}
         '422':
           description: Validation Error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /admin/users/rankings:
+  /admin/events:
     get:
       tags:
       - Admin
-      - Admin
-      summary: Get User Rankings
-      description: Get top users by specified metric.
-      operationId: get_user_rankings_admin_users_rankings_get
+      - admin
+      summary: List Events
+      description: ops_events を検索・一覧表示する。
+      operationId: list_events_admin_events_get
       security:
-      - OAuth2PasswordBearer: []
+      - HTTPBearer: []
       parameters:
-      - name: metric
-        in: query
-        required: false
-        schema:
-          type: string
-          description: 'Metric: recording, cost, sessions'
-          default: recording
-          title: Metric
-        description: 'Metric: recording, cost, sessions'
       - name: limit
         in: query
         required: false
         schema:
           type: integer
-          maximum: 50
-          default: 10
+          default: 50
           title: Limit
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - name: severity
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Severity
+      - name: type
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Type
+      - name: uid
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Uid
+      - name: sessionId
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Sessionid
+      - name: errorCode
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorcode
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/RankingItem'
-                title: Response Get User Rankings Admin Users Rankings Get
+              schema: {}
         '422':
           description: Validation Error
           content:
@@ -2749,12 +2884,12 @@ paths:
     get:
       tags:
       - Admin
-      - Admin
+      - admin
       summary: Get User Detail
-      description: Get detailed user info with usage stats.
+      description: ユーザー詳細：基本情報 + 統計 + 直近イベント
       operationId: get_user_detail_admin_users__uid__get
       security:
-      - OAuth2PasswordBearer: []
+      - HTTPBearer: []
       parameters:
       - name: uid
         in: path
@@ -2767,43 +2902,94 @@ paths:
           description: Successful Response
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/UserDetailResponse'
+              schema: {}
         '422':
           description: Validation Error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /admin/config/pricing:
-    get:
+  /admin/users/{uid}/actions:
+    post:
       tags:
       - Admin
-      - Admin
-      summary: Get Pricing Config
-      description: Get current pricing configuration.
-      operationId: get_pricing_config_admin_config_pricing_get
+      - admin
+      summary: User Actions
+      description: 'ユーザーへのアクション（隔離、BANなど）
+
+        Body: { "action": "quarantine", "durationMinutes": 60, "reason": "Abuse" }'
+      operationId: user_actions_admin_users__uid__actions_post
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: uid
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Uid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Action Body
       responses:
         '200':
           description: Successful Response
           content:
             application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
               schema:
-                $ref: '#/components/schemas/PricingConfig'
-      security:
-      - OAuth2PasswordBearer: []
-    patch:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /admin/sessions/{session_id}:
+    get:
       tags:
       - Admin
-      - Admin
-      summary: Update Pricing Config
-      description: Update pricing configuration.
-      operationId: update_pricing_config_admin_config_pricing_patch
+      - admin
+      summary: Get Session Detail
+      description: セッション詳細：基本情報 + ジョブ履歴 + 関連イベント
+      operationId: get_session_detail_admin_sessions__session_id__get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /imports/youtube/check:
+    post:
+      tags:
+      - Imports
+      summary: Check Youtube Transcript
+      description: '[vNext] Verifies if a YouTube video has available transcripts
+        before import.'
+      operationId: check_youtube_transcript_imports_youtube_check_post
       requestBody:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PricingConfig'
+              $ref: '#/components/schemas/YouTubeCheckRequest'
         required: true
       responses:
         '200':
@@ -2811,74 +2997,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PricingConfig'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-      security:
-      - OAuth2PasswordBearer: []
-  /admin/sessions:
-    get:
-      tags:
-      - Admin
-      - Admin
-      summary: Get Admin Sessions
-      description: Get paginated session list with filters.
-      operationId: get_admin_sessions_admin_sessions_get
-      security:
-      - OAuth2PasswordBearer: []
-      parameters:
-      - name: status
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: Filter by status
-          title: Status
-        description: Filter by status
-      - name: mode
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: Filter by mode
-          title: Mode
-        description: Filter by mode
-      - name: userId
-        in: query
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          description: Filter by userId
-          title: Userid
-        description: Filter by userId
-      - name: limit
-        in: query
-        required: false
-        schema:
-          type: integer
-          maximum: 200
-          default: 50
-          title: Limit
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/AdminSessionListItem'
-                title: Response Get Admin Sessions Admin Sessions Get
+                $ref: '#/components/schemas/YouTubeCheckResponse'
         '422':
           description: Validation Error
           content:
@@ -2912,6 +3031,89 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - OAuth2PasswordBearer: []
+  /ads/placement:
+    get:
+      tags:
+      - Ads
+      summary: Get Placement
+      description: Get an ad placement for the given slot (e.g., 'summary_generating').
+      operationId: get_placement_ads_placement_get
+      parameters:
+      - name: slot
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Slot
+      - name: session_id
+        in: query
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: job_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Job Id
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlacementResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /ads/events:
+    post:
+      tags:
+      - Ads
+      summary: Post Ad Event
+      description: Track ad events (impression, click, dismiss).
+      operationId: post_ad_event_ads_events_post
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdEventIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /sessions/{session_id}/quiz_attempts:
     post:
       tags:
@@ -3028,6 +3230,8 @@ paths:
 
         Scans all sessions and populates user_daily_usage.'
       operationId: backfill_usage_usage_admin_backfill_post
+      security:
+      - OAuth2PasswordBearer: []
       parameters:
       - name: secret
         in: query
@@ -3037,14 +3241,6 @@ paths:
           - type: string
           - type: 'null'
           title: Secret
-      - name: authorization
-        in: header
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Authorization
       responses:
         '200':
           description: Successful Response
@@ -3116,10 +3312,7 @@ paths:
       - Usage
       - Usage
       summary: Get User Usage Summary Admin
-      description: 'Admin endpoint to view any user''s usage.
-
-
-        TODO: Add proper admin role check'
+      description: Admin endpoint to view any user's usage.
       operationId: get_user_usage_summary_admin_usage_admin_users__user_id__summary_get
       security:
       - OAuth2PasswordBearer: []
@@ -3201,56 +3394,139 @@ paths:
               schema: {}
 components:
   schemas:
-    AdminSessionListItem:
+    AdAction:
       properties:
         id:
           type: string
           title: Id
-        userId:
+        style:
           type: string
-          title: Userid
-        title:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Title
-        createdAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Createdat
-        durationSec:
-          type: number
-          title: Durationsec
-          default: 0.0
-        status:
+          title: Style
+        text:
           type: string
-          title: Status
-          default: created
-        mode:
+          title: Text
+        url:
           type: string
-          title: Mode
-          default: lecture
-        audioStatus:
+          title: Url
+        openMode:
+          type: string
+          title: Openmode
+        fallbackUrl:
           anyOf:
           - type: string
           - type: 'null'
-          title: Audiostatus
-        summaryStatus:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Summarystatus
-        sizeBytes:
-          type: integer
-          title: Sizebytes
-          default: 0
+          title: Fallbackurl
       type: object
       required:
       - id
-      - userId
-      title: AdminSessionListItem
+      - style
+      - text
+      - url
+      - openMode
+      title: AdAction
+    AdAsset:
+      properties:
+        type:
+          type: string
+          title: Type
+        url:
+          type: string
+          title: Url
+        posterUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Posterurl
+        muted:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Muted
+        loop:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Loop
+        blurHash:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Blurhash
+      type: object
+      required:
+      - type
+      - url
+      title: AdAsset
+    AdAssets:
+      properties:
+        logo:
+          anyOf:
+          - $ref: '#/components/schemas/AdAsset'
+          - type: 'null'
+        hero:
+          anyOf:
+          - $ref: '#/components/schemas/AdAsset'
+          - type: 'null'
+        video:
+          anyOf:
+          - $ref: '#/components/schemas/AdAsset'
+          - type: 'null'
+      type: object
+      title: AdAssets
+    AdCreative:
+      properties:
+        logoUrl:
+          type: string
+          title: Logourl
+        heroUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Herourl
+        backgroundHex:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Backgroundhex
+      type: object
+      required:
+      - logoUrl
+      title: AdCreative
+    AdEventIn:
+      properties:
+        event:
+          type: string
+          title: Event
+        placement_id:
+          type: string
+          title: Placement Id
+        ad_id:
+          type: string
+          title: Ad Id
+        session_id:
+          type: string
+          title: Session Id
+        job_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Job Id
+        ts_ms:
+          type: integer
+          title: Ts Ms
+        meta:
+          additionalProperties: true
+          type: object
+          title: Meta
+          default: {}
+      type: object
+      required:
+      - event
+      - placement_id
+      - ad_id
+      - session_id
+      - ts_ms
+      title: AdEventIn
     AppStoreNotificationRequest:
       properties:
         signedPayload:
@@ -3369,6 +3645,7 @@ components:
       enum:
       - ready
       - processing
+      - pending
       - missing
       - error
       title: AssetStatus
@@ -3481,6 +3758,11 @@ components:
           - type: number
           - type: 'null'
           title: Durationsec
+        fileSize:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Filesize
         sampleRate:
           anyOf:
           - type: integer
@@ -3524,8 +3806,7 @@ components:
           title: Storagepath
         deleteAfterAt:
           anyOf:
-          - type: string
-            format: date-time
+          - {}
           - type: 'null'
           title: Deleteafterat
       type: object
@@ -3544,6 +3825,7 @@ components:
       - ready
       - failed
       - expired
+      - deleted
       - unknown
       title: AudioStatus
     BatchDeleteRequest:
@@ -3707,6 +3989,130 @@ components:
       required:
       - username
       title: ClaimUsernameRequest
+    CloudSTTStartResponse:
+      properties:
+        allowed:
+          type: boolean
+          title: Allowed
+        remainingSeconds:
+          type: number
+          title: Remainingseconds
+        lockedUntil:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Lockeduntil
+        ticket:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ticket
+      type: object
+      required:
+      - allowed
+      - remainingSeconds
+      title: CloudSTTStartResponse
+    CloudUsageReport:
+      properties:
+        limitSeconds:
+          type: number
+          title: Limitseconds
+        usedSeconds:
+          type: number
+          title: Usedseconds
+        remainingSeconds:
+          type: number
+          title: Remainingseconds
+        sessionLimit:
+          type: integer
+          title: Sessionlimit
+        sessionsStarted:
+          type: integer
+          title: Sessionsstarted
+        canStart:
+          type: boolean
+          title: Canstart
+        reasonIfBlocked:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reasonifblocked
+      type: object
+      required:
+      - limitSeconds
+      - usedSeconds
+      - remainingSeconds
+      - sessionLimit
+      - sessionsStarted
+      - canStart
+      title: CloudUsageReport
+      description: '[vNext] Monthly Cloud Transcription Quota Report
+
+        Used to inform the UI about remaining minutes and sessions.'
+    ConsentRequest:
+      properties:
+        termsVersion:
+          type: string
+          title: Termsversion
+          description: Version string of accepted Terms of Service
+        privacyVersion:
+          type: string
+          title: Privacyversion
+          description: Version string of accepted Privacy Policy
+        acceptedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Acceptedat
+        appVersion:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Appversion
+        build:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Build
+        platform:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Platform
+          default: ios
+        locale:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Locale
+      type: object
+      required:
+      - termsVersion
+      - privacyVersion
+      title: ConsentRequest
+    ConsentResponse:
+      properties:
+        ok:
+          type: boolean
+          title: Ok
+        termsVersion:
+          type: string
+          title: Termsversion
+        privacyVersion:
+          type: string
+          title: Privacyversion
+        acceptedAt:
+          type: string
+          format: date-time
+          title: Acceptedat
+      type: object
+      required:
+      - ok
+      - termsVersion
+      - privacyVersion
+      - acceptedAt
+      title: ConsentResponse
     CreateSessionRequest:
       properties:
         title:
@@ -3759,7 +4165,26 @@ components:
           anyOf:
           - $ref: '#/components/schemas/TranscriptionMode'
           - type: 'null'
-          default: cloud_google
+        clientSessionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Clientsessionid
+        deviceId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Deviceid
+        createdAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Createdat
+        source:
+          type: string
+          title: Source
+          default: ios
       type: object
       required:
       - title
@@ -3828,53 +4253,6 @@ components:
       required:
       - status
       title: DerivedStatusResponse
-    PlaylistArtifactResponse:
-      properties:
-        status:
-          $ref: '#/components/schemas/JobStatus'
-        jobId:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Jobid
-        updatedAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Updatedat
-        items:
-          anyOf:
-          - items:
-              $ref: '#/components/schemas/PlaylistItem'
-            type: array
-          - type: 'null'
-          title: Items
-        errorReason:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Errorreason
-        modelInfo:
-          anyOf:
-          - additionalProperties: true
-            type: object
-          - type: 'null'
-          title: Modelinfo
-        idempotencyKey:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Idempotencykey
-        version:
-          anyOf:
-          - type: integer
-          - type: 'null'
-          title: Version
-      type: object
-      required:
-      - status
-      title: PlaylistArtifactResponse
     DeviceSyncRequest:
       properties:
         transcriptText:
@@ -3912,8 +4290,63 @@ components:
           type: boolean
           title: Needsplaylist
           default: true
+        createIfMissing:
+          type: boolean
+          title: Createifmissing
+          default: true
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        mode:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Mode
+          default: lecture
+        transcriptionMode:
+          anyOf:
+          - $ref: '#/components/schemas/TranscriptionMode'
+          - type: 'null'
+          default: device_sherpa
+        deviceId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Deviceid
+        clientCreatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Clientcreatedat
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          default: ios
       type: object
       title: DeviceSyncRequest
+    DeviceSyncResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+          default: accepted
+        sessionCreated:
+          type: boolean
+          title: Sessioncreated
+          default: false
+        sessionId:
+          type: string
+          title: Sessionid
+      type: object
+      required:
+      - sessionId
+      title: DeviceSyncResponse
+      description: '[OFFLINE-FIRST] Response from /device_sync endpoint'
     DiarizedSegment:
       properties:
         startSec:
@@ -3922,24 +4355,6 @@ components:
         endSec:
           type: number
           title: Endsec
-        summary:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Summary
-        label:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Label
-        segments:
-          anyOf:
-          - items:
-              additionalProperties: true
-              type: object
-            type: array
-          - type: 'null'
-          title: Segments
         speakerId:
           anyOf:
           - type: string
@@ -4036,6 +4451,15 @@ components:
       required:
       - status
       title: HighlightsResponse
+    ImageCommitRequest:
+      properties:
+        imageId:
+          type: string
+          title: Imageid
+      type: object
+      required:
+      - imageId
+      title: ImageCommitRequest
     ImageNoteDTO:
       properties:
         id:
@@ -4044,26 +4468,40 @@ components:
         url:
           type: string
           title: Url
+        status:
+          type: string
+          title: Status
+          default: ready
         createdAt:
           anyOf:
           - type: string
             format: date-time
           - type: 'null'
           title: Createdat
+        localId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Localid
       type: object
       required:
       - id
       - url
       title: ImageNoteDTO
-    ImageUploadUrlRequest:
+    ImagePrepareRequest:
       properties:
         contentType:
           type: string
           title: Contenttype
           default: image/jpeg
+        localId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Localid
       type: object
-      title: ImageUploadUrlRequest
-    ImageUploadUrlResponse:
+      title: ImagePrepareRequest
+    ImagePrepareResponse:
       properties:
         imageId:
           type: string
@@ -4072,19 +4510,24 @@ components:
           type: string
           title: Uploadurl
         storagePath:
-          anyOf:
-          - type: string
-          - type: 'null'
+          type: string
           title: Storagepath
         method:
           type: string
           title: Method
           default: PUT
+        headers:
+          additionalProperties:
+            type: string
+          type: object
+          title: Headers
+          default: {}
       type: object
       required:
       - imageId
       - uploadUrl
-      title: ImageUploadUrlResponse
+      - storagePath
+      title: ImagePrepareResponse
     ImportYouTubeRequest:
       properties:
         url:
@@ -4122,6 +4565,18 @@ components:
           type: boolean
           title: Isautogenerated
           default: false
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+        languages:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          title: Languages
       type: object
       required:
       - url
@@ -4159,7 +4614,6 @@ components:
           enum:
           - summary
           - quiz
-          - explain
           - playlist
           - calendar_sync
           - transcribe
@@ -4192,7 +4646,6 @@ components:
           enum:
           - summary
           - quiz
-          - explain
           - playlist
           - calendar_sync
           - transcribe
@@ -4229,8 +4682,12 @@ components:
           anyOf:
           - type: string
           - type: 'null'
-          title: PollUrl
-          description: Full path for polling this job, e.g. /sessions/{sid}/jobs/{jobId}
+          title: Pollurl
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
       type: object
       required:
       - jobId
@@ -4238,7 +4695,6 @@ components:
       - status
       - createdAt
       title: JobResponse
-      description: Response from job creation or status query. Use pollUrl for polling.
     JobStatus:
       type: string
       enum:
@@ -4360,6 +4816,45 @@ components:
           - type: integer
           - type: 'null'
           title: Freecloudcreditsremaining
+        freeSummaryCreditsRemaining:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Freesummarycreditsremaining
+        freeQuizCreditsRemaining:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Freequizcreditsremaining
+        activeSessionCount:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Activesessioncount
+        serverSessionCount:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Serversessioncount
+        serverSessionLimit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Serversessionlimit
+        cloudSessionCount:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Cloudsessioncount
+        cloudSessionLimit:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Cloudsessionlimit
+        cloud:
+          anyOf:
+          - $ref: '#/components/schemas/CloudUsageReport'
+          - type: 'null'
       type: object
       required:
       - uid
@@ -4397,63 +4892,61 @@ components:
       required:
       - notes
       title: NotesUpdateRequest
-    OverviewResponse:
+    PlacementResponse:
       properties:
-        total_users:
-          type: integer
-          title: Total Users
-        dau:
-          type: integer
-          title: Dau
-        wau:
-          type: integer
-          title: Wau
-        mau:
-          type: integer
-          title: Mau
-        new_users_today:
-          type: integer
-          title: New Users Today
-        new_users_7d:
-          type: integer
-          title: New Users 7D
-        total_sessions_today:
-          type: integer
-          title: Total Sessions Today
-        total_sessions_7d:
-          type: integer
-          title: Total Sessions 7D
-        total_recording_sec_today:
-          type: number
-          title: Total Recording Sec Today
-        total_recording_sec_7d:
-          type: number
-          title: Total Recording Sec 7D
-        estimated_cost_today_usd:
-          type: number
-          title: Estimated Cost Today Usd
-        estimated_cost_7d_usd:
-          type: number
-          title: Estimated Cost 7D Usd
-        jobs_failed_24h:
-          type: integer
-          title: Jobs Failed 24H
+        ad:
+          anyOf:
+          - $ref: '#/components/schemas/SponsoredAd'
+          - type: 'null'
+      type: object
+      title: PlacementResponse
+    PlaylistArtifactResponse:
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        jobId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Jobid
+        updatedAt:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updatedat
+        items:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/PlaylistItem'
+            type: array
+          - type: 'null'
+          title: Items
+        errorReason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Errorreason
+        modelInfo:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Modelinfo
+        idempotencyKey:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotencykey
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Version
       type: object
       required:
-      - total_users
-      - dau
-      - wau
-      - mau
-      - new_users_today
-      - new_users_7d
-      - total_sessions_today
-      - total_sessions_7d
-      - total_recording_sec_today
-      - total_recording_sec_7d
-      - estimated_cost_today_usd
-      - estimated_cost_7d_usd
-      - jobs_failed_24h
-      title: OverviewResponse
+      - status
+      title: PlaylistArtifactResponse
     PlaylistItem:
       properties:
         id:
@@ -4468,6 +4961,24 @@ components:
         endSec:
           type: number
           title: Endsec
+        summary:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Summary
+        label:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Label
+        segments:
+          anyOf:
+          - items:
+              additionalProperties: true
+              type: object
+            type: array
+          - type: 'null'
+          title: Segments
         speakerId:
           anyOf:
           - type: string
@@ -4500,38 +5011,26 @@ components:
       - startSec
       - endSec
       title: PlaylistItem
-    PricingConfig:
+    Policy:
       properties:
-        llm_input_per_1k_tokens_usd:
-          type: number
-          title: Llm Input Per 1K Tokens Usd
-          default: 0.0015
-        llm_output_per_1k_tokens_usd:
-          type: number
-          title: Llm Output Per 1K Tokens Usd
-          default: 0.002
-        storage_gb_month_usd:
-          type: number
-          title: Storage Gb Month Usd
-          default: 0.02
-        egress_gb_usd:
-          type: number
-          title: Egress Gb Usd
-          default: 0.12
-        speech_per_min_usd:
-          type: number
-          title: Speech Per Min Usd
-          default: 0.024
-        cloudrun_shared_monthly_usd:
-          type: number
-          title: Cloudrun Shared Monthly Usd
-          default: 50.0
-        firestore_shared_monthly_usd:
-          type: number
-          title: Firestore Shared Monthly Usd
-          default: 20.0
+        minViewSec:
+          type: integer
+          title: Minviewsec
+          default: 10
+        maxViewSec:
+          type: integer
+          title: Maxviewsec
+          default: 30
+        skippableAfterSec:
+          type: integer
+          title: Skippableaftersec
+          default: 10
+        autodismissAtSec:
+          type: integer
+          title: Autodismissatsec
+          default: 30
       type: object
-      title: PricingConfig
+      title: Policy
     PublicUser:
       properties:
         uid:
@@ -4747,28 +5246,6 @@ components:
       - durationSec
       - completed
       title: QuizAttemptCreate
-    RankingItem:
-      properties:
-        uid:
-          type: string
-          title: Uid
-        displayName:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Displayname
-        value:
-          type: number
-          title: Value
-        unit:
-          type: string
-          title: Unit
-      type: object
-      required:
-      - uid
-      - value
-      - unit
-      title: RankingItem
     ReactionStateResponse:
       properties:
         myEmoji:
@@ -4784,6 +5261,31 @@ components:
           default: {}
       type: object
       title: ReactionStateResponse
+    RenderHints:
+      properties:
+        layout:
+          type: string
+          title: Layout
+        showSponsorBadge:
+          type: boolean
+          title: Showsponsorbadge
+          default: true
+        showCountdown:
+          type: boolean
+          title: Showcountdown
+          default: true
+        ctaPlacement:
+          type: string
+          title: Ctaplacement
+          default: card_bottom
+        videoPlacement:
+          type: string
+          title: Videoplacement
+          default: inline_in_card
+      type: object
+      required:
+      - layout
+      title: RenderHints
     ResolvedAsset:
       properties:
         url:
@@ -4837,6 +5339,16 @@ components:
         id:
           type: string
           title: Id
+        clientSessionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Clientsessionid
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
         title:
           type: string
           title: Title
@@ -4885,11 +5397,21 @@ components:
           - type: 'null'
           title: Reactioncounts
           default: {}
+        canManage:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Canmanage
         ownerUserId:
           anyOf:
           - type: string
           - type: 'null'
           title: Owneruserid
+        ownerId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ownerid
         participantUserIds:
           items:
             type: string
@@ -4927,24 +5449,18 @@ components:
           - $ref: '#/components/schemas/JobStatus'
           - type: 'null'
           default: pending
-        explainStatus:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Explainstatus
-          default: not_started
         diarizationStatus:
           anyOf:
           - type: string
           - type: 'null'
           title: Diarizationstatus
-          default: not_started
+          default: pending
         highlightsStatus:
           anyOf:
           - type: string
           - type: 'null'
           title: Highlightsstatus
-          default: not_started
+          default: pending
         isArchived:
           type: boolean
           title: Isarchived
@@ -4976,6 +5492,22 @@ components:
           type: boolean
           title: Hastranscript
           default: false
+        cloudTicket:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cloudticket
+        cloudAllowedUntil:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Cloudalloweduntil
+        cloudStatus:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cloudstatus
         transcriptText:
           anyOf:
           - type: string
@@ -5037,6 +5569,28 @@ components:
           - type: string
           - type: 'null'
           title: Summarymarkdown
+        imageNotes:
+          items:
+            $ref: '#/components/schemas/ImageNoteDTO'
+          type: array
+          title: Imagenotes
+          default: []
+        transcriptState:
+          type: string
+          title: Transcriptstate
+          default: partial
+        transcriptTextLen:
+          type: integer
+          title: Transcripttextlen
+          default: 0
+        batchRetranscribeState:
+          type: string
+          title: Batchretranscribestate
+          default: idle
+        batchRetranscribeUsed:
+          type: boolean
+          title: Batchretranscribeused
+          default: false
         quizError:
           anyOf:
           - type: string
@@ -5236,6 +5790,16 @@ components:
         id:
           type: string
           title: Id
+        clientSessionId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Clientsessionid
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
         title:
           type: string
           title: Title
@@ -5285,11 +5849,21 @@ components:
           - type: 'null'
           title: Reactioncounts
           default: {}
+        canManage:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Canmanage
         ownerUserId:
           anyOf:
           - type: string
           - type: 'null'
           title: Owneruserid
+        ownerId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ownerid
         participantUserIds:
           items:
             type: string
@@ -5322,31 +5896,25 @@ components:
           - type: string
           - type: 'null'
           title: Summarystatus
-          default: not_started
+          default: pending
         quizStatus:
           anyOf:
           - type: string
           - type: 'null'
           title: Quizstatus
-          default: not_started
-        explainStatus:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Explainstatus
-          default: not_started
+          default: pending
         diarizationStatus:
           anyOf:
           - type: string
           - type: 'null'
           title: Diarizationstatus
-          default: not_started
+          default: pending
         highlightsStatus:
           anyOf:
           - type: string
           - type: 'null'
           title: Highlightsstatus
-          default: not_started
+          default: pending
         isArchived:
           type: boolean
           title: Isarchived
@@ -5381,7 +5949,6 @@ components:
         cloudTicket:
           anyOf:
           - type: string
-            format: uuid
           - type: 'null'
           title: Cloudticket
         cloudAllowedUntil:
@@ -5393,7 +5960,6 @@ components:
         cloudStatus:
           anyOf:
           - type: string
-            enum: ["none", "allowed", "limited", "blocked"]
           - type: 'null'
           title: Cloudstatus
       type: object
@@ -5604,6 +6170,97 @@ components:
       - audioUrl
       - expiresAt
       title: SignedCompressedAudioResponse
+    SponsoredAd:
+      properties:
+        id:
+          type: string
+          title: Id
+        placementId:
+          type: string
+          title: Placementid
+        sponsorName:
+          type: string
+          title: Sponsorname
+        headline:
+          type: string
+          title: Headline
+        body:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Body
+        format:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Format
+        ctaText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ctatext
+        clickUrl:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Clickurl
+        creative:
+          anyOf:
+          - $ref: '#/components/schemas/AdCreative'
+          - type: 'null'
+        minViewSec:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Minviewsec
+        maxViewSec:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Maxviewsec
+        assets:
+          anyOf:
+          - $ref: '#/components/schemas/AdAssets'
+          - type: 'null'
+        actions:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/AdAction'
+            type: array
+          - type: 'null'
+          title: Actions
+        renderHints:
+          anyOf:
+          - $ref: '#/components/schemas/RenderHints'
+          - type: 'null'
+        theme:
+          anyOf:
+          - $ref: '#/components/schemas/Theme'
+          - type: 'null'
+        policy:
+          anyOf:
+          - $ref: '#/components/schemas/Policy'
+          - type: 'null'
+        priority:
+          type: integer
+          title: Priority
+          default: 100
+      type: object
+      required:
+      - id
+      - placementId
+      - sponsorName
+      - headline
+      title: SponsoredAd
+    StartSTTGlobalRequest:
+      properties:
+        sessionId:
+          type: string
+          title: Sessionid
+      type: object
+      required:
+      - sessionId
+      title: StartSTTGlobalRequest
     SubscriptionVerifyRequest:
       properties:
         isSubscribed:
@@ -5717,6 +6374,27 @@ components:
       - userId
       - title
       title: TaskResponse
+    Theme:
+      properties:
+        accentHex:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Accenthex
+        surfaceStyle:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Surfacestyle
+          default: ultraThin
+        cornerRadius:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Cornerradius
+          default: 22
+      type: object
+      title: Theme
     TranscriptChunkAppendRequest:
       properties:
         chunks:
@@ -5843,6 +6521,15 @@ components:
           - type: 'null'
           title: Source
           default: device
+        transcriptSha256:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcriptsha256
+        isFinal:
+          type: boolean
+          title: Isfinal
+          default: false
       type: object
       required:
       - transcriptText
@@ -5908,6 +6595,21 @@ components:
           - type: string
           - type: 'null'
           title: Visibility
+        transcriptText:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcripttext
+        transcriptDraft:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcriptdraft
+        transcriptSource:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Transcriptsource
       type: object
       title: UpdateSessionRequest
       description: PATCH 部分更新。指定したフィールドだけ更新。
@@ -5930,6 +6632,14 @@ components:
           type: integer
           title: Session Count
           default: 0
+        total_recording_cloud_sec:
+          type: number
+          title: Total Recording Cloud Sec
+          default: 0.0
+        total_recording_ondevice_sec:
+          type: number
+          title: Total Recording Ondevice Sec
+          default: 0.0
         summary_invocations:
           type: integer
           title: Summary Invocations
@@ -6000,83 +6710,6 @@ components:
       - to_date
       title: UsageSummaryResponse
       description: Response for /me/usage-summary
-    UserDetailResponse:
-      properties:
-        uid:
-          type: string
-          title: Uid
-        displayName:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Displayname
-        email:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Email
-        plan:
-          type: string
-          title: Plan
-          default: free
-        providers:
-          items:
-            type: string
-          type: array
-          title: Providers
-          default: []
-        createdAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Createdat
-        lastSeenAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Lastseenat
-        session_count_30d:
-          type: integer
-          title: Session Count 30D
-          default: 0
-        total_recording_min_30d:
-          type: number
-          title: Total Recording Min 30D
-          default: 0.0
-        total_recording_min_lifetime:
-          type: number
-          title: Total Recording Min Lifetime
-          default: 0.0
-        estimated_cost_30d_usd:
-          type: number
-          title: Estimated Cost 30D Usd
-          default: 0.0
-        active_badge:
-          type: string
-          title: Active Badge
-          default: inactive
-        session_count_lifetime:
-          type: integer
-          title: Session Count Lifetime
-          default: 0
-        llm_input_tokens_30d:
-          type: integer
-          title: Llm Input Tokens 30D
-          default: 0
-        llm_output_tokens_30d:
-          type: integer
-          title: Llm Output Tokens 30D
-          default: 0
-        audio_bytes_30d:
-          type: integer
-          title: Audio Bytes 30D
-          default: 0
-      type: object
-      required:
-      - uid
-      title: UserDetailResponse
     UserProfileResponse:
       properties:
         uid:
@@ -6114,67 +6747,6 @@ components:
           title: Isshareable
       type: object
       title: UserProfileUpdateRequest
-    UserSummary:
-      properties:
-        uid:
-          type: string
-          title: Uid
-        displayName:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Displayname
-        email:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Email
-        plan:
-          type: string
-          title: Plan
-          default: free
-        providers:
-          items:
-            type: string
-          type: array
-          title: Providers
-          default: []
-        createdAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Createdat
-        lastSeenAt:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Lastseenat
-        session_count_30d:
-          type: integer
-          title: Session Count 30D
-          default: 0
-        total_recording_min_30d:
-          type: number
-          title: Total Recording Min 30D
-          default: 0.0
-        total_recording_min_lifetime:
-          type: number
-          title: Total Recording Min Lifetime
-          default: 0.0
-        estimated_cost_30d_usd:
-          type: number
-          title: Estimated Cost 30D Usd
-          default: 0.0
-        active_badge:
-          type: string
-          title: Active Badge
-          default: inactive
-      type: object
-      required:
-      - uid
-      title: UserSummary
     ValidationError:
       properties:
         loc:
@@ -6196,26 +6768,61 @@ components:
       - msg
       - type
       title: ValidationError
-  parameters:
-    RequestIdHeader:
-      name: X-Request-Id
-      in: header
-      description: クライアント側のリクエストID。未指定の場合はサーバ側で生成する。
-      required: false
-      schema:
-        type: string
-    IdempotencyKeyHeader:
-      name: Idempotency-Key
-      in: header
-      description: 冪等性キー。重複送信時の安全な再実行判定に利用する。
-      required: false
-      schema:
-        type: string
-  headers:
-    RequestId:
-      description: リクエスト追跡用のID。
-      schema:
-        type: string
+    YouTubeCheckRequest:
+      properties:
+        url:
+          type: string
+          title: Url
+      type: object
+      required:
+      - url
+      title: YouTubeCheckRequest
+    YouTubeCheckResponse:
+      properties:
+        videoId:
+          type: string
+          title: Videoid
+        available:
+          type: boolean
+          title: Available
+        tracks:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/YouTubeTrack'
+            type: array
+          - type: 'null'
+          title: Tracks
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+      type: object
+      required:
+      - videoId
+      - available
+      title: YouTubeCheckResponse
+    YouTubeTrack:
+      properties:
+        language:
+          type: string
+          title: Language
+        language_code:
+          type: string
+          title: Language Code
+        is_generated:
+          type: boolean
+          title: Is Generated
+        is_translatable:
+          type: boolean
+          title: Is Translatable
+      type: object
+      required:
+      - language
+      - language_code
+      - is_generated
+      - is_translatable
+      title: YouTubeTrack
   securitySchemes:
     OAuth2PasswordBearer:
       type: oauth2
@@ -6223,3 +6830,6 @@ components:
         password:
           scopes: {}
           tokenUrl: token
+    HTTPBearer:
+      type: http
+      scheme: bearer

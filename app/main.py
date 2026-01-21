@@ -6,7 +6,7 @@ print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -68,10 +68,19 @@ async def ops_logger_middleware(request: Request, call_next):
 
     return response
 
-# CORS Setup
+# CORS Setup - Explicit allowed origins for security
+ALLOWED_ORIGINS = [
+    "https://classnote.app",
+    "https://www.classnote.app",
+    "https://classnote-x-dev.web.app",
+    "https://classnote-x.web.app",
+    "http://localhost:3000",  # Local development
+    "http://localhost:8080",  # Local development
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -93,6 +102,7 @@ app.include_router(admin.router, tags=["Admin"])
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)
+app.include_router(ads.router, tags=["Ads"])
 
 # [NEW] Quiz Analytics
 from app.routes import quiz_analytics
@@ -114,3 +124,19 @@ async def health():
 async def root():
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/docs")
+
+# Legal Pages (Static HTML)
+@app.get("/terms", include_in_schema=False)
+async def terms_page():
+    from fastapi.responses import FileResponse
+    import os
+    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "terms.html")
+    return FileResponse(file_path, media_type="text/html")
+
+@app.get("/privacy", include_in_schema=False)
+async def privacy_page():
+    from fastapi.responses import FileResponse
+    import os
+    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "privacy.html")
+    return FileResponse(file_path, media_type="text/html")
+
