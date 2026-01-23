@@ -7,7 +7,7 @@ print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -111,6 +111,7 @@ app.add_middleware(
 # Include Routers
 app.include_router(account.router, tags=["Account"])
 app.include_router(account_merge.router, tags=["Account Merge"])
+app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
 app.include_router(sessions.router, tags=["Sessions"])
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)

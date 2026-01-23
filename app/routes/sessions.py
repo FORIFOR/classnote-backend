@@ -247,7 +247,7 @@ def _cascade_delete_session(session_id: str, session_data: dict, owner_uid: str)
     return cascade_delete_session(session_id, session_data, owner_uid, db=db)
 
 
-def _resolve_session(session_id: str, user_id: Optional[str] = None):
+def _resolve_session(session_id: str, user_id: Optional[str] = None, account_id: Optional[str] = None):
     """
     Resolve session by server ID or clientSessionId fallback.
 
@@ -255,6 +255,8 @@ def _resolve_session(session_id: str, user_id: Optional[str] = None):
     server-assigned ID. This function handles both cases:
     1. Direct lookup by session_id (server ID)
     2. Fallback query by clientSessionId field
+
+    [Account Architecture] Prefers account_id for queries when available.
 
     Returns: (doc_ref, snapshot, resolved_session_id) or raises HTTPException 404
     """
@@ -267,24 +269,36 @@ def _resolve_session(session_id: str, user_id: Optional[str] = None):
 
     # 2. Fallback: Query by clientSessionId
     try:
-        query = db.collection("sessions").where("clientSessionId", "==", session_id).limit(1)
+        # [Account Architecture] Use accountId for queries (preferred)
+        if account_id:
+            results = list(db.collection("sessions")
+                .where("ownerAccountId", "==", account_id)
+                .where("clientSessionId", "==", session_id)
+                .limit(1).stream())
 
-        # If user_id provided, scope to their sessions for security
+            if results:
+                resolved_doc = results[0]
+                resolved_id = resolved_doc.id
+                logger.info(f"[SessionResolve] Resolved clientSessionId {session_id} -> serverId {resolved_id} (via accountId)")
+                return _session_doc_ref(resolved_id), resolved_doc, resolved_id
+
+        # Legacy fallback: use uid (for unmigrated sessions)
         if user_id:
-            # Try with ownerUid first (newer field)
             results = list(db.collection("sessions")
                 .where("ownerUid", "==", user_id)
                 .where("clientSessionId", "==", session_id)
                 .limit(1).stream())
 
-            if not results:
-                # Fallback to ownerUserId (legacy field)
-                results = list(db.collection("sessions")
-                    .where("ownerUserId", "==", user_id)
-                    .where("clientSessionId", "==", session_id)
-                    .limit(1).stream())
-        else:
-            results = list(query.stream())
+            if results:
+                resolved_doc = results[0]
+                resolved_id = resolved_doc.id
+                logger.info(f"[SessionResolve] Resolved clientSessionId {session_id} -> serverId {resolved_id} (via uid - legacy)")
+                return _session_doc_ref(resolved_id), resolved_doc, resolved_id
+
+        # No user context - just query by clientSessionId
+        results = list(db.collection("sessions")
+            .where("clientSessionId", "==", session_id)
+            .limit(1).stream())
 
         if results:
             resolved_doc = results[0]
@@ -735,15 +749,9 @@ async def create_session(
     x_cloud_trace_context: Optional[str] = Header(None, alias="X-Cloud-Trace-Context"),
 ):
     global usage_logger
-    
-    # [NEW] Account Unification Check
-    link_doc = db.collection("uid_links").document(current_user.uid).get()
-    if not link_doc.exists:
-        # Enforce phone verification for session creation (server-side)
-        raise HTTPException(status_code=403, detail="PHONE_VERIFICATION_REQUIRED")
 
-    link_data = link_doc.to_dict()
-    owner_account_id = link_data.get("accountId")
+    # [Account Architecture] Use account_id from CurrentUser (always resolved)
+    owner_account_id = current_user.account_id
     if not owner_account_id:
         raise HTTPException(status_code=500, detail="DATA_INTEGRITY_ERROR: Account ID missing")
     
@@ -785,11 +793,8 @@ async def create_session(
     doc_ref = _session_doc_ref(session_id)
     user_ref = db.collection("users").document(current_user.uid)
 
-    # [NEW] Enforce Account Link & Resolve ID
-    link_doc = db.collection("uid_links").document(current_user.uid).get()
-    if not link_doc.exists:
-        raise HTTPException(status_code=403, detail="PHONE_VERIFICATION_REQUIRED")
-    owner_account_id = link_doc.to_dict().get("accountId")
+    # [Account Architecture] Use account_id from CurrentUser (always resolved)
+    owner_account_id = current_user.account_id
     
     # Prep Data
     now = _now_timestamp()
@@ -1219,11 +1224,8 @@ async def list_sessions(
     # Always use authenticated ID
     target_user_id = current_user.uid
     
-    # [UNIFIED ACCOUNT] Resolve Account ID for aggregation
-    account_id = None
-    if current_user.phone_number:
-        from app.services.account import account_id_from_phone
-        account_id = account_id_from_phone(current_user.phone_number)
+    # [Account Architecture] Use account_id directly from CurrentUser (always available now)
+    account_id = current_user.account_id
 
     # Scope filtering
     scope_owned = True
@@ -1232,27 +1234,25 @@ async def list_sessions(
          scope_shared = False
     elif kind == "shared":
          scope_owned = False
-    
+
     # Query sessions
     owned_docs = []
     shared_docs = []
-    
-    # Query sessions using new Source of Truth model
-    # 1. Owned by me (ownerUserId == uid OR ownerAccountId == accountId)
-    # 2. Shared with me (participantUserIds contains uid)
+
+    # [Account Architecture] Query sessions by ownerAccountId (primary)
+    # Legacy uid queries are kept temporarily for unmigrated sessions
     try:
-        # Owned 
+        # Owned
         if scope_owned:
-            # Query by UID
-            owned_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(limit * 2)
-            owned_docs = list(owned_query.stream())
-            
-            # [NEW] Query by Unified Account ID
-            if account_id:
-                acc_query = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(limit * 2)
-                acc_docs = list(acc_query.stream())
-                # Resulting list will be deduped Python-side
-                owned_docs += acc_docs
+            # [PRIMARY] Query by accountId
+            acc_query = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(limit * 2)
+            owned_docs = list(acc_query.stream())
+
+            # [LEGACY] Also query by uid for unmigrated sessions
+            uid_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(limit * 2)
+            uid_docs = list(uid_query.stream())
+            # Merge and dedupe later
+            owned_docs += uid_docs
 
         # Shared (New Model)
         if scope_shared:
@@ -1547,17 +1547,24 @@ async def import_session_audio(
     # Query sessions
     owned_docs = []
     shared_docs = []
-    
-    if scope_owned:
-        user_id = target_user_id
+
+    # [Account Architecture] Use account_id from CurrentUser
+    account_id = current_user.account_id
+
     # Query sessions using new Source of Truth model
-    # 1. Owned by me (ownerUserId == uid)
+    # 1. Owned by me (ownerAccountId == accountId)
     # 2. Shared with me (participantUserIds contains uid)
     try:
-        # Owned - simple query without order_by to avoid index requirements
+        # Owned - query by accountId (primary) and uid (legacy fallback)
         if scope_owned:
-            owned_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(limit * 2)
-            owned_docs = list(owned_query.stream())
+            # [PRIMARY] Query by accountId
+            acc_query = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(limit * 2)
+            owned_docs = list(acc_query.stream())
+
+            # [LEGACY] Also query by uid for unmigrated sessions
+            uid_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(limit * 2)
+            uid_docs = list(uid_query.stream())
+            owned_docs += uid_docs
         
         # Shared (New Model)
         if scope_shared:
@@ -2598,7 +2605,13 @@ async def create_job(
         guard_feature = "llm_calls"
 
     if guard_feature:
-        allowed, _meta = await cost_guard.guard_can_consume(current_user.uid, guard_feature, 1)
+        # [FIX] Use ownerAccountId from session data for accurate limit check
+        # Fall back to uid with mode="user" for legacy sessions without ownerAccountId
+        owner_account_id = data.get("ownerAccountId")
+        if owner_account_id:
+            allowed, _meta = await cost_guard.guard_can_consume(owner_account_id, guard_feature, 1, mode="account")
+        else:
+            allowed, _meta = await cost_guard.guard_can_consume(current_user.uid, guard_feature, 1, mode="user")
         if not allowed:
             # Align error codes with iOS APIClient.swift expectations
             err_code = "feature_restricted"

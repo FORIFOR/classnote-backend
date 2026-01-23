@@ -36,17 +36,103 @@ USER_ACTIVITY_THROTTLE_SEC = 300  # 5 minutes
 
 
 from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger("app.dependencies")
 
 @dataclass
 class CurrentUser:
     uid: str
+    account_id: str  # [CRITICAL] Always resolved - this is the canonical identity
     provider: str | None
     phone_number: str | None
     email: str | None
     display_name: str | None = None
     photo_url: str | None = None
-    # Plan is now on Account, not User, but kept for compat if needed or removed. 
-    # Logic will fetch Plan from Account.
+
+
+def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> str:
+    """
+    [Account Architecture] Resolve uid -> accountId.
+
+    Resolution priority:
+    1. uid_links/{uid}.accountId (existing link)
+    2. phone_numbers/{phone}.accountId (if phone in token)
+    3. users/{uid}.accountId (legacy fallback)
+    4. Create new account (last resort)
+
+    This function ALWAYS returns an accountId and ensures uid_links is set.
+    """
+    now = datetime.now(timezone.utc)
+
+    # 1. Check uid_links (primary source of truth)
+    link_ref = db.collection("uid_links").document(uid)
+    link_doc = link_ref.get()
+    if link_doc.exists:
+        account_id = link_doc.to_dict().get("accountId")
+        if account_id:
+            return account_id
+
+    # 2. Check phone_numbers index (for cross-provider unification)
+    if phone_number:
+        phone_ref = db.collection("phone_numbers").document(phone_number)
+        phone_doc = phone_ref.get()
+        if phone_doc.exists:
+            account_id = phone_doc.to_dict().get("accountId")
+            if account_id:
+                # Link this uid to the phone's account
+                link_ref.set({
+                    "uid": uid,
+                    "accountId": account_id,
+                    "linkedAt": now,
+                    "linkedVia": "phone_number_match"
+                }, merge=True)
+                logger.info(f"[resolve_account] Linked uid={uid} to account={account_id} via phone")
+                return account_id
+
+    # 3. Check users/{uid} (legacy)
+    user_ref = db.collection("users").document(uid)
+    user_doc = user_ref.get()
+    if user_doc.exists:
+        account_id = user_doc.to_dict().get("accountId")
+        if account_id:
+            # Repair: ensure uid_links exists
+            link_ref.set({
+                "uid": uid,
+                "accountId": account_id,
+                "linkedAt": now,
+                "linkedVia": "legacy_repair"
+            }, merge=True)
+            logger.info(f"[resolve_account] Repaired uid_links for uid={uid} -> account={account_id}")
+            return account_id
+
+    # 4. Create new account (no existing link found)
+    new_acc_ref = db.collection("accounts").document()
+    account_id = new_acc_ref.id
+
+    new_acc_ref.set({
+        "primaryUid": uid,
+        "memberUids": [uid],
+        "plan": "free",
+        "createdAt": now,
+        "updatedAt": now
+    })
+
+    link_ref.set({
+        "uid": uid,
+        "accountId": account_id,
+        "linkedAt": now,
+        "linkedVia": "auto_create"
+    })
+
+    # Also update users doc
+    user_ref.set({
+        "accountId": account_id,
+        "updatedAt": now
+    }, merge=True)
+
+    logger.info(f"[resolve_account] Created new account={account_id} for uid={uid}")
+    return account_id
 
 def _resolve_user_from_token(token: str) -> CurrentUser:
     try:
@@ -55,10 +141,10 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
         email = decoded_token.get("email")
         # Firebase Auth phone_number is top-level claim
         phone_number = decoded_token.get("phone_number")
-        
+
         firebase_claims = decoded_token.get("firebase", {})
         provider_id = firebase_claims.get("sign_in_provider")
-        
+
         if not uid:
              raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -66,8 +152,12 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        # [CRITICAL] Always resolve accountId - this is the canonical identity
+        account_id = _resolve_account_id_for_uid(uid, phone_number)
+
         return CurrentUser(
             uid=uid,
+            account_id=account_id,
             provider=provider_id,
             phone_number=phone_number,
             email=email,
@@ -82,6 +172,8 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Auth System Error: {e}")
         raise HTTPException(
@@ -187,93 +279,105 @@ def _get_session_member(session_id: str | None, user_id: str | None) -> Optional
         return None
     return doc.to_dict() or {}
 
-from app.services.account import account_id_from_phone
 from typing import Union
 
 def ensure_can_view(session_data: dict, user_or_uid: Union[str, CurrentUser], session_id: Optional[str] = None):
+    """
+    [Account Architecture] Check if user can view a session.
+
+    Authorization is based on accountId ONLY (no uid fallback).
+    Sessions without ownerAccountId require migration.
+    """
     # Normalize input
     if isinstance(user_or_uid, CurrentUser):
         uid = user_or_uid.uid
-        phone = user_or_uid.phone_number
-        provider = user_or_uid.provider
+        account_id = user_or_uid.account_id
     else:
+        # Legacy: if raw uid string is passed, resolve account_id
         uid = user_or_uid
-        phone = None
-        provider = None
+        account_id = _resolve_account_id_for_uid(uid)
 
-    owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
     owner_account_id = session_data.get("ownerAccountId")
 
-    # 1. UID Match (Legacy/Fastest)
-    if owner_uid == uid:
+    # [CRITICAL] Require ownerAccountId - sessions without it need migration
+    if not owner_account_id:
+        # Temporary compatibility: check ownerUid match during migration period
+        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId")
+        if owner_uid == uid:
+            logger.warning(f"[ensure_can_view] Session missing ownerAccountId, uid match used (migration needed)")
+            return
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Session requires migration (missing ownerAccountId)"
+        )
+
+    # 1. Account Match (Primary check)
+    if owner_account_id == account_id:
         return
 
-    # 2. Account Match (New)
-    if owner_account_id:
-        # A. Check if this UID is explicitly linked (Most reliable)
-        link_doc = db.collection("uid_links").document(uid).get()
-        if link_doc.exists and link_doc.to_dict().get("accountId") == owner_account_id:
-            return
-        
-        # B. Fallback: Check if the token's phone number matches the account
-        #    (Prevents "I just linked but link doc propagation failed" or "uid_links missing")
-        #    NOTE: This enables "Unified Identity" - same person, different UIDs.
-        if phone:
-            derived_acc_id = account_id_from_phone(phone)
-            if derived_acc_id == owner_account_id:
-                return
+    # 2. Shared access (via accountId or legacy uid)
+    shared_account_ids = session_data.get("sharedWithAccountIds") or []
+    if account_id in shared_account_ids:
+        return
 
+    # Legacy shared access (uid-based) - to be deprecated
     shared_users = session_data.get("sharedUserIds") or session_data.get("sharedWithUserIds") or []
     shared_map = session_data.get("sharedWith") or {}
+    if uid in shared_users or shared_map.get(uid):
+        return
 
+    # 3. Session member check
     if session_id:
         member = _get_session_member(session_id, uid)
         if member:
             return
-    if uid in shared_users:
-        return
-    if shared_map.get(uid):
-        return
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="You do not have access to this session"
     )
 
+
 def ensure_is_owner(session_data: dict, user_or_uid: Union[str, CurrentUser], session_id: Optional[str] = None):
+    """
+    [Account Architecture] Check if user is the owner of a session.
+
+    Authorization is based on accountId ONLY (no uid fallback).
+    Sessions without ownerAccountId require migration.
+    """
     # Normalize input
     if isinstance(user_or_uid, CurrentUser):
         uid = user_or_uid.uid
-        phone = user_or_uid.phone_number
+        account_id = user_or_uid.account_id
     else:
+        # Legacy: if raw uid string is passed, resolve account_id
         uid = user_or_uid
-        phone = None
+        account_id = _resolve_account_id_for_uid(uid)
 
-    owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
     owner_account_id = session_data.get("ownerAccountId")
-    
-    # 1. Legacy Match
-    if owner_uid == uid:
+
+    # [CRITICAL] Require ownerAccountId - sessions without it need migration
+    if not owner_account_id:
+        # Temporary compatibility: check ownerUid match during migration period
+        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId")
+        if owner_uid == uid:
+            logger.warning(f"[ensure_is_owner] Session missing ownerAccountId, uid match used (migration needed)")
+            return
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Session requires migration (missing ownerAccountId)"
+        )
+
+    # Account Match (Primary check)
+    if owner_account_id == account_id:
         return
 
-    # 2. Account Match
-    if owner_account_id:
-        # A. Check UID Link
-        link_doc = db.collection("uid_links").document(uid).get()
-        if link_doc.exists and link_doc.to_dict().get("accountId") == owner_account_id:
-            return
-            
-        # B. Fallback: Phone Match
-        if phone:
-            derived_acc_id = account_id_from_phone(phone)
-            if derived_acc_id == owner_account_id:
-                return
-
+    # Session member with owner role
     if session_id:
         member = _get_session_member(session_id, uid)
         if member and member.get("role") == "owner":
             return
-            
+
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Only the owner can perform this operation"
@@ -353,6 +457,7 @@ async def get_admin_user(
 
     return AdminUser(
         uid=user.uid,
+        account_id=user.account_id,
         provider=user.provider,
         phone_number=user.phone_number,
         email=user.email,
@@ -384,6 +489,7 @@ async def get_admin_user_optional(
 
     return AdminUser(
         uid=user.uid,
+        account_id=user.account_id,
         provider=user.provider,
         phone_number=user.phone_number,
         email=user.email,

@@ -740,6 +740,68 @@ async def _run_local_merge_migration(merge_id: str):
         logger.error(f"Local merge migration failed: {e}")
 
 
+@router.post("/internal/tasks/account_migration")
+async def handle_account_migration_task(request: Request):
+    """
+    Cloud Tasks worker for Account Migration (triggered by phone verification merge).
+    Payload: {"fromAccountId": str, "toAccountId": str}
+
+    Migrates sessions and other data from one account to another.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    from_account_id = payload.get("fromAccountId")
+    to_account_id = payload.get("toAccountId")
+
+    if not from_account_id or not to_account_id:
+        return {"status": "error", "message": "fromAccountId and toAccountId required"}
+
+    logger.info(f"[AccountMigration] Starting: {from_account_id} -> {to_account_id}")
+
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        batch_size = 200
+        total_migrated = 0
+
+        while True:
+            # Find sessions owned by old account
+            sessions_query = (
+                db.collection("sessions")
+                .where("ownerAccountId", "==", from_account_id)
+                .limit(batch_size)
+            )
+            docs = list(sessions_query.stream())
+
+            if not docs:
+                break
+
+            batch = db.batch()
+            for doc in docs:
+                batch.update(doc.reference, {
+                    "ownerAccountId": to_account_id,
+                    "migratedFrom": from_account_id,
+                    "migratedAt": now,
+                    "updatedAt": now
+                })
+            batch.commit()
+            total_migrated += len(docs)
+            logger.info(f"[AccountMigration] Migrated batch of {len(docs)} sessions")
+
+            if len(docs) < batch_size:
+                break
+
+        logger.info(f"[AccountMigration] Complete: migrated {total_migrated} sessions from {from_account_id} to {to_account_id}")
+        return {"status": "completed", "migratedCount": total_migrated}
+
+    except Exception as e:
+        logger.exception(f"[AccountMigration] Failed: {from_account_id} -> {to_account_id}")
+        return {"status": "failed", "error": str(e)}
+
+
 @router.post("/internal/tasks/daily-usage-aggregation")
 async def handle_daily_usage_aggregation(request: Request):
     """
@@ -983,16 +1045,21 @@ async def handle_qa_task(request: Request):
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
 
+        # [FIX] Resolve account ID for cost guard
+        owner_account_id = data.get("ownerAccountId")
+        cost_guard_id = owner_account_id or final_user_id
+        cost_guard_mode = "account" if owner_account_id else "user"
+
         transcript = resolve_transcript_text(session_id, data) or ""
-        
+
         if not transcript:
             qa_ref.set({"status": "failed", "error": "Transcript empty", "updatedAt": datetime.now(timezone.utc)})
             return {"status": "failed", "error": "Transcript empty"}
-        
+
         qa_ref.set({"status": "running", "question": question, "updatedAt": datetime.now(timezone.utc)}, merge=True)
-        
+
         # [TRIPLE LOCK] Monthly Cost Guard
-        allowed = await cost_guard.guard_can_consume(final_user_id, "llm_calls", 1)
+        allowed = await cost_guard.guard_can_consume(cost_guard_id, "llm_calls", 1, mode=cost_guard_mode)
         if not allowed:
              logger.warning(f"[CostGuard] BLOCKED qa {session_id} for user {final_user_id}. Monthly limit exceeded.")
              err_msg = "Monthly LLM limit exceeded (1000 calls)"
@@ -1026,7 +1093,7 @@ async def handle_qa_task(request: Request):
         
     except Exception as e:
         if has_consumed:
-            await cost_guard.refund_consumption(final_user_id, "llm_calls", 1)
+            await cost_guard.refund_consumption(cost_guard_id, "llm_calls", 1, mode=cost_guard_mode)
         logger.exception(f"QA task failed for session {session_id}")
 
         # ops_logger: LLM/job failed
@@ -1276,7 +1343,11 @@ async def _handle_transcribe_task_core(request: Request):
         has_consumed = False
         consumption_sec = duration
 
-        allowed = await cost_guard.guard_can_consume(final_user_id, "cloud_stt_sec", duration)
+        # [FIX] Use ownerAccountId for accurate limit check, fall back to uid with mode="user"
+        owner_account_id = data.get("ownerAccountId")
+        cost_guard_id = owner_account_id or final_user_id
+        cost_guard_mode = "account" if owner_account_id else "user"
+        allowed = await cost_guard.guard_can_consume(cost_guard_id, "cloud_stt_sec", duration, mode=cost_guard_mode)
         if not allowed:
              logger.warning(f"[CostGuard] BLOCKED session {session_id} for user {final_user_id}. Monthly limit exceeded.")
              err_msg = "Monthly transcription limit exceeded (100h)"
@@ -1435,7 +1506,7 @@ async def _handle_transcribe_task_core(request: Request):
 
     except Exception as e:
         if has_consumed:
-            await cost_guard.refund_consumption(final_user_id, "cloud_stt_sec", consumption_sec)
+            await cost_guard.refund_consumption(cost_guard_id, "cloud_stt_sec", consumption_sec, mode=cost_guard_mode)
         logger.exception(f"Transcribe task failed for {session_id}")
         error_msg = str(e)
 

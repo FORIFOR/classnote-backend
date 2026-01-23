@@ -484,12 +484,17 @@ class MeResponse(BaseModel):
     appAccountToken: Optional[str] = None  # [NEW] UUID for StoreKit 2
 
     # [NEW 2026-01] Account Unification
-    needsPhoneVerification: Optional[bool] = None
+    needsPhoneVerification: Optional[bool] = None  # Hard gate (login blocked) - now always False for SNS users
     needsSnsLogin: bool = False # [NEW]
     accountId: Optional[str] = None
     phoneE164: Optional[str] = None
     credits: Optional[Dict[str, Any]] = None
     accountResolution: Optional[Dict[str, Any]] = None # [NEW] {action: attached|created|none}
+
+    # [NEW 2026-01] Feature-level phone gate (soft gate)
+    # List of features that require phone verification to use
+    # Possible values: "share", "publicProfile", "subscriptionRestore", "accountMerge"
+    phoneRequiredFor: Optional[List[str]] = None
 
 class MeUpdateRequest(BaseModel):
     displayName: Optional[str] = None

@@ -621,6 +621,81 @@ def enqueue_merge_migration_task(merge_id: str):
         logger.error(f"Failed to enqueue merge migration task: {e}")
         raise e
 
+
+def enqueue_account_migration_task(from_account_id: str, to_account_id: str):
+    """
+    Enqueues a task to migrate data (sessions, etc.) from one account to another.
+    Used after phone verification triggers account merge.
+    """
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running account migration locally: {from_account_id} -> {to_account_id}")
+        import asyncio
+        asyncio.create_task(_run_local_account_migration(from_account_id, to_account_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/account_migration"
+    payload = {"fromAccountId": from_account_id, "toAccountId": to_account_id}
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        }
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Enqueued account migration task: {from_account_id} -> {to_account_id}")
+    except Exception as e:
+        logger.error(f"Failed to enqueue account migration task: {e}")
+        raise e
+
+
+async def _run_local_account_migration(from_account_id: str, to_account_id: str):
+    """
+    Local fallback for account migration.
+    Moves sessions from one account to another.
+    """
+    from app.firebase import db
+    from datetime import datetime, timezone
+
+    logger.info(f"[LocalAccountMigration] Starting: {from_account_id} -> {to_account_id}")
+    now = datetime.now(timezone.utc)
+    batch_size = 200
+    total_migrated = 0
+
+    while True:
+        # Find sessions owned by old account
+        sessions_query = (
+            db.collection("sessions")
+            .where("ownerAccountId", "==", from_account_id)
+            .limit(batch_size)
+        )
+        docs = list(sessions_query.stream())
+
+        if not docs:
+            break
+
+        batch = db.batch()
+        for doc in docs:
+            batch.update(doc.reference, {
+                "ownerAccountId": to_account_id,
+                "migratedFrom": from_account_id,
+                "migratedAt": now,
+                "updatedAt": now
+            })
+        batch.commit()
+        total_migrated += len(docs)
+
+        if len(docs) < batch_size:
+            break
+
+    logger.info(f"[LocalAccountMigration] Complete: migrated {total_migrated} sessions")
+
+
 async def _run_local_youtube_import(session_id: str, url: str, language: str):
     # This invokes the worker logic directly (must implement import inside tasks.py or services)
     # Since worker logic is in services, we can call it here OR import tasks router logic.
