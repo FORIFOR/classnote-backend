@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from app.firebase import db
-from app.dependencies import get_current_user, User, ensure_is_owner
+from app.dependencies import get_current_user, CurrentUser, CurrentUser, ensure_is_owner
 from app.util_models import (
     ShareResponse, ShareLinkResponse, ShareByCodeRequest, ShareCodeLookupResponse,
     SharedSessionDTO
@@ -111,7 +111,7 @@ def _remove_participant_from_session(session_id: str, user_id: str):
 # --- User Sharing ---
 
 @router.get("/share-code/{code}", response_model=ShareCodeLookupResponse)
-async def lookup_user_by_share_code(code: str, current_user: User = Depends(get_current_user)):
+async def lookup_user_by_share_code(code: str, current_user: CurrentUser = Depends(get_current_user)):
     code = code.strip()
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
@@ -154,16 +154,17 @@ async def lookup_user_by_share_code(code: str, current_user: User = Depends(get_
 async def share_session_to_user(
     session_id: str, 
     body: ShareByCodeRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
-    doc_ref = db.collection("sessions").document(session_id)
-    snapshot = doc_ref.get()
+    doc_ref, snapshot = _resolve_session_local(session_id)
     
     if not snapshot.exists:
         raise HTTPException(status_code=404, detail="Session not found")
         
     session_data = snapshot.to_dict()
-    ensure_is_owner(session_data, current_user.uid, session_id)
+    # Use resolved ID
+    session_id = snapshot.id
+    ensure_is_owner(session_data, current_user, session_id)
 
     code = (body.targetShareCode or "").strip()
     # Support "code" field as well if body model allows, but sticking to targetShareCode as per defined model or user request
@@ -180,7 +181,7 @@ async def share_session_to_user(
     if not code_snap.exists:
          # Fallback to legacy query if needed? Or just fail. User wants O(1).
          # Let's try legacy query just in case migration is slow? 
-         # No, User emphasized "You are NOT saving code to standard location". 
+         # No, CurrentUser emphasized "You are NOT saving code to standard location". 
          # I should trust the new location primarily. But to be safe:
          qs = db.collection("users").where("shareCode", "==", code).limit(1).stream()
          docs = list(qs)
@@ -232,16 +233,17 @@ async def share_session_to_user(
 async def revoke_share(
     session_id: str,
     target_uid: str,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
-    doc_ref = db.collection("sessions").document(session_id)
-    snapshot = doc_ref.get()
+    doc_ref, snapshot = _resolve_session_local(session_id)
     
     if not snapshot.exists:
         raise HTTPException(status_code=404, detail="Session not found")
         
     session_data = snapshot.to_dict()
-    ensure_is_owner(session_data, current_user.uid, session_id)
+    # Use resolved ID
+    session_id = snapshot.id
+    ensure_is_owner(session_data, current_user, session_id)
 
     owner_id = session_data.get("ownerUserId") or session_data.get("ownerUid") or session_data.get("userId")
     if target_uid == owner_id:
@@ -290,23 +292,47 @@ async def share_fallback(token: str):
 
 # --- Link Sharing ---
 
+
+def _resolve_session_local(session_id: str):
+    """
+    Local helper to resolve session by ID or clientSessionId.
+    """
+    # 1. Direct Lookup
+    doc_ref = db.collection("sessions").document(session_id)
+    snapshot = doc_ref.get()
+    if snapshot.exists:
+        return doc_ref, snapshot
+
+    # 2. Fallback: clientSessionId
+    # Note: This might return multiple if collisions exist (unlikely for UUID).
+    # We take the first match.
+    docs = list(db.collection("sessions").where("clientSessionId", "==", session_id).limit(1).stream())
+    if docs:
+        d = docs[0]
+        return d.reference, d
+    
+    # Not found
+    return doc_ref, snapshot # snapshot.exists will be False
+
+
 @router.api_route("/sessions/{session_id}/share_link", methods=["GET", "POST"], response_model=ShareLinkResponse)
 async def create_share_link(
     session_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
-    doc_ref = db.collection("sessions").document(session_id)
-    snapshot = doc_ref.get()
+    doc_ref, snapshot = _resolve_session_local(session_id)
     
     if not snapshot.exists:
         raise HTTPException(status_code=404, detail="Session not found")
         
     session_data = snapshot.to_dict()
-    ensure_is_owner(session_data, current_user.uid, session_id)
+    # If resolved via clientSessionId, we must use the server ID (snapshot.id) for storage
+    real_session_id = snapshot.id
+    ensure_is_owner(session_data, current_user, real_session_id)
     
     # [FIX] Reuse existing valid link if available (Idempotency)
     # Query shareLinks for this session
-    existing_docs = db.collection("shareLinks").where("sessionId", "==", session_id).stream()
+    existing_docs = db.collection("shareLinks").where("sessionId", "==", real_session_id).stream()
     now = datetime.now(timezone.utc)
     
     for d in existing_docs:
@@ -324,7 +350,7 @@ async def create_share_link(
     expires_at = now + timedelta(days=7)
     
     db.collection("shareLinks").document(token).set({
-        "sessionId": session_id,
+        "sessionId": real_session_id,
         "ownerId": current_user.uid,
         "expiresAt": expires_at,
         "createdAt": firestore.SERVER_TIMESTAMP
@@ -369,7 +395,7 @@ async def resolve_share_link_info(token: str):
 @router.post("/share/{token}/join", response_model=ShareResponse)
 async def join_via_share_link(
     token: str,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     link_doc = db.collection("shareLinks").document(token).get()
     if not link_doc.exists:

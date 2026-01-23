@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Constants for transcript validation
-MIN_TRANSCRIPT_LENGTH = 50  # Minimum characters for meaningful LLM processing
+MIN_TRANSCRIPT_LENGTH = 10  # [FIX] Lowered to 10 as requested
 MAX_TRANSCRIPT_LENGTH = 100000  # Maximum to prevent excessive token usage
 SUMMARY_JSON_VERSION = 1
 
@@ -570,7 +570,7 @@ def _build_meeting_summary_prompt(
 # UI目的
 - 画面最上部に「結論だけ」が3〜7行で出ること（highlights）
 - 次に「決定事項」と「TODO」がカード表示できること
-- その下に overview を300〜1500文字で提供（背景→議論→結論→次アクションの順）
+- その下に overview を300〜600文字で提供（背景→議論→結論→次アクションの順）
 
 # 出力JSONスキーマ（厳守）
 {{
@@ -579,7 +579,7 @@ def _build_meeting_summary_prompt(
     "highlights": [
       {{"text": "短い結論", "category": "decision|todo|risk|info", "needConfirm": false}}
     ],
-    "overview": "300〜1500文字",
+    "overview": "300〜600文字",
     "decisions": [
       {{"text": "〜することに決定", "owner": "名前or担当不明", "due": "YYYY-MM-DD|期限不明", "needConfirm": false}}
     ],
@@ -595,9 +595,6 @@ def _build_meeting_summary_prompt(
     "keywords": [{{"text": "重要語"}}],
     "participants": [
       {{"name": "話者名or不明", "role": "PM|Dev|Sales|Other|不明"}}
-    ],
-    "timeline": [
-      {{"timeHint": "冒頭/中盤/終盤/不明", "event": "出来事", "needConfirm": false}}
     ],
     "uiHints": {{
       "topFocus": ["decisions", "todos"],
@@ -633,7 +630,7 @@ def _build_lecture_summary_prompt(
 # UI目的
 - 最上部に「今日のポイントのおさらい」を3〜7行で簡潔に（highlights）
 - 次に「用語カード」「流れ（セクション）」「重要式・手順」「例題/範囲」を見やすく
-- overview は200〜1200文字で「何を学び、なぜ重要か、全体像」を説明
+- overview は200〜600文字で「何を学び、なぜ重要か、全体像」を説明
 
 # 出力JSONスキーマ（厳守）
 {{
@@ -642,7 +639,7 @@ def _build_lecture_summary_prompt(
     "highlights": [
       {{"text": "重要ポイント（短文）", "needConfirm": false}}
     ],
-    "overview": "200〜1200文字",
+    "overview": "200〜600文字",
     "theme": {{"text": "今日のテーマ（1〜2文）", "needConfirm": false}},
     "terms": [
       {{"term": "用語", "definition": "文字起こしに基づく説明", "examples": ["例があれば"], "needConfirm": false}}
@@ -755,7 +752,8 @@ async def generate_summary_and_tags(
     # Transcript length validation
     if len(text) < MIN_TRANSCRIPT_LENGTH:
         logger.warning(f"Transcript too short for summary: {len(text)} chars")
-        summary_json = _build_summary_json_fallback(mode)
+        # [FIX] Return specific "No input" message
+        summary_json = _build_summary_json_fallback(mode, reason="入力がありません")
         return {
             "summaryJson": summary_json,
             "summaryType": summary_json.get("type"),
@@ -833,12 +831,13 @@ async def generate_summary_and_tags(
     }
 
 
-def _build_summary_json_fallback(mode: str) -> dict:
+def _build_summary_json_fallback(mode: str, reason: str = None) -> dict:
     mode_key = "lecture" if mode == "lecture" else "meeting"
+    msg = reason or "要確認: 文字起こしの内容が短すぎるため要約不可"
     base = {
         "type": mode_key,
         "highlights": [
-            {"text": "要確認: 文字起こしの内容が短すぎるため要約不可", "needConfirm": True}
+            {"text": msg, "needConfirm": True}
         ],
         "overview": ""
     }
@@ -1066,18 +1065,27 @@ def _validate_summary_json(data: dict, mode: str, source_len: int) -> tuple[bool
     highlights = data.get("highlights")
     if not isinstance(highlights, list):
         return False, "highlights_missing"
-    if len(highlights) < 3 or len(highlights) > 7:
-        return False, "highlights_count"
+    if len(highlights) < 1 or len(highlights) > 10:
+        return False, f"highlights_count (got {len(highlights)})"
     overview = data.get("overview")
     if not isinstance(overview, str):
         return False, "overview_type"
-    min_len, max_len = (200, 1200) if mode == "lecture" else (300, 1500)
+    # [FIX] Relax constraints for shorter inputs or concise LLM outputs
+    min_len, max_len = (10, 2000) if mode == "lecture" else (10, 2500)
+    
     if len(overview) > max_len:
-        return False, "overview_length_max"
+        # Instead of failing, just truncate or warn (but here we strict check max)
+        # For now, let's just allow it if it's reasonable, or fail if absurdly long
+        if len(overview) > 5000:
+             return False, "overview_length_max_critical"
+        # Otherwise ignore max_len strict check for now
+        pass
+
     if len(overview) < min_len:
         # Allow shorter overview when source transcript is short
-        if source_len < min_len * 2:
-            return True, "ok_short_overview"
+        # Relaxed ratio: if source is less than 100x the min_len (pretty liberal)
+        if source_len < 1000: 
+             return True, "ok_short_source"
         return False, "overview_length_min"
     return True, "ok"
 

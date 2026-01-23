@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
-from app.dependencies import get_current_user, User, ensure_can_view, ensure_is_owner
+from app.dependencies import get_current_user, CurrentUser, CurrentUser, ensure_can_view, ensure_is_owner
 from app.routes.sessions import _session_doc_ref, _derived_doc_ref, _map_derived_status
 from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
 from app.util_models import (
@@ -28,6 +28,21 @@ logger = logging.getLogger("app.assets")
 @router.get("/assets/ping", include_in_schema=False)
 async def ping_assets():
     return {"status": "ok", "msg": "Assets router is mounted"}
+
+def _update_artifact_status(session_id: str, artifact_type: str, status: JobStatus, job_id: Optional[str] = None):
+    """
+    Helper to update artifact status + jobId atomically (where possible).
+    Used by internal triggers to give immediate UI feedback.
+    """
+    ref = _derived_doc_ref(session_id, artifact_type)
+    update_data = {
+        "status": status,
+        "updatedAt": datetime.now(timezone.utc)
+    }
+    if job_id:
+        update_data["jobId"] = job_id
+        
+    ref.set(update_data, merge=True)
 
 def _get_asset_item_from_derived(session_id: str, type_key: str, data: dict, derived_map: dict) -> Optional[AssetItem]:
     """
@@ -53,8 +68,16 @@ def _get_asset_item_from_derived(session_id: str, type_key: str, data: dict, der
         elif st == JobStatus.FAILED:
             status = AssetStatus.ERROR
             error = derived.get("errorReason")
+        elif st == JobStatus.LOCKED:
+            status = AssetStatus.LOCKED
+            error = derived.get("errorReason")
         elif st in (JobStatus.PENDING, JobStatus.RUNNING):
-            status = AssetStatus.PROCESSING
+            # Only map to PROCESSING if we have evidence of a job (jobId)
+            # This avoids infinite loading when a job record is missing
+            if derived.get("jobId"):
+                status = AssetStatus.PROCESSING
+            else:
+                status = AssetStatus.PENDING
     
     # Fallback/Compat with Session Data
     if status == AssetStatus.MISSING:
@@ -76,8 +99,10 @@ def _get_asset_item_from_derived(session_id: str, type_key: str, data: dict, der
             if has_content:
                 status = AssetStatus.READY
                 updated_at = data.get(f"{type_key}UpdatedAt")
-        elif session_status in (JobStatus.PENDING, JobStatus.RUNNING):
+        elif session_status == JobStatus.RUNNING:
             status = AssetStatus.PROCESSING
+        elif session_status == JobStatus.PENDING:
+            status = AssetStatus.PENDING
     
     # Return NOT_STARTED instead of None to prevent client from deleting local data
     if status == AssetStatus.MISSING:
@@ -135,7 +160,7 @@ def _get_audio_asset(data: dict) -> Optional[AssetItem]:
 
 
 @router.get("/sessions/{session_id}/assets", response_model=AssetManifest)
-async def get_session_assets(session_id: str, current_user: User = Depends(get_current_user)):
+async def get_session_assets(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """
     Get Asset Manifest for a session.
     Tells client what exists and its status.
@@ -146,7 +171,7 @@ async def get_session_assets(session_id: str, current_user: User = Depends(get_c
         raise HTTPException(status_code=404, detail="Session not found")
     
     data = doc.to_dict()
-    ensure_can_view(data, current_user.uid, session_id)
+    ensure_can_view(data, current_user, session_id)
     
     # Fetch all derived docs in parallel (efficient)
     derived_refs = [
@@ -204,7 +229,7 @@ async def get_session_assets(session_id: str, current_user: User = Depends(get_c
 async def resolve_session_assets(
     session_id: str, 
     req: AssetResolveRequest, 
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Generate Signed URLs for requested assets.
@@ -218,7 +243,7 @@ async def resolve_session_assets(
         raise HTTPException(status_code=404, detail="Session not found")
     
     data = doc.to_dict()
-    ensure_can_view(data, current_user.uid, session_id)
+    ensure_can_view(data, current_user, session_id)
     
     allowed_types = {"audio", "summary", "quiz", "transcript"}
     unknown_types = [type_key for type_key in req.types if type_key not in allowed_types]
@@ -305,7 +330,7 @@ async def resolve_session_assets(
 async def ensure_asset_generation(
     session_id: str, 
     asset_type: str, 
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Idempotent generation trigger.
@@ -317,7 +342,7 @@ async def ensure_asset_generation(
     if not doc.exists:
         raise HTTPException(404, "Session not found")
     data = doc.to_dict()
-    ensure_is_owner(data, current_user.uid, session_id) # Owners only for generation
+    ensure_is_owner(data, current_user, session_id) # Owners only for generation
     
     # Check current status
     # We can use the helper _get_asset_item_from_derived logic, but simpler to check derived doc directly?
@@ -343,6 +368,8 @@ async def ensure_asset_generation(
         enqueue_summarize_task(session_id, user_id=current_user.uid)
     elif asset_type == "quiz":
         enqueue_quiz_task(session_id, user_id=current_user.uid)
+    elif asset_type == "playlist":
+        enqueue_playlist_task(session_id, user_id=current_user.uid)
     else:
         raise HTTPException(400, f"Unsupported asset type for ensure: {asset_type}")
         
@@ -350,14 +377,14 @@ async def ensure_asset_generation(
 
 # We need a Transcript Artifact endpoint to match other artifacts
 @router.get("/sessions/{session_id}/artifacts/transcript", response_model=DerivedStatusResponse)
-async def get_artifact_transcript(session_id: str, current_user: User = Depends(get_current_user)):
+async def get_artifact_transcript(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Bridge endpoint for Transcript as Artifact."""
     doc_ref = _session_doc_ref(session_id)
     doc = doc_ref.get()
     if not doc.exists:
         raise HTTPException(404, "Session not found")
     data = doc.to_dict()
-    ensure_can_view(data, current_user.uid, session_id)
+    ensure_can_view(data, current_user, session_id)
     
     text = data.get("transcriptText")
     if not text:

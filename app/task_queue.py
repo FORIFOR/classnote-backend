@@ -209,6 +209,36 @@ def enqueue_translate_task(session_id: str, target_language: str, user_id: str):
     logger.info(f"Enqueued translate task for session {session_id}")
 
 
+def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
+    """
+    プレイリスト生成タスクをキューに入れる。
+    """
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running playlist task locally for session: {session_id}")
+        asyncio.create_task(_run_local_playlist(session_id, job_id=job_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/playlist"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        }
+    }
+
+    tasks_client.create_task(parent=parent, task=task)
+    logger.info(f"Enqueued playlist task for session {session_id}")
+
 # ---------- Local fallback workers ---------- #
 
 async def _run_local_summarize(session_id: str, job_id: str | None = None):
@@ -298,8 +328,90 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
         doc_ref.update({
             "quizStatus": "failed",
             "quizError": "Transcript is empty",
-            "status": "録音済み"
+            "quizUpdatedAt": datetime.utcnow(),
+            "status": "録音済み",
         })
+        return
+
+    # Trigger LLM
+    try:
+        doc_ref.update({
+            "quizStatus": "running",
+            "quizError": None,
+            "quizUpdatedAt": datetime.utcnow()
+        })
+        quiz_md = await llm.generate_quiz(transcript, mode=data.get("mode", "lecture"), count=count)
+        doc_ref.update({
+            "quizStatus": "completed",
+            "quizMarkdown": quiz_md,
+            "quizUpdatedAt": datetime.utcnow(),
+            "quizError": None,
+        })
+        if job_id:
+             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
+    except Exception as e:
+        logger.exception(f"[local quiz] failed: {e}")
+        doc_ref.update({
+            "quizStatus": "failed",
+            "quizError": str(e),
+            "quizUpdatedAt": datetime.utcnow(),
+        })
+
+async def _run_local_playlist(session_id: str, job_id: str | None = None):
+    doc_ref = db.collection("sessions").document(session_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return
+    data = doc.to_dict()
+    transcript = resolve_transcript_text(session_id, data)
+    if not transcript:
+        return
+    
+    try:
+        # Update status
+        doc_ref.update({"playlistStatus": "running"})
+        _derived_doc_ref(session_id, "playlist").set({
+            "status": "running",
+            "updatedAt": datetime.utcnow(),
+            "jobId": job_id
+        }, merge=True)
+        
+        # Generate
+        segments = data.get("diarizedSegments")
+        duration = data.get("durationSec")
+        playlist_json_str = await llm.generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
+        
+        try:
+            items = json.loads(playlist_json_str)
+        except:
+            items = []
+            
+        # Update result (Legacy playlist field + New Artifact)
+        ts = datetime.utcnow()
+        doc_ref.update({
+            "playlistStatus": "completed",
+            "playlist": items,
+            "playlistUpdatedAt": ts
+        })
+        _derived_doc_ref(session_id, "playlist").set({
+            "status": "succeeded",
+            "result": {"items": items},
+            "updatedAt": ts,
+            "jobId": job_id # Persist jobId
+        }, merge=True)
+        
+        if job_id:
+             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
+             
+    except Exception as e:
+        logger.exception(f"[local playlist] failed: {e}")
+        doc_ref.update({"playlistStatus": "failed"})
+        _derived_doc_ref(session_id, "playlist").set({
+            "status": "failed", 
+            "errorReason": str(e),
+            "updatedAt": datetime.utcnow()
+        }, merge=True)
+
         return
     doc_ref.update({"quizStatus": "running", "quizError": None, "status": "テスト生成"})
     try:
@@ -476,6 +588,37 @@ def enqueue_youtube_import_task(session_id: str, url: str, language: str = "ja",
         logger.info(f"Enqueued youtube import task for {session_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue youtube import task: {e}")
+        raise e
+
+def enqueue_merge_migration_task(merge_id: str):
+    """
+    Enqueues the background worker to migrate data for an account merge.
+    """
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running merge migration locally for {merge_id}")
+        import asyncio
+        from app.routes.tasks import _run_local_merge_migration
+        asyncio.create_task(_run_local_merge_migration(merge_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/merge_migration"
+    payload = {"mergeId": merge_id}
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        }
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Enqueued merge migration task for {merge_id}")
+    except Exception as e:
+        logger.error(f"Failed to enqueue merge migration task: {e}")
         raise e
 
 async def _run_local_youtube_import(session_id: str, url: str, language: str):
@@ -675,3 +818,56 @@ async def _run_local_transcribe(session_id: str, force: bool = False, engine: st
             "transcriptionStatus": "failed",
             "transcriptionError": str(e),
         })
+
+def enqueue_merge_migration_task(
+    merge_job_id: str,
+    source_uid: str,
+    target_account_id: str,
+):
+    """
+    Enqueues a background task to migrate sessions from a source UID to a target Account ID.
+    Used during Account Merge (Strategy B).
+    """
+    payload = {
+        "mergeJobId": merge_job_id,
+        "sourceUid": source_uid,
+        "targetAccountId": target_account_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running merge migration locally for job: {merge_job_id}")
+        asyncio.create_task(_run_local_merge_migration(merge_job_id, source_uid, target_account_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/merge_migration"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 1800},
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Enqueued merge migration task for job {merge_job_id}")
+    except Exception as e:
+        logger.error(f"Failed to enqueue merge migration task: {e}")
+        # In a critical merge flow, we might want to retry or alert, but usually Cloud Tasks is reliable.
+        raise e
+
+async def _run_local_merge_migration(merge_job_id: str, source_uid: str, target_account_id: str):
+    """
+    Local fallback for Merge Migration.
+    Directly calls the worker logic (simulated or imported).
+    """
+    # Ideally import from routes/tasks or services, but to avoid circular imports,
+    # we might just trigger the endpoint/function if it was refactored.
+    # For now, minimal mock or warning that it needs the server running.
+    logger.warning("Local merge migration is not fully implemented in task_queue (logic is in routes/tasks.py).")
+    # If we wanted to run it, we'd need to move the logic to a service.
+    # For now, we assume local dev might not test full merge migration backgrounding strictly.

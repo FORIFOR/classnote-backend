@@ -9,6 +9,7 @@ import os
 from app.dependencies import get_current_user, get_admin_user, get_admin_user_optional
 from app.usage_models import UsageSummaryResponse
 from app.services.usage import usage_logger
+from app.services.cost_guard import cost_guard
 from app.firebase import db
 from google.cloud.firestore_v1.base_query import FieldFilter
 
@@ -238,6 +239,13 @@ async def get_my_usage_summary(
         to_date=to_date
     )
     
+    # [UNIFY] Align with CostGuard
+    report = await cost_guard.get_usage_report(user_id)
+    summary["summary_invocations"] = max(summary.get("summary_invocations", 0), report.get("summaryGenerated", 0))
+    summary["quiz_invocations"] = max(summary.get("quiz_invocations", 0), report.get("quizGenerated", 0))
+    summary["total_recording_cloud_sec"] = max(summary.get("total_recording_cloud_sec", 0.0), report.get("usedSeconds", 0.0))
+    summary["total_recording_sec"] = summary.get("total_recording_ondevice_sec", 0.0) + summary["total_recording_cloud_sec"]
+
     return UsageSummaryResponse(**summary)
 
 
@@ -296,4 +304,4 @@ async def get_usage_timeline(
             "sessionCount": d.get("session_count", 0)
         })
         
-    return timeline
+    return {"timelineDaily": timeline}

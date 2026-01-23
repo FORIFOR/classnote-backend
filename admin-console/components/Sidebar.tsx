@@ -9,7 +9,7 @@ import { cn } from "@/components/ui/common";
 
 const navItems = [
   { name: "ダッシュボード", href: "/", icon: LayoutDashboard },
-  { name: "アラート・ログ", href: "/events", icon: AlertTriangle },
+  { name: "エラーログ", href: "/logs", icon: AlertTriangle },
   // { name: "ユーザー管理", href: "/users", icon: Users }, // Not implemented list yet
   // { name: "セッション管理", href: "/sessions", icon: FileAudio }, // Not implemented list yet
 ];
@@ -25,7 +25,7 @@ export function Sidebar() {
       <div className="flex h-16 items-center px-6 font-bold text-xl tracking-tight border-b border-slate-800">
         Classnote Admin
       </div>
-      
+
       <div className="flex-1 overflow-y-auto py-4">
         <nav className="space-y-1 px-3">
           {navItems.map((item) => {
@@ -52,10 +52,10 @@ export function Sidebar() {
 
       <div className="border-t border-slate-800 p-4">
         <div className="flex items-center">
-           <div className="ml-3">
-             <p className="text-sm font-medium text-white">{user.email}</p>
-             <p className="text-xs text-slate-500">{isAdmin ? "Admin Access" : "Read Only"}</p>
-           </div>
+          <div className="ml-3">
+            <p className="text-sm font-medium text-white">{user.email}</p>
+            <p className="text-xs text-slate-500">{isAdmin ? "Admin Access" : "Read Only"}</p>
+          </div>
         </div>
         <button
           onClick={() => auth.signOut()}

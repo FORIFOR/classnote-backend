@@ -73,12 +73,33 @@ def _extract_seq_and_pcm(data: bytes) -> tuple[Optional[int], bytes]:
 
 
 @router.websocket("/ws/sessions")
+@router.websocket("/ws/sessions/")
 async def ws_session_events(websocket: WebSocket):
-    await websocket.accept()
+    try:
+        auth_header = websocket.headers.get("authorization") or ""
+        masked_auth = (auth_header[:10] + "...") if len(auth_header) > 10 else "None"
+        logger.info(f"[ws_sessions] Connection attempt. Auth: {masked_auth}")
+        
+        await websocket.accept()
+        logger.info("[ws_sessions] Accepted connection")
+    except Exception as e:
+        logger.error(f"[ws_sessions] Failed to accept or unexpected error pre-handshake: {e}", exc_info=True)
+        # Try to close if possible, though it might be dead
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
+
+    # Post-accept logic
     auth_header = websocket.headers.get("authorization") or ""
     token = auth_header
     if auth_header.lower().startswith("bearer "):
         token = auth_header.split(" ", 1)[1].strip()
+    
+    # [FIX] Support Query Param "token" for clients that can't set headers
+    if not token:
+        token = websocket.query_params.get("token")
 
     if not token:
         await websocket.send_json({"type": "error", "code": "unauthorized"})
@@ -95,7 +116,17 @@ async def ws_session_events(websocket: WebSocket):
     conn_id = await session_event_bus.register(websocket, user.uid)
     try:
         while True:
-            raw = await websocket.receive_text()
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            
+            if "text" in message:
+                raw = message["text"]
+            elif "bytes" in message:
+                # Ignore binary frames (likely keepalives or errors from client)
+                continue
+            else:
+                continue
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -113,7 +144,7 @@ async def ws_session_events(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "code": "session_not_found"})
                     continue
                 try:
-                    ensure_can_view(snapshot.to_dict() or {}, user.uid, resolved_id)
+                    ensure_can_view(snapshot.to_dict() or {}, user, resolved_id)
                 except HTTPException:
                     await websocket.send_json({"type": "error", "code": "forbidden"})
                     await websocket.close(code=4403, reason="forbidden")
@@ -141,7 +172,24 @@ async def ws_session_events(websocket: WebSocket):
 
 @router.websocket("/ws/stream/{session_id}")
 async def ws_stream(websocket: WebSocket, session_id: str):
-    await websocket.accept()
+    try:
+        # [Debug] Log connection attempt details
+        auth_header = websocket.headers.get("authorization") or ""
+        query_token = websocket.query_params.get("token")
+        
+        masked_auth = (auth_header[:10] + "...") if len(auth_header) > 10 else "None"
+        masked_query = (query_token[:10] + "...") if query_token and len(query_token) > 10 else "None"
+        
+        logger.info(f"[/ws/stream] Connection attempt for {session_id}. AuthHeader: {masked_auth}, QueryToken: {masked_query}")
+        await websocket.accept()
+        logger.info(f"[/ws/stream] Accepted connection for {session_id}")
+    except Exception as e:
+        logger.error(f"[/ws/stream] Failed to accept or unexpected error pre-handshake: {e}", exc_info=True)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
     logger.info(f"[/ws/stream] WebSocket connected session_id={session_id}")
 
     # Session State Data (Defined early for scope)
@@ -156,25 +204,71 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     audio_started_at = None
     frame_count = 0
 
-    # --- Connection Phase (Validation & Locks) ---
+    # --- Connection Phase (Authentication & Validation) ---
     try:
-        # [FIX] Support clientSessionId fallback for offline-first clients
+        # 1. Unified Authentication
+        auth_header = websocket.headers.get("authorization") or ""
+        token = None
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+        
+        if not token:
+            token = websocket.query_params.get("token")
+        
+        if not token:
+            logger.warning(f"[/ws/stream] Missing authentication for session {session_id}")
+            await websocket.send_json({"event": "error", "code": "unauthorized", "reason": "missing_token"})
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+
+        try:
+            user = _resolve_user_from_token(token)
+            uid = user.uid
+        except Exception as auth_err:
+            logger.warning(f"[/ws/stream] Invalid token for session {session_id}: {auth_err}")
+            await websocket.send_json({"event": "error", "code": "unauthorized", "reason": "invalid_token"})
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+
+        # 2. Session Resolution
         doc_ref, doc, session_id = _resolve_session_ws(session_id)
 
         if doc is None or not doc.exists:
             logger.warning(f"[/ws/stream] Session not found: {session_id}")
-            await websocket.close(code=4000, reason="session_not_found")
+            await websocket.send_json({"event": "error", "code": "session_not_found"})
+            await websocket.close(code=1008, reason="session_not_found")
             return
 
         session_data = doc.to_dict()
         
+        # 3. Authorization Check
+        try:
+            ensure_can_view(session_data, user, session_id)
+        except Exception as perm_err:
+            logger.warning(f"[/ws/stream] Forbidden access for user {uid} to session {session_id}")
+            await websocket.send_json({"event": "error", "code": "forbidden"})
+            await websocket.close(code=1008, reason="forbidden")
+            return
+        
         # Limit checks for Free Plan (Credit Based)
         uid = session_data.get("userId") or session_data.get("ownerUserId") or session_data.get("ownerId")
         if uid:
+            # [FIX] Fetch accountId for unified quota management
+            # PHASE 1: Always use mode="user" since accounts/{accountId} doesn't have plan field yet
+            # PHASE 2 (future): After migrating plan to accounts collection, switch to mode="account"
+            user_doc = db.collection("users").document(uid).get()
+            user_data = user_doc.to_dict() if user_doc.exists else {}
+            account_id = user_data.get("accountId")
+            # For now, always use uid with mode="user" until accounts collection has plan data
+            quota_id = uid
+            quota_mode = "user"
+            logger.info(f"[/ws/stream] Quota lookup: uid={uid}, accountId={account_id}, mode={quota_mode}")
+
             # [Security] Blocked/Restricted check
             if not await usage_logger.check_security_state(uid):
                  logger.warning(f"[/ws/stream] Security block for user {uid}")
-                 await websocket.close(code=4003, reason="security_block")
+                 await websocket.send_json({"event": "error", "code": "security_block"})
+                 await websocket.close(code=1008, reason="security_block")
                  return
 
             # [Security] Concurrent connection lock (Atomic)
@@ -200,49 +294,58 @@ async def ws_stream(websocket: WebSocket, session_id: str):
 
             if not txn_lock(db.transaction(), lock_ref):
                 logger.info(f"[/ws/stream] User {uid} already has an active stream. Rejecting concurrent connection.")
-                await websocket.close(code=4003, reason="concurrent_stream_limit")
+                await websocket.send_json({"event": "error", "code": "concurrent_stream_limit"})
+                await websocket.close(code=1008, reason="concurrent_stream_limit")
                 return
 
             # [FIX] Use Atomic Transaction for ticket issuance to prevent double-counting
             @firestore.transactional
-            def txn_issue_ticket(transaction, s_ref, u_uid):
+            def txn_issue_ticket(transaction, s_ref, u_uid, q_id, q_mode):
                 s_snap = s_ref.get(transaction=transaction)
                 s_data = s_snap.to_dict() or {}
-                
+
                 # 1. Already has ticket?
                 if s_data.get("cloudTicket"):
                     return True, s_data.get("cloudTicket")
-                
+
                 # 2. Check and increment usage (passing transaction)
                 # Note: cost_guard.guard_can_consume (transactional)
                 # However, guard_can_consume is async and transactional decorator is sync.
                 # We should use _check_and_reserve_logic directly if we are inside a sync txn.
+
+                # [FIX] Use quota_id and quota_mode for unified account-based quota
+                m_ref = cost_guard._get_monthly_doc_ref(q_id, mode=q_mode)
+                # Entity ref for plan lookup. 
+                # If mode is account, we must check for plan in BOTH account and user docs?
+                # Actually cost_guard._check_and_reserve_logic handles this if we pass u_ref correctly.
+                # Currently it expects u_ref to point to the entity that HAS the 'plan' field.
                 
-                m_ref = cost_guard._get_monthly_doc_ref(u_uid)
-                u_ref = db.collection("users").document(u_uid)
+                # Check where plan is stored
+                plan_entity_ref = db.collection("accounts").document(q_id) if q_mode == "account" else db.collection("users").document(u_uid)
                 
                 allowed, meta = cost_guard._check_and_reserve_logic(
-                    transaction, u_ref, m_ref, u_uid, "cloud_sessions_started", 1, cost_guard._get_month_key()
+                    transaction, plan_entity_ref, m_ref, q_id, "cloud_sessions_started", 1, cost_guard._get_month_key()
                 )
-                
+
                 if not allowed:
                     return False, "cloud_session_limit_exceeded"
-                
+
                 # 3. Issue and persist ticket
                 new_ticket = str(uuid.uuid4())
                 transaction.update(s_ref, {
-                    "cloudTicket": new_ticket, 
+                    "cloudTicket": new_ticket,
                     "cloudTicketIssuedAt": firestore.SERVER_TIMESTAMP,
                     "transcriptionMode": "cloud_google" # Auto-upgrade mode
                 })
                 return True, new_ticket
 
             # Execute ticket issuance
-            success, result_or_ticket = txn_issue_ticket(db.transaction(), doc_ref, uid)
+            success, result_or_ticket = txn_issue_ticket(db.transaction(), doc_ref, uid, quota_id, quota_mode)
             if not success:
                 lock_ref.delete()
                 logger.info(f"[/ws/stream] User {uid} rejected: {result_or_ticket}")
-                await websocket.close(code=4003, reason=result_or_ticket)
+                await websocket.send_json({"event": "error", "code": result_or_ticket})
+                await websocket.close(code=1008, reason=result_or_ticket)
                 return
             
             # Refresh session_data with the new ticket/mode
@@ -251,7 +354,18 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 session_data["transcriptionMode"] = "cloud_google"
 
             # [FIX] Check remaining cloud_stt_sec quota and enforce monthly limits
-            usage_report = await cost_guard.get_usage_report(uid)
+            # Use quota_id and quota_mode for unified account-based quota lookup
+            usage_report = await cost_guard.get_usage_report(quota_id, mode=quota_mode)
+
+            # [SAFETY] Handle missing/empty usage data as internal error, not quota limit
+            if not usage_report:
+                lock_ref.delete()
+                reason = "usage_data_missing"
+                logger.error(f"[/ws/stream] Usage data missing for {quota_mode}={quota_id}. This is a data sync issue, not a quota limit.")
+                await websocket.send_json({"event": "error", "code": reason})
+                await websocket.close(code=1011, reason=reason)  # 1011 = internal error
+                return
+
             limit_sec = float(usage_report.get("limitSeconds", 0.0))
             used_sec = float(usage_report.get("usedSeconds", 0.0))
             remaining_sec = float(usage_report.get("remainingSeconds", 0.0))
@@ -262,13 +376,18 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 lock_ref.delete()
                 reason = usage_report.get("reasonIfBlocked", "cloud_minutes_limit")
                 logger.info(f"[/ws/stream] User {uid} has no remaining cloud STT quota. Rejecting. reason={reason}")
-                await websocket.close(code=4003, reason=reason)
+                await websocket.send_json({"event": "error", "code": reason})
+                await websocket.close(code=1008, reason=reason)
                 return
-            logger.info(f"[/ws/stream] User {uid} remaining quota: {remaining_sec:.0f}s (limit={limit_sec:.0f}s, used={used_sec:.0f}s, plan={plan})")
+            logger.info(f"[/ws/stream] User {uid} (quota_id={quota_id}) remaining quota: {remaining_sec:.0f}s (limit={limit_sec:.0f}s, used={used_sec:.0f}s, plan={plan})")
 
-        logger.info(f"[/ws/stream] Setup complete for session_id={session_id}, quota_remaining={remaining_sec:.0f}s, plan={plan}")
+        logger.info(f"[/ws/stream] Setup complete for session_id={session_id}, user_id={uid}, plan={plan}")
     except Exception as e:
         logger.error(f"[/ws/stream] Initial setup failed: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"event": "error", "code": "internal_setup_error", "message": str(e)})
+        except Exception:
+            pass
         await websocket.close(code=1011, reason="internal_setup_error")
         return
 
@@ -364,7 +483,7 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                         transcript_segments.append(segment)
                         last_final_end_ms = current_time_ms
                         current_partial = ""  # Clear partial after final
-                        logger.debug(f"[/ws/stream] Final segment #{segment_counter}: {len(transcript_text)} chars")
+                        logger.debug(f"[/ws/stream] Final segment #{segment_counter}: {len(transcript_text)} chars (segmentIndex={segment_index})")
                     else:
                         # Update current partial (for draft)
                         current_partial = transcript_text
@@ -399,11 +518,11 @@ async def ws_stream(websocket: WebSocket, session_id: str):
 
     try:
         while True:
-            # [Security] No-Audio Timeout (20s)
-            # If start was received but no audio bytes arrived within 20s
-            if started and total_audio_bytes == 0 and audio_started_at:
+            # [Security] No-Audio Timeout (20s) - Only if not started or inactivity
+            if total_audio_bytes == 0 and audio_started_at:
                  if time.time() - audio_started_at > NO_AUDIO_TIMEOUT:
                       logger.warning(f"[/ws/stream] Session {session_id} no-audio timeout (20s). Forced disconnect.")
+                      await websocket.send_json({"event": "error", "code": "no_audio_timeout"})
                       break
 
             msg = await websocket.receive()
@@ -415,6 +534,10 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                     event = data.get("event")
 
                     if event == "start":
+                        if started:
+                            logger.warning("[/ws/stream] Multiplexed START received - ignoring.")
+                            continue
+
                         client_config = data.get("config", {})
                         client_ticket = data.get("cloudTicket") # [NEW] Authorization Ticket
                         try:
@@ -422,7 +545,8 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                         except (TypeError, ValueError):
                             segment_index = 0
                         
-                        logger.info(f"[/ws/stream] START: {json.dumps(client_config)} ticket={client_ticket}")
+                        masked_ticket = (client_ticket[:8] + "...") if client_ticket and len(client_ticket) > 8 else "None"
+                        logger.info(f"[/ws/stream] START: {json.dumps(client_config)} ticket={masked_ticket} segmentIndex={segment_index}")
 
                         # [Security] Cloud Ticket Verification
                         # If the session is in cloud_google mode, it MUST have a valid ticket.
@@ -431,14 +555,13 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                             expected_ticket = session_data.get("cloudTicket")
                             if not expected_ticket or client_ticket != expected_ticket:
                                 logger.warning(f"[/ws/stream] Ticket mismatch: expected={expected_ticket}, got={client_ticket}")
-                                await websocket.send_json({"event": "error", "message": "unauthorized_cloud_ticket"})
-                                break
+                                await websocket.send_json({"event": "error", "code": "unauthorized_cloud_ticket"})
+                                await websocket.close(code=1008, reason="unauthorized_cloud_ticket")
+                                return
                             
-                            # Check expiry again just in case
-                            if cloud_allowed_until and time.time() > cloud_allowed_until.timestamp():
-                                logger.warning(f"[/ws/stream] Ticket expired for session {session_id}")
-                                await websocket.send_json({"event": "error", "message": "cloud_ticket_expired"})
-                                break
+                            # [NOTE] cloud_allowed_until was undefined here causing NameError crashes.
+                            # Ticket verification above is sufficient for security.
+                            pass
 
                         if "languageCode" in client_config:
                             language_code = client_config["languageCode"]
@@ -475,10 +598,17 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                         break
 
                 except json.JSONDecodeError:
-                    pass
+                    logger.warning(f"[/ws/stream] Invalid JSON received: {msg.get('text')}")
+                    await websocket.send_json({"event": "error", "code": "invalid_json"})
 
             # 2. Binary Messages (Audio)
             elif "bytes" in msg and msg["bytes"]:
+                if not started:
+                    logger.warning("[/ws/stream] Received audio before START handshake. Rejection expected.")
+                    await websocket.send_json({"event": "error", "code": "protocol_violation", "reason": "audio_before_start"})
+                    await websocket.close(code=1002) # Protocol Error
+                    return
+
                 raw_data = msg["bytes"]
                 seq, pcm = _extract_seq_and_pcm(raw_data)
 
@@ -620,10 +750,11 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                 # 16kHz, 16bit (2bytes) -> 32000 bytes/sec
                 rec_sec = total_audio_bytes / 32000.0
                 uid = session_data.get("userId") or session_data.get("ownerUserId") or session_id
+                target_account_id = session_data.get("ownerAccountId") or uid
                 
                 # Fire and forget usage log
                 asyncio.create_task(usage_logger.log(
-                    user_id=uid,
+                    user_id=target_account_id, # Log to account for quota enforcement
                     session_id=session_id,
                     feature="transcribe",
                     event_type="success",

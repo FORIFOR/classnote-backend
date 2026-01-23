@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status, Header, BackgroundTasks
+from fastapi import Depends, HTTPException, status, Header, BackgroundTasks, Request
 from typing import Optional
 from fastapi.security import OAuth2PasswordBearer
 import firebase_admin
@@ -7,7 +7,22 @@ from google.cloud import firestore
 from app.firebase import db
 from app.services.account_deletion import LOCKS_COLLECTION, deletion_lock_id
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import datetime as dt_module # Fallback
+try:
+    # Try public API first (recommended for newer SDKs)
+    from firebase_admin.auth import InvalidIdTokenError, ExpiredIdTokenError, RevokedIdTokenError, CertificateFetchError
+except ImportError:
+    try:
+        # Fallback to internal utils (older SDKs)
+        from firebase_admin._auth_utils import InvalidIdTokenError, ExpiredIdTokenError, RevokedIdTokenError, CertificateFetchError
+    except ImportError:
+        # Final fallback: generic placeholders to allow app startup
+        # The logic will simply catch general Exceptions if these match nothing
+        class InvalidIdTokenError(Exception): pass
+        class ExpiredIdTokenError(Exception): pass
+        class RevokedIdTokenError(Exception): pass
+        class CertificateFetchError(Exception): pass
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
@@ -19,158 +34,68 @@ if not firebase_admin._apps:
 USER_ACTIVITY_CACHE = {}
 USER_ACTIVITY_THROTTLE_SEC = 300  # 5 minutes
 
-class User:
-    def __init__(self, uid: str, email: str = None, display_name: str = None, photo_url: str = None):
-        self.uid = uid
-        self.email = email
-        self.display_name = display_name
-        self.photo_url = photo_url
 
+from dataclasses import dataclass
 
-def _normalize_ts(ts: datetime | None) -> datetime | None:
-    if ts is None:
-        return None
-    if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts
+@dataclass
+class CurrentUser:
+    uid: str
+    provider: str | None
+    phone_number: str | None
+    email: str | None
+    display_name: str | None = None
+    photo_url: str | None = None
+    # Plan is now on Account, not User, but kept for compat if needed or removed. 
+    # Logic will fetch Plan from Account.
 
-
-def _update_last_seen(uid: str):
-    """Background task to update lastSeenAt"""
+def _resolve_user_from_token(token: str) -> CurrentUser:
     try:
-        db.collection("users").document(uid).set({
-            "lastSeenAt": firestore.SERVER_TIMESTAMP
-        }, merge=True)
-    except Exception as e:
-        print(f"Error updating lastSeenAt for {uid}: {e}")
-
-def _track_activity(uid: str, background_tasks: BackgroundTasks):
-    """Check throttle and schedule background update if needed."""
-    now = time.time()
-    last_update = USER_ACTIVITY_CACHE.get(uid, 0)
-    
-    if now - last_update > USER_ACTIVITY_THROTTLE_SEC:
-        USER_ACTIVITY_CACHE[uid] = now
-        background_tasks.add_task(_update_last_seen, uid)
-
-
-def _resolve_user_from_token(token: str) -> User:
-    try:
-        decoded_token = auth.verify_id_token(token)
+        decoded_token = auth.verify_id_token(token, check_revoked=False)
         uid = decoded_token.get("uid")
         email = decoded_token.get("email")
-        name = decoded_token.get("name")
-        picture = decoded_token.get("picture")
-        provider_id = None
-        try:
-            provider_id = decoded_token.get("firebase", {}).get("sign_in_provider")
-        except Exception:
-            provider_id = None
-        default_name = name or "ゲスト"
-
+        # Firebase Auth phone_number is top-level claim
+        phone_number = decoded_token.get("phone_number")
+        
+        firebase_claims = decoded_token.get("firebase", {})
+        provider_id = firebase_claims.get("sign_in_provider")
+        
         if not uid:
-            raise HTTPException(
+             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token: No UID",
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        user_ref = db.collection("users").document(uid)
-        user_doc = user_ref.get()
+        return CurrentUser(
+            uid=uid,
+            provider=provider_id,
+            phone_number=phone_number,
+            email=email,
+            display_name=decoded_token.get("name"),
+            photo_url=decoded_token.get("picture")
+        )
 
-        # プロバイダー情報は Auth から取得
-        providers = []
-        photo_url = picture
-        try:
-            record = auth.get_user(uid)
-            providers = [p.provider_id for p in record.provider_data] if record.provider_data else []
-            photo_url = photo_url or record.photo_url
-            # email が空なら Auth の値を使う
-            if not email and record.email:
-                email = record.email
-            if not name and record.display_name:
-                name = record.display_name
-            if not provider_id and record.provider_id:
-                provider_id = record.provider_id
-        except Exception as e:
-            # print(f"Auth get_user error: {e}") # Suppress noise
-            pass
-
-        email_lower = email.lower() if email else None
-        if not provider_id and providers:
-            provider_id = providers[0]
-
-        if not user_doc.exists and email_lower and provider_id:
-            lock_ref = db.collection(LOCKS_COLLECTION).document(deletion_lock_id(email_lower, provider_id))
-            lock_doc = lock_ref.get()
-            if lock_doc.exists:
-                lock_data = lock_doc.to_dict() or {}
-                delete_after = _normalize_ts(lock_data.get("deleteAfterAt"))
-                now_dt = datetime.now(timezone.utc)
-                if not delete_after or delete_after > now_dt:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="account_deletion_pending",
-                    )
-                lock_ref.delete()
-
-        now_ts = firestore.SERVER_TIMESTAMP
-        if not user_doc.exists:
-            user_data = {
-                "email": email,
-                "emailLower": email_lower,
-                "displayName": default_name,
-                "photoUrl": photo_url,
-                "providers": providers,
-                "provider": provider_id,
-                "allowSearch": True,
-                "isShareable": True,
-                "shareCodeSearchEnabled": True,
-                "createdAt": now_ts,
-                "updatedAt": now_ts,
-            }
-            user_data = {k: v for k, v in user_data.items() if v is not None}
-            user_ref.set(user_data)
-        else:
-            existing = user_doc.to_dict() or {}
-            update_data = {}
-            # 既存ユーザーでも allowSearch/isShareable が無い場合は true に初期化
-            if existing.get("allowSearch") is None:
-                update_data["allowSearch"] = True
-            if existing.get("isShareable") is None:
-                update_data["isShareable"] = True
-            if existing.get("shareCodeSearchEnabled") is None:
-                update_data["shareCodeSearchEnabled"] = True
-            if email and existing.get("email") != email:
-                update_data["email"] = email
-                update_data["emailLower"] = email.lower()
-            if default_name and not existing.get("displayName"):
-                update_data["displayName"] = default_name
-            if photo_url and not existing.get("photoUrl"):
-                update_data["photoUrl"] = photo_url
-            if providers and not existing.get("providers"):
-                update_data["providers"] = providers
-            if update_data:
-                update_data["updatedAt"] = now_ts
-                user_ref.update(update_data)
-
-        return User(uid=uid, email=email, display_name=name, photo_url=photo_url)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Auth Error: {e}")
+    except (InvalidIdTokenError, ExpiredIdTokenError, RevokedIdTokenError) as e:
+        print(f"Auth Token Error: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    except Exception as e:
+        print(f"Auth System Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Auth system error",
+        )
+
 
 
 async def get_current_user(
+    request: Request,
     background_tasks: BackgroundTasks,
     token: Optional[str] = Depends(oauth2_scheme)
-) -> User:
+) -> CurrentUser:
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -178,18 +103,58 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     user = _resolve_user_from_token(token)
-    _track_activity(user.uid, background_tasks)
+    # [NEW] Inject UID into request state for OpsLogger
+    request.state.uid = user.uid
+    request.state.email = user.email
+    request.state.email = user.email
+    # _track_activity(user.uid, background_tasks)
     return user
 
 
-def get_user_from_token(token: str) -> User:
+async def get_verified_user(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    currentUser: CurrentUser = Depends(get_current_user)
+) -> CurrentUser:
+    """
+    Dependency to enforce phone verification.
+    If the user has not verified their phone number (and needs to), this raises 403.
+    """
+    
+    # 1. Check Link State (Same logic as /users/me to determine needsPhoneVerification)
+    # We can rely on the fact that if they are linked to an account, they are verified.
+    # However, get_current_user only resolves the token. We need to check the link doc.
+    
+    uid = currentUser.uid
+    
+    # Optimization: If the token has the custom claim "verified", we could trust it.
+    # But for now, let's check the DB or use a cached approach if clear.
+    # Actually, let's just do the DB check. usage of this endpoint implies a "write" or "critical" action usually.
+
+    link_ref = db.collection("uid_links").document(uid)
+    link_doc = link_ref.get()
+    
+    # If not linked -> Unverified
+    if not link_doc.exists:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "PHONE_VERIFICATION_REQUIRED", "message": "Phone verification required to perform this action."}
+        )
+        
+    # If linked but strictly check? 
+    # Usually existence of uid_links means phone verification passed.
+    
+    return currentUser
+
+
+def get_user_from_token(token: str) -> CurrentUser:
     return _resolve_user_from_token(token)
 
 
 async def get_current_user_optional(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
-) -> Optional[User]:
+) -> Optional[CurrentUser]:
     """
     Optional authentication - returns None if no valid token provided.
     Used for endpoints that support both authenticated and unauthenticated access.
@@ -205,7 +170,6 @@ async def get_current_user_optional(
     
     try:
         user = _resolve_user_from_token(token)
-        _track_activity(user.uid, background_tasks)
         return user
     except HTTPException:
         return None
@@ -223,13 +187,45 @@ def _get_session_member(session_id: str | None, user_id: str | None) -> Optional
         return None
     return doc.to_dict() or {}
 
-def ensure_can_view(session_data: dict, uid: str, session_id: Optional[str] = None):
-    owner = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
+from app.services.account import account_id_from_phone
+from typing import Union
+
+def ensure_can_view(session_data: dict, user_or_uid: Union[str, CurrentUser], session_id: Optional[str] = None):
+    # Normalize input
+    if isinstance(user_or_uid, CurrentUser):
+        uid = user_or_uid.uid
+        phone = user_or_uid.phone_number
+        provider = user_or_uid.provider
+    else:
+        uid = user_or_uid
+        phone = None
+        provider = None
+
+    owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
+    owner_account_id = session_data.get("ownerAccountId")
+
+    # 1. UID Match (Legacy/Fastest)
+    if owner_uid == uid:
+        return
+
+    # 2. Account Match (New)
+    if owner_account_id:
+        # A. Check if this UID is explicitly linked (Most reliable)
+        link_doc = db.collection("uid_links").document(uid).get()
+        if link_doc.exists and link_doc.to_dict().get("accountId") == owner_account_id:
+            return
+        
+        # B. Fallback: Check if the token's phone number matches the account
+        #    (Prevents "I just linked but link doc propagation failed" or "uid_links missing")
+        #    NOTE: This enables "Unified Identity" - same person, different UIDs.
+        if phone:
+            derived_acc_id = account_id_from_phone(phone)
+            if derived_acc_id == owner_account_id:
+                return
+
     shared_users = session_data.get("sharedUserIds") or session_data.get("sharedWithUserIds") or []
     shared_map = session_data.get("sharedWith") or {}
 
-    if owner == uid:
-        return
     if session_id:
         member = _get_session_member(session_id, uid)
         if member:
@@ -244,17 +240,44 @@ def ensure_can_view(session_data: dict, uid: str, session_id: Optional[str] = No
         detail="You do not have access to this session"
     )
 
-def ensure_is_owner(session_data: dict, uid: str, session_id: Optional[str] = None):
-    owner = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
-    if owner != uid:
-        if session_id:
-            member = _get_session_member(session_id, uid)
-            if member and member.get("role") == "owner":
+def ensure_is_owner(session_data: dict, user_or_uid: Union[str, CurrentUser], session_id: Optional[str] = None):
+    # Normalize input
+    if isinstance(user_or_uid, CurrentUser):
+        uid = user_or_uid.uid
+        phone = user_or_uid.phone_number
+    else:
+        uid = user_or_uid
+        phone = None
+
+    owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("ownerId") or session_data.get("userId")
+    owner_account_id = session_data.get("ownerAccountId")
+    
+    # 1. Legacy Match
+    if owner_uid == uid:
+        return
+
+    # 2. Account Match
+    if owner_account_id:
+        # A. Check UID Link
+        link_doc = db.collection("uid_links").document(uid).get()
+        if link_doc.exists and link_doc.to_dict().get("accountId") == owner_account_id:
+            return
+            
+        # B. Fallback: Phone Match
+        if phone:
+            derived_acc_id = account_id_from_phone(phone)
+            if derived_acc_id == owner_account_id:
                 return
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the owner can perform this operation"
-        )
+
+    if session_id:
+        member = _get_session_member(session_id, uid)
+        if member and member.get("role") == "owner":
+            return
+            
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Only the owner can perform this operation"
+    )
 
 
 # --- Admin Authentication ---
@@ -264,11 +287,10 @@ import os
 ADMIN_UIDS = set(filter(None, (os.environ.get("ADMIN_UIDS") or "").split(",")))
 
 
-class AdminUser(User):
+@dataclass
+class AdminUser(CurrentUser):
     """管理者ユーザー"""
-    def __init__(self, uid: str, email: str = None, display_name: str = None, is_super_admin: bool = False):
-        super().__init__(uid, email, display_name)
-        self.is_super_admin = is_super_admin
+    is_super_admin: bool = False
 
 
 def _check_admin_claims(token: str) -> tuple[bool, bool]:
@@ -329,12 +351,13 @@ async def get_admin_user(
             detail="Admin access required"
         )
 
-    _track_activity(user.uid, background_tasks)
-
     return AdminUser(
         uid=user.uid,
+        provider=user.provider,
+        phone_number=user.phone_number,
         email=user.email,
         display_name=user.display_name,
+        photo_url=user.photo_url,
         is_super_admin=is_super_admin
     )
 
@@ -359,11 +382,12 @@ async def get_admin_user_optional(
             detail="Admin access required"
         )
 
-    _track_activity(user.uid, background_tasks)
-
     return AdminUser(
         uid=user.uid,
+        provider=user.provider,
+        phone_number=user.phone_number,
         email=user.email,
         display_name=user.display_name,
+        photo_url=user.photo_url,
         is_super_admin=is_super_admin
     )

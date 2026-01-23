@@ -6,7 +6,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 
-from app.dependencies import get_current_user, get_current_user_optional, User
+from app.dependencies import get_current_user, get_current_user_optional, CurrentUser, CurrentUser
 from app.google_calendar import (
     _sign_state,
     _verify_state,
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/google")
 async def google_oauth_start(
     return_to: str = "/",
     token: str | None = None,
-    current_user: User | None = Depends(get_current_user_optional)
+    current_user: CurrentUser | None = Depends(get_current_user_optional)
 ):
     # Determine UID: priority to `token` query param (for iOS Safari), fallback to Header (for Web)
     uid = None

@@ -9,7 +9,7 @@ from app.ad_models import (
     SponsoredAd, AdCreative, PlacementResponse, AdEventIn,
     AdAssets, AdAsset, AdAction, RenderHints, Theme, Policy
 )
-from app.dependencies import get_current_user_optional, User
+from app.dependencies import get_current_user_optional, CurrentUser
 from app.firebase import db
 
 router = APIRouter()
@@ -69,7 +69,7 @@ async def get_placement(
     slot: str, 
     session_id: str, 
     job_id: Optional[str] = None,
-    current_user: Optional[User] = Depends(get_current_user_optional)
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional)
 ):
     """
     Get an ad placement for the given slot (e.g., 'summary_generating').
@@ -104,7 +104,7 @@ async def get_placement(
 @router.post("/ads/events")
 async def post_ad_event(
     evt: AdEventIn,
-    current_user: Optional[User] = Depends(get_current_user_optional)
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional)
 ):
     """
     Track ad events (impression, click, dismiss).

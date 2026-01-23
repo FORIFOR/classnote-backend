@@ -6,7 +6,7 @@ from google.cloud import firestore
 
 
 from app.firebase import db
-from app.dependencies import get_current_user, User
+from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.util_models import SessionResponse, TaskResponse, DecisionResponse
 
 router = APIRouter(prefix="/search", tags=["Search"])
@@ -19,7 +19,7 @@ async def search_sessions(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 20,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Search sessions with filters.
@@ -100,7 +100,7 @@ async def search_tasks(
     status: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 20,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Search tasks assigned to or owned by user.
@@ -149,7 +149,7 @@ async def search_tasks(
 async def search_decisions(
     q: Optional[str] = None,
     limit: int = 20,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     Search decisions extracted from sessions.

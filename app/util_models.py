@@ -24,6 +24,7 @@ class AssetStatus(str, Enum):
     PENDING = "pending"  # [RENAME] Changed from not_started for iOS compatibility
     MISSING = "missing"  # Asset is missing/unavailable
     ERROR = "error"
+    LOCKED = "locked"    # [NEW] Blocked by quota or paywall
 
 class AssetItem(BaseModel):
     status: AssetStatus
@@ -67,6 +68,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    LOCKED = "locked"    # [NEW] Job blocked by quota/billing
 
 class TranscriptionMode(str, Enum):
     CLOUD_GOOGLE = "cloud_google"
@@ -477,6 +479,17 @@ class MeResponse(BaseModel):
     
     # [vNext] Consolidated Cloud Usage Report
     cloud: Optional[CloudUsageReport] = None
+    
+    # [Security] App Store Receipt Validation
+    appAccountToken: Optional[str] = None  # [NEW] UUID for StoreKit 2
+
+    # [NEW 2026-01] Account Unification
+    needsPhoneVerification: Optional[bool] = None
+    needsSnsLogin: bool = False # [NEW]
+    accountId: Optional[str] = None
+    phoneE164: Optional[str] = None
+    credits: Optional[Dict[str, Any]] = None
+    accountResolution: Optional[Dict[str, Any]] = None # [NEW] {action: attached|created|none}
 
 class MeUpdateRequest(BaseModel):
     displayName: Optional[str] = None
@@ -781,14 +794,14 @@ class DerivedEnqueueResponse(BaseModel):
     idempotencyKey: Optional[str] = None
 
 class DerivedStatusResponse(BaseModel):
-    status: JobStatus
-    jobId: Optional[str] = None # Optional because artifact might exist without job tracking
-    result: Optional[dict] = None
-    meta: Optional[dict] = None
+    status: str # ready, running, pending, error
+    result: Optional[Dict[str, Any]] = None
+    meta: Optional[Dict[str, Any]] = None
     updatedAt: Optional[datetime] = None
     errorReason: Optional[str] = None
-    modelInfo: Optional[dict] = None
+    modelInfo: Optional[Dict[str, Any]] = None
     idempotencyKey: Optional[str] = None
+    jobId: Optional[str] = None # [NEW] Ensure client can track job
 
 class PlaylistArtifactResponse(BaseModel):
     status: JobStatus
@@ -908,3 +921,21 @@ class SessionQuizStat(BaseModel):
     lastAccuracy: Optional[float] = None
     completionRate: Optional[float] = None
     lastAttemptAt: Optional[datetime] = None
+
+
+# --- Entitlement Models (vNext) ---
+
+class IosEntitlement(BaseModel):
+    """
+    Represents the server-side source of truth for an Apple subscription entitlement.
+    Stored in /ios_entitlements/{originalTransactionId}
+    """
+    ownerUserId: str
+    originalTransactionId: str
+    productId: str
+    environment: str # "Sandbox" or "Production"
+    status: str # "active", "expired", "revoked", etc.
+    latestExpiresAt: datetime
+    appAccountToken: Optional[str] = None
+    createdAt: datetime
+    updatedAt: datetime

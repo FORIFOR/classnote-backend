@@ -137,4 +137,4 @@ class UsageTimelineItem(BaseModel):
     sessionCount: int
 
 class UsageTimelineResponse(BaseModel):
-    timeline: list[UsageTimelineItem]
+    timelineDaily: list[UsageTimelineItem]

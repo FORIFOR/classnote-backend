@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from google.cloud import firestore
 
-from app.dependencies import get_current_user, User
+from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.firebase import db
 from app.services.apple import apple_service
 from app.util_models import BillingConfirmRequest, AppStoreNotificationRequest, BillingConfirmResponse
@@ -193,7 +193,7 @@ def _diff_transaction_info(primary: Any, secondary: Any) -> dict:
 @router.post("/ios/confirm", response_model=BillingConfirmResponse)
 async def confirm_ios_purchase(
     req: BillingConfirmRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
     response: Response = None,
 ):
     request_id = str(uuid.uuid4())
@@ -332,6 +332,47 @@ async def confirm_ios_purchase(
         "planUpdatedAt": firestore.SERVER_TIMESTAMP,
     })
 
+    # [Unified Account] Sync Plan to Account
+    link_ref = db.collection("uid_links").document(current_user.uid)
+    link_doc = link_ref.get()
+    if link_doc.exists:
+        account_id = link_doc.to_dict().get("accountId")
+        if account_id:
+             # Ensure we only update if this user is the "standardOwner" or if nobody owns it yet?
+             # Actually, for a NEW purchase, this user effectively claims it.
+             # But strictly, the "phone" link logic handles owner.
+             # Here we just push the plan state if entitled.
+             
+             # We should store expiresAt on the account for JIT checks
+             update_data = {
+                 "plan": plan,
+                 "planExpiresAt": _ms_to_datetime(fields.get("expiresDateMs")),
+                 "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+                 "lastTransactionId": fields.get("transactionId"),
+                 "originalTransactionId": original_transaction_id,
+             }
+             if entitled:
+                 # If we are entitled, we set the plan.
+                 # If not entitled (expired/revoked), we set 'free' (which is done by line 273 logic)
+                 pass
+            
+             db.collection("accounts").document(account_id).set(update_data, merge=True)
+             
+             # Log transition
+             logger.info(
+                 "subscription_state_transition",
+                 extra={
+                     "uid": current_user.uid,
+                     "accountId": account_id,
+                     "fromPlan": "unknown", # We'd need to fetch to know, but maybe just log 'toPlan'
+                     "toPlan": plan,
+                     "reason": "purchase_confirm",
+                     "transactionId": fields.get("transactionId"),
+                     "originalTransactionId": original_transaction_id,
+                     "expiresAt": fields.get("expiresDateMs")
+                 }
+             )
+
     return BillingConfirmResponse(
         ok=True,
         plan=plan,
@@ -414,6 +455,32 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
             )
 
         if uid:
+            # [Unified Account] Sync to Account
+            link_ref = db.collection("uid_links").document(uid)
+            link_doc = link_ref.get()
+            if link_doc.exists:
+                account_id = link_doc.to_dict().get("accountId")
+                if account_id:
+                    db.collection("accounts").document(account_id).set({
+                        "plan": plan,
+                        "planExpiresAt": _ms_to_datetime(fields.get("expiresDateMs")),
+                        "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+                        "lastTransactionId": fields.get("transactionId"),
+                        "originalTransactionId": original_transaction_id,
+                    }, merge=True)
+                    
+                    logger.info(
+                         "subscription_state_transition",
+                         extra={
+                             "uid": uid,
+                             "accountId": account_id,
+                             "toPlan": plan,
+                             "reason": f"notification_{notification_type}",
+                             "transactionId": fields.get("transactionId"),
+                             "expiresAt": fields.get("expiresDateMs")
+                         }
+                     )
+
             db.collection("users").document(uid).collection("subscriptions").document("apple").set(
                 {
                     **summary_data,

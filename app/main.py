@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from datetime import datetime, timezone
 from app.services.ops_logger import OpsLogger, Severity, EventType
 
@@ -6,7 +7,7 @@ print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -35,6 +36,25 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """
+    Standardizes error responses. 
+    If detail is a dict, return it directly to avoid double-wrapping in {"detail": ...}.
+    """
+    headers = getattr(exc, "headers", None)
+    if isinstance(exc.detail, dict):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.detail,
+            headers=headers
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers
+    )
+
 # [NEW] Ops Logger Middleware
 @app.middleware("http")
 async def ops_logger_middleware(request: Request, call_next):
@@ -50,8 +70,9 @@ async def ops_logger_middleware(request: Request, call_next):
             endpoint=request.url.path,
             status_code=response.status_code,
             message=f"API 500 Error: {request.url.path}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host},
-            trace_id=request.headers.get("X-Cloud-Trace-Context")
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host, "email": getattr(request.state, "email", None)},
+            trace_id=request.headers.get("X-Cloud-Trace-Context"),
+            uid=getattr(request.state, "uid", None)
         )
     # 400系は INFO/WARN レベル (認証エラーなどは除外してもよいが、ここでは全て記録しフィルタで分ける)
     # ただし大量になるので 401/403/429/402 など重要なものに絞るのが一般的
@@ -62,8 +83,9 @@ async def ops_logger_middleware(request: Request, call_next):
             endpoint=request.url.path,
             status_code=response.status_code,
             message=f"API Client Error: {response.status_code}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host},
-             trace_id=request.headers.get("X-Cloud-Trace-Context")
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host, "email": getattr(request.state, "email", None)},
+            trace_id=request.headers.get("X-Cloud-Trace-Context"),
+            uid=getattr(request.state, "uid", None)
         )
 
     return response
@@ -87,6 +109,8 @@ app.add_middleware(
 )
 
 # Include Routers
+app.include_router(account.router, tags=["Account"])
+app.include_router(account_merge.router, tags=["Account Merge"])
 app.include_router(assets_router, tags=["Assets"])
 app.include_router(sessions.router, tags=["Sessions"])
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)

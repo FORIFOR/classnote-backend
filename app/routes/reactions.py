@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from google.cloud import firestore
 from datetime import datetime, timezone
 from app.firebase import db
-from app.dependencies import get_current_user, User, ensure_can_view
+from app.dependencies import get_current_user, CurrentUser, CurrentUser, ensure_can_view
 from app.util_models import SetReactionRequest, ReactionStateResponse
 from app.services.session_event_bus import publish_session_event
 
@@ -19,14 +19,14 @@ def _inc_counts(counts: dict, emoji: str, delta: int):
     return counts
 
 @router.get("/sessions/{session_id}/reaction", response_model=ReactionStateResponse)
-async def get_reaction_state(session_id: str, current_user: User = Depends(get_current_user)):
+async def get_reaction_state(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     uid = current_user.uid
 
     sess_ref = db.collection("sessions").document(session_id)
     sess = sess_ref.get()
     if not sess.exists:
         raise HTTPException(status_code=404, detail="session not found")
-    ensure_can_view(sess.to_dict() or {}, uid, session_id)
+    ensure_can_view(sess.to_dict() or {}, current_user, session_id)
 
     counts = (sess.to_dict().get("reactionCounts") or {})
     my_ref = sess_ref.collection("reactions").document(uid)
@@ -47,7 +47,7 @@ async def get_reaction_state(session_id: str, current_user: User = Depends(get_c
 async def set_reaction(
     session_id: str, 
     req: SetReactionRequest, 
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     uid = current_user.uid
     new_emoji = req.emoji
@@ -59,7 +59,7 @@ async def set_reaction(
     sess = sess_ref.get()
     if not sess.exists:
         raise HTTPException(status_code=404, detail="session not found")
-    ensure_can_view(sess.to_dict() or {}, uid, session_id)
+    ensure_can_view(sess.to_dict() or {}, current_user, session_id)
     react_ref = sess_ref.collection("reactions").document(uid)
 
     @firestore.transactional

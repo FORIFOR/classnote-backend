@@ -148,10 +148,10 @@ class UsageLogger:
                 
         elif feature == "recording":
             increments["session_count"] = firestore.Increment(1)
-            if payload and payload.get("recording_sec"):
-                increments["total_recording_sec"] = firestore.Increment(
-                    float(payload.get("recording_sec", 0))
-                )
+            # if payload and payload.get("recording_sec"):
+            #     increments["total_recording_sec"] = firestore.Increment(
+            #         float(payload.get("recording_sec", 0))
+            #     )
                 
         elif feature == "share":
             increments["share_count"] = firestore.Increment(1)
@@ -175,6 +175,10 @@ class UsageLogger:
             rec_sec = float(payload.get("recording_sec", 0))
             rec_type = payload.get("type", "cloud") # "cloud" or "on_device"
             
+            # Aggregate total recording time here to ensure consistency
+            if rec_sec > 0:
+                increments["total_recording_sec"] = firestore.Increment(rec_sec)
+
             if rec_type == "cloud":
                 increments["total_recording_cloud_sec"] = firestore.Increment(rec_sec)
             elif rec_type == "on_device":
@@ -214,43 +218,15 @@ class UsageLogger:
         payload: Optional[Dict[str, Any]]
     ) -> None:
         """
-        [TRIPLE LOCK] Update monthly usage counters.
-        Path: users/{uid}/monthly_usage/{YYYY-MM} (JST)
+        [DEPRECATED] Monthly usage is now handled pre-flight by CostGuard.
+        Leaving this as a no-op to prevent double-counting.
         """
-        from datetime import timezone, timedelta
-        JST = timezone(timedelta(hours=9))
-        month_str = datetime.now(JST).strftime("%Y-%m")
-        doc_ref = db.collection("users").document(user_id).collection("monthly_usage").document(month_str)
-        
-        increments = {}
-        
-        # 1. Cloud STT (Seconds) - Only track success
-        if feature == "transcribe" and event_type == "success" and payload:
-            rec_sec = float(payload.get("recording_sec", 0))
-            rec_type = payload.get("type", "cloud")
-            if rec_type == "cloud" and rec_sec > 0:
-                increments["cloud_stt_sec"] = firestore.Increment(rec_sec)
-                
-        # 2. Cloud Sessions Started
-        if feature == "recording" and event_type == "invoke" and payload:
-            rec_type = payload.get("type", "cloud")
-            if rec_type == "cloud":
-                increments["cloud_sessions_started"] = firestore.Increment(1)
-
-        # 3. AI Generated (Summary/Quiz)
-        if event_type == "success":
-            if feature == "summary":
-                increments["summary_generated"] = firestore.Increment(1)
-                increments["llm_calls"] = firestore.Increment(1)
-            elif feature == "quiz":
-                increments["quiz_generated"] = firestore.Increment(1)
-                increments["llm_calls"] = firestore.Increment(1)
-            elif feature == "qa":
-                increments["llm_calls"] = firestore.Increment(1)
-             
-        if increments:
-             increments["updated_at"] = datetime.now(timezone.utc)
-             doc_ref.set(increments, merge=True)
+        pass
+        # from datetime import timezone, timedelta
+        # JST = timezone(timedelta(hours=9))
+        # month_str = datetime.now(JST).strftime("%Y-%m")
+        # doc_ref = db.collection("users").document(user_id).collection("monthly_usage").document(month_str)
+        # ...
 
     async def consume_free_cloud_credit(self, user_id: str) -> bool:
         """[DEPRECATED] vNext uses CostGuard. Always returns True."""

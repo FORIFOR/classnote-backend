@@ -3,7 +3,7 @@ from typing import Optional, List
 from datetime import datetime
 from google.cloud import firestore
 from app.firebase import db
-from app.dependencies import get_current_user, User
+from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.util_models import (
     QuizAttemptCreate,
     QuizAttempt,
@@ -17,7 +17,7 @@ router = APIRouter()
 async def create_quiz_attempt(
     session_id: str, 
     attempt: QuizAttemptCreate, 
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     uid = current_user.uid
     
@@ -94,7 +94,7 @@ async def create_quiz_attempt(
 async def get_quiz_analytics(
     from_date: Optional[datetime] = Query(None, alias="from"),
     to_date: Optional[datetime] = Query(None, alias="to"),
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     uid = current_user.uid
     
@@ -148,7 +148,7 @@ async def get_quiz_analytics(
 @router.get("/analytics/quiz/sessions", response_model=List[SessionQuizStat])
 async def get_session_quiz_stats(
     limit: int = 50,
-    current_user: User = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user)
 ):
     uid = current_user.uid
     

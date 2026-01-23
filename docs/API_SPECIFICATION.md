@@ -31,13 +31,31 @@ ClassnoteX (GlassnoteX) のバックエンド API 仕様書です。
 
 ---
 
-## 認証
+## 認証・アカウント
 
-Firebase Authentication を使用します。すべてのリクエストヘッダーに ID トークンを含めてください。
+ Firebase Authentication を使用します。すべてのリクエストヘッダーに ID トークンを含めてください。
 
-```http
-Authorization: Bearer <FIREBASE_ID_TOKEN>
-```
+ ```http
+ Authorization: Bearer <FIREBASE_ID_TOKEN>
+ ```
+
+ ### `GET /users/me`
+ 自分のユーザー情報と、紐付いているアカウント情報を取得します。
+
+ **Response:**
+ - `uid`: Firebase UID
+ - `accountId`: 電話番号から生成されたアカウントID (統一主キー)
+ - `needsPhoneVerification`: 未リンクの場合 true
+ - `plan`: `free` | `basic` | `premium` (アカウント単位のプラン)
+ - `credits`: 残枠情報
+
+ ### `POST /me/phone:link`
+ 現在のトークンに含まれる電話番号を使用して、アカウントを統合・リンクします。
+ 電話番号が同じであれば、ログイン方法が違っても同じ `accountId` に集約されます。
+
+ **Response:**
+ - `ok`: true
+ - `accountId`: 統合後のアカウントID
 
 ---
 
@@ -47,8 +65,9 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 ユーザーのセッション一覧を取得します。自分が所有するセッションと、共有されたセッションが含まれます。
 
 **Query Parameters:**
-- `userId` (Required): ユーザーID（通常は自分のUID）
-- `mode`: `lecture` | `meeting` (Optional)
+- `userId` (Optional): 下位互換性のため残されていますが、現在はトークンのユーザーが自動的に適用されます。
+ - `mode`: `lecture` | `meeting` (Optional)
+ - `kind`: `mine` (自分がオーナー) | `shared` (共有されたもの)
 
 ### `POST /sessions`
 新規セッションを作成します。
@@ -193,6 +212,8 @@ YouTube の字幕/文字起こしを取得してセッションを作成し、�
   "id": "lecture-xxx",
   "title": "...",
   "status": "transcribed",
+  "ownerUserId": "uid_abc",
+  "ownerAccountId": "acc_xyz",
   "summaryStatus": "completed",
   "summaryMarkdown": "## 要約...",
   "quizStatus": "completed",

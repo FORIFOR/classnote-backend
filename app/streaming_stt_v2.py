@@ -10,8 +10,8 @@ from google.api_core.client_options import ClientOptions
 logger = logging.getLogger("app.streaming_stt_v2")
 
 # Environment Config
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-REGION = os.environ.get("TASKS_LOCATION", "asia-northeast1")
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "classnote-x-dev"
+REGION = os.environ.get("TASKS_LOCATION") or os.environ.get("FUNCTION_REGION") or "asia-northeast1"
 RECOGNIZER_ID = os.environ.get("STT_RECOGNIZER_ID", "classnote-general-v2")
 
 def compute_audio_stats(pcm_bytes: bytes) -> dict:

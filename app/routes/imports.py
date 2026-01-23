@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.dependencies import User, get_current_user
+from app.dependencies import CurrentUser, get_current_user
 from app.routes.sessions import (
     _ensure_session_meta,
     _now_timestamp,
@@ -146,7 +146,7 @@ def _infer_duration_sec(items: List[dict]) -> Optional[float]:
 
 
 @router.post("/imports/youtube", response_model=ImportYouTubeResponse)
-async def import_youtube(req: ImportYouTubeRequest, current_user: User = Depends(get_current_user)):
+async def import_youtube(req: ImportYouTubeRequest, current_user: CurrentUser = Depends(get_current_user)):
     try:
         # Simple Validation using regex or urllib
         # Use existing parser to ensure it's a youtube ID, but pass the full URL to worker

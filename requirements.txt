@@ -18,5 +18,6 @@ httpx>=0.27.0
 yt-dlp>=2025.01.12 # Or latest
 youtube-transcript-api==0.6.3
 app-store-server-library>=1.0.0
-# Force Rebuild 2026-01-03
-# Force Rebuild 2026-01-21
+# Force Rebuild 2026-01-23 04:45
+google-generativeai>=0.3.0
+google-cloud-vision>=3.4.0
