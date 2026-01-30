@@ -49,12 +49,10 @@ def _ms_to_datetime(value: Optional[int]) -> Optional[datetime]:
 
 
 def _plan_for_product_id(product_id: Optional[str]) -> str:
-    # [SECURITY FIX] Return "free" instead of "pro" when product_id is missing
+    # [SECURITY FIX] Return "free" instead of "basic" when product_id is missing
     if not product_id:
         return "free"
     lowered = product_id.lower()
-    if "pro" in lowered or "premium" in lowered:
-        return "pro"
     if "basic" in lowered or "standard" in lowered:
         return "basic"
     # Default to free for unknown product IDs
@@ -326,23 +324,23 @@ async def confirm_ios_purchase(
         subscription_data, merge=True
     )
 
+    # [FIX] Create entitlement ID for linking
+    entitlement_id = f"apple:{original_transaction_id}" if original_transaction_id else None
+
     db.collection("users").document(current_user.uid).update({
         "plan": plan,
         "subscriptionPlatform": "ios",
         "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+        "appleEntitlementId": entitlement_id,  # [FIX] Set entitlement ID
     })
 
     # [Unified Account] Sync Plan to Account
     link_ref = db.collection("uid_links").document(current_user.uid)
     link_doc = link_ref.get()
+    account_id = None
     if link_doc.exists:
         account_id = link_doc.to_dict().get("accountId")
         if account_id:
-             # Ensure we only update if this user is the "standardOwner" or if nobody owns it yet?
-             # Actually, for a NEW purchase, this user effectively claims it.
-             # But strictly, the "phone" link logic handles owner.
-             # Here we just push the plan state if entitled.
-             
              # We should store expiresAt on the account for JIT checks
              update_data = {
                  "plan": plan,
@@ -350,21 +348,18 @@ async def confirm_ios_purchase(
                  "planUpdatedAt": firestore.SERVER_TIMESTAMP,
                  "lastTransactionId": fields.get("transactionId"),
                  "originalTransactionId": original_transaction_id,
+                 "appleEntitlementId": entitlement_id,  # [FIX] Set entitlement ID
              }
-             if entitled:
-                 # If we are entitled, we set the plan.
-                 # If not entitled (expired/revoked), we set 'free' (which is done by line 273 logic)
-                 pass
-            
+
              db.collection("accounts").document(account_id).set(update_data, merge=True)
-             
+
              # Log transition
              logger.info(
                  "subscription_state_transition",
                  extra={
                      "uid": current_user.uid,
                      "accountId": account_id,
-                     "fromPlan": "unknown", # We'd need to fetch to know, but maybe just log 'toPlan'
+                     "fromPlan": "unknown",
                      "toPlan": plan,
                      "reason": "purchase_confirm",
                      "transactionId": fields.get("transactionId"),
@@ -372,6 +367,56 @@ async def confirm_ios_purchase(
                      "expiresAt": fields.get("expiresDateMs")
                  }
              )
+
+    # [FIX] Create entitlements document (CRITICAL - /users/me checks this!)
+    if original_transaction_id and entitlement_id:
+        entitlement_ref = db.collection("entitlements").document(entitlement_id)
+        existing_entitlement = entitlement_ref.get()
+
+        entitlement_data = {
+            "status": status,
+            "plan": plan,
+            "productId": product_id,
+            "currentPeriodEnd": _ms_to_datetime(fields.get("expiresDateMs")),
+            "environment": fields.get("environment"),
+            "provider": "apple",
+            "providerEntitlementId": original_transaction_id,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedBy": "app_confirm",
+        }
+
+        if not existing_entitlement.exists:
+            # New entitlement - set owner
+            entitlement_data["ownerAccountId"] = account_id
+            entitlement_data["ownerUserId"] = current_user.uid
+            entitlement_data["createdAt"] = firestore.SERVER_TIMESTAMP
+            logger.info(
+                "entitlement_created",
+                extra={
+                    "entitlementId": entitlement_id,
+                    "ownerAccountId": account_id,
+                    "ownerUserId": current_user.uid,
+                    "plan": plan,
+                }
+            )
+        else:
+            # Existing entitlement - verify ownership
+            existing_data = existing_entitlement.to_dict()
+            existing_owner = existing_data.get("ownerAccountId")
+            if existing_owner and existing_owner != account_id:
+                logger.warning(
+                    "entitlement_ownership_conflict",
+                    extra={
+                        "entitlementId": entitlement_id,
+                        "existingOwner": existing_owner,
+                        "requestingAccount": account_id,
+                        "requestingUid": current_user.uid,
+                    }
+                )
+                # Don't overwrite owner, but still update status
+                # (This allows the original owner to keep entitlement)
+
+        entitlement_ref.set(entitlement_data, merge=True)
 
     return BillingConfirmResponse(
         ok=True,
@@ -458,6 +503,7 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
             # [Unified Account] Sync to Account
             link_ref = db.collection("uid_links").document(uid)
             link_doc = link_ref.get()
+            account_id = None
             if link_doc.exists:
                 account_id = link_doc.to_dict().get("accountId")
                 if account_id:
@@ -467,8 +513,9 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                         "planUpdatedAt": firestore.SERVER_TIMESTAMP,
                         "lastTransactionId": fields.get("transactionId"),
                         "originalTransactionId": original_transaction_id,
+                        "appleEntitlementId": f"apple:{original_transaction_id}" if original_transaction_id else None,
                     }, merge=True)
-                    
+
                     logger.info(
                          "subscription_state_transition",
                          extra={
@@ -480,6 +527,30 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                              "expiresAt": fields.get("expiresDateMs")
                          }
                      )
+
+            # Update entitlements collection (source of truth)
+            if original_transaction_id:
+                entitlement_id = f"apple:{original_transaction_id}"
+                entitlement_ref = db.collection("entitlements").document(entitlement_id)
+                entitlement_update = {
+                    "status": status,
+                    "plan": plan,
+                    "productId": product_id,
+                    "currentPeriodEnd": _ms_to_datetime(fields.get("expiresDateMs")),
+                    "environment": fields.get("environment"),
+                    "lastNotificationType": notification_type,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "updatedBy": "webhook",
+                }
+                # Only set ownerAccountId/ownerUserId if not already set (don't overwrite)
+                existing_entitlement = entitlement_ref.get()
+                if not existing_entitlement.exists:
+                    entitlement_update["provider"] = "apple"
+                    entitlement_update["providerEntitlementId"] = original_transaction_id
+                    entitlement_update["ownerAccountId"] = account_id
+                    entitlement_update["ownerUserId"] = uid
+                    entitlement_update["createdAt"] = firestore.SERVER_TIMESTAMP
+                entitlement_ref.set(entitlement_update, merge=True)
 
             db.collection("users").document(uid).collection("subscriptions").document("apple").set(
                 {
@@ -493,6 +564,7 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                 "plan": plan,
                 "subscriptionPlatform": "ios",
                 "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+                "appleEntitlementId": f"apple:{original_transaction_id}" if original_transaction_id else None,
             })
         else:
             logger.warning(

@@ -33,7 +33,9 @@ class AppStoreService:
         self.key_id = os.getenv("APPLE_KEY_ID")
         self.private_key = os.getenv("APPLE_KEY_P8")
         self.bundle_id = os.getenv("APPLE_BUNDLE_ID")
-        self.app_apple_id = os.getenv("APPLE_APPLE_ID")
+        # app_apple_id must be an int for SignedDataVerifier
+        app_apple_id_str = os.getenv("APPLE_APPLE_ID")
+        self.app_apple_id = int(app_apple_id_str) if app_apple_id_str else None
         self.environment = VerifierEnvironment.SANDBOX  # Default to Sandbox, override checking logic later or via Env
         self.client_environment = ClientEnvironment.SANDBOX
         self.enable_online_checks = True
@@ -53,26 +55,33 @@ class AppStoreService:
                 formatted_key = self.private_key.replace("\\n", "\n")
                 if "-----BEGIN PRIVATE KEY-----" not in formatted_key:
                      formatted_key = f"-----BEGIN PRIVATE KEY-----\n{formatted_key}\n-----END PRIVATE KEY-----"
+                # Encode to bytes for cryptography library
+                formatted_key_bytes = formatted_key.encode("utf-8")
 
+                print("[Apple] Creating AppStoreServerAPIClient...")
                 self.client = AppStoreServerAPIClient(
-                    formatted_key,
+                    formatted_key_bytes,
                     self.key_id,
                     self.issuer_id,
                     self.bundle_id,
                     self.client_environment
                 )
-                
+                print("[Apple] AppStoreServerAPIClient created successfully.")
+
                 cert_dir = os.getenv(
                     "APPLE_ROOT_CERT_DIR",
                     os.path.normpath(
                         os.path.join(os.path.dirname(__file__), "..", "certs", "apple")
                     ),
                 )
+                print(f"[Apple] Loading root certificates from: {cert_dir}")
                 root_certificates = _load_root_certificates(cert_dir)
+                print(f"[Apple] Loaded {len(root_certificates)} root certificates (sizes: {[len(c) for c in root_certificates]})")
 
                 online_checks_env = os.getenv("APPLE_ENABLE_ONLINE_CHECKS", "true")
                 self.enable_online_checks = online_checks_env.lower() in {"1", "true", "yes"}
-                
+
+                print(f"[Apple] Creating SignedDataVerifier with app_apple_id={self.app_apple_id} (type={type(self.app_apple_id).__name__})...")
                 self.verifier = SignedDataVerifier(
                     root_certificates,
                     self.enable_online_checks,
@@ -80,13 +89,11 @@ class AppStoreService:
                     self.bundle_id,
                     self.app_apple_id
                 )
-                logger.info(
-                    "AppStoreService initialized in %s mode (online_checks=%s).",
-                    self.environment.name,
-                    self.enable_online_checks,
-                )
+                print(f"[Apple] AppStoreService initialized in {self.environment.name} mode (online_checks={self.enable_online_checks}).")
             except Exception as e:
-                logger.error(f"Failed to initialize AppStoreService: {e}")
+                import traceback
+                print(f"[Apple] ERROR: Failed to initialize AppStoreService: {e}")
+                print(traceback.format_exc())
         else:
             logger.warning("AppStoreService not initialized. Missing environment variables.")
 
@@ -98,8 +105,29 @@ class AppStoreService:
                 "error_message": "AppStoreService verifier not initialized.",
             }
         try:
-            decoded = self.verifier.verify_and_decode_transaction(signed_payload)
-            return vars(decoded), None
+            decoded = self.verifier.verify_and_decode_signed_transaction(signed_payload)
+            # Extract all known fields using getattr (slots-compatible)
+            result = {
+                'originalTransactionId': getattr(decoded, 'originalTransactionId', None),
+                'transactionId': getattr(decoded, 'transactionId', None),
+                'productId': getattr(decoded, 'productId', None),
+                'bundleId': getattr(decoded, 'bundleId', None),
+                'environment': getattr(decoded, 'environment', None),
+                'expiresDate': getattr(decoded, 'expiresDate', None),
+                'appAccountToken': getattr(decoded, 'appAccountToken', None),
+                'originalPurchaseDate': getattr(decoded, 'originalPurchaseDate', None),
+                'purchaseDate': getattr(decoded, 'purchaseDate', None),
+                'signedDate': getattr(decoded, 'signedDate', None),
+                'inAppOwnershipType': getattr(decoded, 'inAppOwnershipType', None),
+                'subscriptionGroupIdentifier': getattr(decoded, 'subscriptionGroupIdentifier', None),
+                'isUpgraded': getattr(decoded, 'isUpgraded', None),
+                'revocationDate': getattr(decoded, 'revocationDate', None),
+                'revocationReason': getattr(decoded, 'revocationReason', None),
+                'offerType': getattr(decoded, 'offerType', None),
+                'offerIdentifier': getattr(decoded, 'offerIdentifier', None),
+            }
+            print(f"[Apple] Decoded: otid={result.get('originalTransactionId')}, productId={result.get('productId')}")
+            return result, None
         except Exception as e:
             return None, {
                 "stage": "verify",
