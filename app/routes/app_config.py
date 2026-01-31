@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
 
-from app.admin_auth import require_admin
+from app.admin_auth import get_current_admin_user
 from app.services.app_config import (
     get_app_config,
     update_app_config,
@@ -82,7 +82,7 @@ async def get_config(
 @router.post("/admin/app-config", response_model=AppConfigResponse, include_in_schema=False)
 async def admin_update_config(
     update: AppConfigUpdate,
-    _admin=Depends(require_admin),
+    _admin=Depends(get_current_admin_user),
 ):
     """
     Update app configuration (admin only).
@@ -100,7 +100,7 @@ async def admin_toggle_maintenance(
     message: Optional[str] = None,
     eta: Optional[datetime] = None,
     allow_limited_mode: bool = True,
-    _admin=Depends(require_admin),
+    _admin=Depends(get_current_admin_user),
 ):
     """
     Quick toggle for maintenance mode (admin only).
@@ -124,7 +124,7 @@ async def admin_toggle_maintenance(
 async def admin_toggle_feature(
     feature: str,
     enabled: bool,
-    _admin=Depends(require_admin),
+    _admin=Depends(get_current_admin_user),
 ):
     """
     Toggle a single feature flag (admin only).
@@ -158,7 +158,7 @@ async def admin_toggle_feature(
 
 
 @router.get("/admin/app-config", response_model=AppConfigResponse, include_in_schema=False)
-async def admin_get_config(_admin=Depends(require_admin)):
+async def admin_get_config(_admin=Depends(get_current_admin_user)):
     """
     Get current app configuration (admin only, bypasses cache).
     """
