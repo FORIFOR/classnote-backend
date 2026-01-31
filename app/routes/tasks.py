@@ -9,6 +9,7 @@ from app.services.llm import (
     clean_quiz_markdown,
     answer_question,
     translate_text,
+    generate_playlist_timeline,
 )
 from app.services.transcripts import resolve_transcript_text
 from app.services.usage import usage_logger
@@ -20,6 +21,7 @@ from app.services.account_deletion import (
     REQUESTS_COLLECTION,
     deletion_lock_id,
 )
+from app.services.app_config import is_feature_enabled
 import logging
 import json
 from datetime import datetime, timezone
@@ -54,6 +56,11 @@ async def _handle_summarize_task_core(request: Request):
     Cloud Tasks Worker for Summarization.
     Decrement inflight count on completion.
     """
+    # [FeatureGate] Check if summarization is enabled
+    if not is_feature_enabled("summarization"):
+        logger.warning("[FeatureGate] Summarization feature is disabled, skipping task")
+        return {"status": "skipped", "reason": "feature_disabled"}
+
     try:
         payload = await request.json()
     except Exception:
@@ -68,9 +75,14 @@ async def _handle_summarize_task_core(request: Request):
     if not session_id:
         logger.error("sessionId is missing")
         return {"status": "error", "message": "sessionId required"}
-    
+
     # Attempt to use payload user_id, will refine from DB if needed
-    final_user_id = user_id 
+    final_user_id = user_id
+
+    # [FIX] Initialize cost_guard variables at top level for exception handler scope
+    cost_guard_id = None
+    cost_guard_mode = "user"
+    has_consumed = False
 
     try:
 
@@ -94,9 +106,15 @@ async def _handle_summarize_task_core(request: Request):
         data = doc.to_dict()
         # [Security] Resolve User ID if missing
         if not final_user_id:
-            final_user_id = data.get("ownerUserId") or data.get("userId") 
+            final_user_id = data.get("ownerUserId") or data.get("userId")
             old_uid = data.get("ownerUid")
             if not final_user_id: final_user_id = old_uid
+
+        # [FIX] Resolve account ID for cost guard
+        owner_account_id = data.get("ownerAccountId")
+        cost_guard_id = owner_account_id or final_user_id
+        cost_guard_mode = "account" if owner_account_id else "user"
+        has_consumed = False  # Track if we've consumed quota for refund on failure
 
         transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
@@ -144,7 +162,17 @@ async def _handle_summarize_task_core(request: Request):
             "jobId": job_id,
         }, merge=True)
 
-        # [CostGuard] Shifted to VIP/API layer to avoid "Ghost Jobs"
+        # [FIX] CostGuard - Count usage when task actually executes (not just at API layer)
+        if not usage_reserved and cost_guard_id:
+            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode)
+            if not allowed:
+                logger.warning(f"[CostGuard] BLOCKED summary {session_id} for {cost_guard_id}. Monthly limit exceeded.")
+                err_msg = "Monthly summary limit exceeded"
+                doc_ref.update({"summaryStatus": "locked", "summaryError": err_msg})
+                derived_ref.set({"status": "locked", "errorReason": err_msg, "updatedAt": datetime.now(timezone.utc)}, merge=True)
+                return {"status": "blocked", "error": err_msg}
+            has_consumed = True
+            logger.info(f"[CostGuard] Reserved summary_generated for {cost_guard_id} ({cost_guard_mode})")
 
         # ops_logger: job started
         logger.info(f"Starting summary task for {session_id} job={job_id}")
@@ -213,6 +241,11 @@ async def _handle_summarize_task_core(request: Request):
         return {"status": "completed"}
 
     except Exception as e:
+        # [FIX] Refund quota on failure
+        if has_consumed and cost_guard_id:
+            await cost_guard.refund_consumption(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode)
+            logger.info(f"[CostGuard] Refunded summary_generated for {cost_guard_id} due to failure")
+
         logger.exception(f"Summarization failed for session {session_id}")
 
         # ops_logger: LLM/job failed
@@ -325,9 +358,10 @@ async def handle_import_youtube_task(request: Request):
         # Trigger Next Steps
         from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
         # [Security] Pass userId to keep inflight tracking correct if they implement handling
+        # [FIX] Use session-based idempotency key to prevent duplicate consumption
         uid = final_user_id
-        enqueue_summarize_task(session_id, user_id=uid)
-        enqueue_quiz_task(session_id, user_id=uid)
+        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
+        enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
         
         logger.info(f"YouTube Import Success for {session_id}")
 
@@ -371,6 +405,11 @@ async def _handle_quiz_task_core(request: Request):
     Cloud Tasks Quiz Worker.
     Decrement inflight count on completion.
     """
+    # [FeatureGate] Check if quiz feature is enabled
+    if not is_feature_enabled("quiz"):
+        logger.warning("[FeatureGate] Quiz feature is disabled, skipping task")
+        return {"status": "skipped", "reason": "feature_disabled"}
+
     try:
         payload = await request.json()
     except Exception:
@@ -385,8 +424,13 @@ async def _handle_quiz_task_core(request: Request):
 
     if not session_id:
         return {"status": "error", "message": "session_id required"}
-    
+
     final_user_id = user_id
+
+    # [FIX] Initialize cost_guard variables at top level for exception handler scope
+    cost_guard_id = None
+    cost_guard_mode = "user"
+    has_consumed = False
 
     try:
         # [FIX] Initialize DB locally
@@ -407,6 +451,12 @@ async def _handle_quiz_task_core(request: Request):
         data = doc.to_dict()
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
+
+        # [FIX] Resolve account ID for cost guard
+        owner_account_id = data.get("ownerAccountId")
+        cost_guard_id = owner_account_id or final_user_id
+        cost_guard_mode = "account" if owner_account_id else "user"
+        has_consumed = False  # Track if we've consumed quota for refund on failure
 
         transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
@@ -444,7 +494,17 @@ async def _handle_quiz_task_core(request: Request):
             "status": "テスト生成",
         })
 
-        # [CostGuard] Shifted to VIP/API layer
+        # [FIX] CostGuard - Count usage when task actually executes (not just at API layer)
+        if not usage_reserved and cost_guard_id:
+            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode)
+            if not allowed:
+                logger.warning(f"[CostGuard] BLOCKED quiz {session_id} for {cost_guard_id}. Monthly limit exceeded.")
+                err_msg = "Monthly quiz limit exceeded"
+                doc_ref.update({"quizStatus": "locked", "quizError": err_msg})
+                derived_ref.set({"status": "locked", "errorReason": err_msg, "updatedAt": datetime.now(timezone.utc)}, merge=True)
+                return {"status": "blocked", "error": err_msg}
+            has_consumed = True
+            logger.info(f"[CostGuard] Reserved quiz_generated for {cost_guard_id} ({cost_guard_mode})")
 
         # ops_logger: job started
         log_job_transition(session_id, "quiz", "started", uid=final_user_id, job_id=job_id)
@@ -482,6 +542,11 @@ async def _handle_quiz_task_core(request: Request):
         return {"status": "completed"}
 
     except Exception as e:
+        # [FIX] Refund quota on failure
+        if has_consumed and cost_guard_id:
+            await cost_guard.refund_consumption(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode)
+            logger.info(f"[CostGuard] Refunded quiz_generated for {cost_guard_id} due to failure")
+
         logger.exception(f"Quiz generation failed for session {session_id}")
 
         # ops_logger: LLM/job failed
@@ -491,7 +556,7 @@ async def _handle_quiz_task_core(request: Request):
             await usage_logger.log(user_id=final_user_id, feature="quiz", event_type="error", session_id=session_id)
         error_str = str(e)
         is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
-        
+
         if is_transient:
              logger.warning(f"Transient error detected for quiz {session_id}, raising 503 for retry.")
              raise HTTPException(status_code=503, detail="Transient error, retrying...")
@@ -609,16 +674,28 @@ async def _handle_playlist_task_core(request: Request):
 
     except Exception as e:
         logger.exception(f"Playlist failed for {session_id}")
+        ts = datetime.now(timezone.utc)
+
+        # [FIX] Update session document status to "failed"
+        try:
+            doc_ref.update({
+                "playlistStatus": "failed",
+                "playlistError": str(e)[:500],  # Truncate long errors
+                "playlistUpdatedAt": ts
+            })
+        except Exception as update_err:
+            logger.error(f"Failed to update session playlistStatus: {update_err}")
+
         if job_id:
              db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
-        
+
         derived_ref.set({
-            "status": "failed", 
-            "errorReason": str(e),
-            "updatedAt": datetime.now(timezone.utc),
-             "jobId": job_id
+            "status": "failed",
+            "errorReason": str(e)[:500],
+            "updatedAt": ts,
+            "jobId": job_id
         }, merge=True)
-        
+
         return {"status": "failed", "error": str(e)}
 
 
@@ -653,33 +730,9 @@ async def handle_generate_highlights(request: Request):
     return {"status": "failed", "reason": "deprecated"}
 
 
-@router.post("/internal/tasks/playlist")
-async def handle_playlist_task(request: Request):
-    """
-    端末同期後にプレイリスト（再生リスト）を生成するワーカー。
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    session_id = payload.get("sessionId")
-    if not session_id:
-        return {"status": "error", "message": "sessionId required"}
-
-    from google.cloud import firestore
-    import os
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-    db = firestore.Client(project=project_id)
-
-    doc_ref = db.collection("sessions").document(session_id)
-    doc_ref.update({
-        "playlistStatus": "failed",
-        "playlistError": "deprecated",
-        "playlistUpdatedAt": datetime.now(timezone.utc),
-    })
-    return {"status": "failed", "reason": "deprecated"}
-
+# [REMOVED] Duplicate deprecated playlist handler - the real implementation is at line 574
+# FastAPI registers routes in order, and having two handlers for the same path
+# causes the second one to override the first.
 
 @router.post("/internal/tasks/audio-cleanup")
 async def handle_audio_cleanup_task():
@@ -859,133 +912,7 @@ async def handle_account_deletion_sweep():
         if not uid:
             continue
 
-@router.post("/internal/tasks/nuke_user")
-async def handle_nuke_user_task(request: Request):
-    """
-    [CRITICAL] Nuke User Worker.
-    Completely wipe a user's account and data.
-    """
-    try:
-        payload = await request.json()
-        user_id = payload.get("userId")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    if not user_id:
-        return {"status": "error", "message": "userId required"}
-
-    logger.info(f"[NukeUser] Starting complete account wipe for {user_id}")
-    
-    # [FIX] Initialize DB locally
-    from google.cloud import firestore
-    import os
-    try:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
-    except Exception as e:
-        logger.error(f"Failed to init local DB: {e}")
-        return {"status": "failed", "error": f"DB Init Failed: {e}"}
-
-    # 1. Update status to RUNNING
-    user_ref = db.collection("users").document(user_id)
-    user_ref.set({
-        "deletion": {"state": "running", "startedAt": datetime.now(timezone.utc)}
-    }, merge=True)
-
-    try:
-        # 2. Delete All Sessions (Cascade)
-        from app.routes.sessions import _cascade_delete_session # Ideally move to service, but importing from routes for now
-        
-        # We need to find ALL sessions where this user is owner or participant?
-        # Typically NUKE only deletes owned sessions.
-        # Shared sessions where user is participant: remove member from them.
-        
-        # A. Owned Sessions
-        owned_docs = list(db.collection("sessions").where("ownerUid", "==", user_id).stream())
-        logger.info(f"[NukeUser] Found {len(owned_docs)} owned sessions to delete.")
-        
-        deleted_count = 0
-        for doc in owned_docs:
-            try:
-                # Reuse existing logic (assuming local import works or refactor preferred)
-                # _cascade_delete_session is in routes.sessions, which might have deps.
-                # For safety/cleanliness, we should assume we refactored it or import it here.
-                # Given the context, I will implement a service helper in step 1.
-                # Here I assume app.services.session_cleanup.cascade_delete_session exists.
-                from app.services.session_cleanup import cascade_delete_session
-                
-                success = cascade_delete_session(doc.id, doc.to_dict(), user_id, db=db)
-                if success: deleted_count += 1
-            except Exception as e:
-                logger.error(f"[NukeUser] Failed to delete session {doc.id}: {e}")
-
-        # B. Shared/Participating Sessions (Remove me from them)
-        # Query session_members where userId == uid
-        member_docs = list(db.collection("session_members").where("userId", "==", user_id).stream())
-        logger.info(f"[NukeUser] Found {len(member_docs)} memberships to remove.")
-        
-        for mdoc in member_docs:
-            try:
-                d = mdoc.to_dict()
-                sid = d.get("sessionId")
-                if sid:
-                    # Remove from session doc arrays
-                    sess_ref = db.collection("sessions").document(sid)
-                    sess_ref.update({
-                        "participantUserIds": firestore.ArrayRemove([user_id]),
-                        "sharedWithUserIds": firestore.ArrayRemove([user_id]),
-                        f"participants.{user_id}": firestore.DELETE_FIELD
-                    })
-                # Delete member doc
-                mdoc.reference.delete()
-            except Exception as e:
-                 logger.warning(f"[NukeUser] Failed to remove membership {mdoc.id}: {e}")
-
-        # 3. Delete Sub-collections / Meta
-        # users/{uid}/sessionMeta
-        meta_coll = user_ref.collection("sessionMeta")
-        _delete_collection(meta_coll)
-        
-        # users/{uid}/usage_logs (if exists)
-        # users/{uid}/payments (if exists) - usually keep for audit? 
-        # Requirement says "Complete Delete". Let's delete sessionMeta at least.
-        
-        # 4. Delete Link Docs
-        try:
-            db.collection("uid_links").document(user_id).delete()
-            # If phone exists, delete phone doc?
-            # We don't know the phone number easily unless we read user doc first.
-            udata = user_ref.get().to_dict() or {}
-            phone = udata.get("phoneNumber")
-            if phone:
-                db.collection("phone_numbers").document(phone).delete()
-        except Exception as e:
-            logger.warning(f"[NukeUser] Failed to delete links: {e}")
-
-        # 5. Firebase Auth Delete (Backend)
-        try:
-            from firebase_admin import auth
-            auth.delete_user(user_id)
-            logger.info(f"[NukeUser] Deleted Auth user {user_id}")
-        except Exception as e:
-             logger.error(f"[NukeUser] Failed to delete Auth user: {e}")
-             # Non-fatal? We marked DB as deleted.
-
-        # 6. Mark as DONE (or delete user doc)
-        # If we delete user doc, GET /me:delete/status returns "done" (implicitly).
-        # But we might want to keep a tombstone?
-        # "Complete wipe" implies deleting user doc.
-        user_ref.delete()
-        
-        logger.info(f"[NukeUser] Completed nuke for {user_id}. Deleted {deleted_count} sessions.")
-        return {"status": "completed", "deletedSessions": deleted_count}
-
-    except Exception as e:
-        logger.exception(f"[NukeUser] Failed: {e}")
-        user_ref.set({
-            "deletion": {"state": "failed", "error": str(e), "updatedAt": datetime.now(timezone.utc)}
-        }, merge=True)
-        return {"status": "failed", "error": str(e)}
+## First nuke_user handler removed - using consolidated handler below (handle_nuke_user_task_v2)
 
 def _delete_collection(coll_ref, batch_size=50):
     docs = list(coll_ref.limit(batch_size).stream())
@@ -1220,6 +1147,11 @@ async def _handle_transcribe_task_core(request: Request):
     """
     Cloud Tasks から呼び出される Transcribe Worker エンドポイント。
     """
+    # [FeatureGate] Check if cloudStt feature is enabled
+    if not is_feature_enabled("cloudStt"):
+        logger.warning("[FeatureGate] Cloud STT feature is disabled, skipping task")
+        return {"status": "skipped", "reason": "feature_disabled"}
+
     try:
         payload = await request.json()
     except Exception:
@@ -1460,29 +1392,24 @@ async def _handle_transcribe_task_core(request: Request):
                 user_doc = db.collection("users").document(uid).get()
                 if user_doc.exists and user_doc.to_dict().get("plan", "free") == "free":
                     from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-                    
+
+                    # [FIX] Use session-based idempotency key to prevent duplicate consumption
                     logger.info(f"[FreePlan] Auto-triggering Summary/Quiz for {session_id}")
-                    enqueue_summarize_task(session_id, user_id=uid)
-                    enqueue_quiz_task(session_id, count=3, user_id=uid) # Default 3 questions for free?
+                    enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
+                    enqueue_quiz_task(session_id, count=3, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
             except Exception as e:
                 logger.error(f"[FreePlan] Auto-trigger failed: {e}")
 
         # [NEW] Log Usage for Cloud STT
+        # NOTE: usage_logger is imported at file level (line 15)
         try:
-             # Calculate duration if possible (from metadata or audio file size?)
-             # Here we rely on data.get("durationSec") or audio_info
-             # If not available, we might log 0 or approximate?
              duration_sec = data.get("durationSec")
              if not duration_sec and audio_info.get("durationSec"):
                  duration_sec = audio_info.get("durationSec")
-             
+
              if duration_sec:
-                 from app.services.usage import usage_logger
-                 # We need user_id. 'ownerUserId' (new) or 'userId' (old)
                  uid = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
                  if uid:
-                     # Since this is a background task, await might need loop?
-                     # No, this is an async def, so await is fine.
                      await usage_logger.log(
                         user_id=uid,
                         session_id=session_id,
@@ -1497,10 +1424,11 @@ async def _handle_transcribe_task_core(request: Request):
             logger.warning(f"Failed to log usage for transcribe task {session_id}: {e}")
 
         # Trigger downstream
+        # [FIX] Use session-based idempotency key to prevent duplicate consumption
         if should_update_main and transcript_text:
              from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-             enqueue_summarize_task(session_id, user_id=final_user_id)
-             enqueue_quiz_task(session_id, user_id=final_user_id)
+             enqueue_summarize_task(session_id, user_id=final_user_id, idempotency_key=f"auto_summary:{session_id}")
+             enqueue_quiz_task(session_id, user_id=final_user_id, idempotency_key=f"auto_quiz:{session_id}")
 
         return {"status": "completed"}
 
@@ -1629,12 +1557,12 @@ async def handle_transcribe_task_deprecated(request: Request):
             
             # Trigger Auto-Summary if needed
             # Only if we just updated the main transcript
+            # [FIX] Use session-based idempotency key to prevent duplicate consumption
             if updates.get("transcriptText"):
                  from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-                 # Use data.get("ownerUserId") or data.get("userId") for uid
                  uid = data.get("ownerUserId") or data.get("userId")
-                 enqueue_summarize_task(session_id, user_id=uid)
-                 enqueue_quiz_task(session_id, user_id=uid)
+                 enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
+                 enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
 
             logger.info(f"Transcribe task completed for {session_id}, job_id={job_id}")
             return {"status": "completed", "engine": "google"}
@@ -1780,13 +1708,17 @@ async def handle_cleanup_sessions_task(request: Request):
 @router.post("/internal/tasks/nuke_user")
 async def handle_nuke_user_task(request: Request):
     """
-    [DANGER] Completely wipe a user account and all associated data.
-    1. List all sessions
-    2. For each session:
-       - Delete GCS Objects (Audio/Images)
-       - Delete Subcollections (jobs, derived, etc)
-       - Delete Session Doc
-    3. Delete User Data (sessionMeta, Claims, CurrentUser Doc, Auth)
+    [CRITICAL] Complete account deletion worker.
+
+    Deletes ALL user data:
+    - All owned sessions (with cascade: audio, images, subcollections)
+    - Removes user from shared sessions
+    - User document and subcollections (sessionMeta, subscriptions, etc.)
+    - Account (if sole owner) or removes from account members
+    - uid_links, phone_numbers
+    - Apple subscription data (transactions, tokens, entitlements)
+    - Share links, username claims
+    - Firebase Auth user
     """
     try:
         payload = await request.json()
@@ -1797,100 +1729,41 @@ async def handle_nuke_user_task(request: Request):
     if not user_id:
         return {"status": "error", "message": "userId required"}
 
-    logger.warning(f"[NUKE] Starting Account Deletion for {user_id}")
-    
-    # Init DB & Storage
-    from google.cloud import firestore, storage
-    import os
-    from app.firebase import AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
-    
-    try:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
-        storage_client = storage.Client(project=project_id)
-    except Exception as e:
-        logger.error(f"[NUKE] DB/Storage Init Failed: {e}")
-        return {"status": "failed", "error": f"Init Failed: {e}"}
+    logger.warning(f"[NUKE] Starting complete account deletion for {user_id}")
 
-    try:
-        # 2. Delete All Sessions (Cascade)
-        from app.services.session_cleanup import cascade_delete_session
-        
-        # We need to find ALL sessions where this user is owner or participant?
-        # Typically NUKE only deletes owned sessions.
-        # Shared sessions where user is participant: remove member from them.
-        
-        # A. Owned Sessions
-        owned_docs = list(db.collection("sessions").where("ownerUid", "==", user_id).stream())
-        logger.info(f"[NukeUser] Found {len(owned_docs)} owned sessions to delete.")
-        
-        deleted_count = 0
-        for doc in owned_docs:
-            try:
-                success = cascade_delete_session(doc.id, doc.to_dict(), user_id, db=db)
-                if success: deleted_count += 1
-            except Exception as e:
-                logger.error(f"[NukeUser] Failed to delete session {doc.id}: {e}")
-    except Exception as e:
-        logger.error(f"[NukeUser] Error during session wipe: {e}")
+    # Use the comprehensive nuke service
+    from app.services.session_cleanup import nuke_user_complete
 
-    logger.info("[NUKE] All sessions wiped.")
+    result = nuke_user_complete(user_id)
 
-    # --- Step 2: Delete User Subcollections ---
-    user_ref = db.collection("users").document(user_id)
-    delete_collection(user_ref.collection("sessionMeta"))
-    delete_collection(user_ref.collection("devices")) # If exists
+    # Finalize deletion request/lock if exists
+    if result.get("status") == "completed":
+        try:
+            from google.cloud import firestore as fs
+            import os
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+            db = fs.Client(project=project_id)
 
-    # --- Step 3: Delete Username Claim ---
-    # Need to read user doc first to know username
-    user_doc = user_ref.get()
-    if user_doc.exists:
-        u_data = user_doc.to_dict()
-        username = u_data.get("username") or u_data.get("usernameLower")
-        if username:
-            try:
-                db.collection("username_claims").document(username).delete()
-                logger.info(f"[NUKE] Released username {username}")
-            except Exception as e:
-                logger.error(f"[NUKE] Failed username release: {e}")
-
-    # --- Step 4: Delete User Doc ---
-    user_ref.delete()
-    logger.info(f"[NUKE] User doc {user_id} deleted.")
-
-    # --- Step 5: Firebase Auth ---
-    try:
-        from firebase_admin import auth
-        auth.delete_user(user_id)
-        logger.info(f"[NUKE] Firebase Auth user {user_id} deleted.")
-    except Exception as e:
-        # Ignore if already deleted
-        logger.warning(f"[NUKE] Auth deletion warning (might be already deleted): {e}")
-
-    # --- Step 6: Finalize deletion request/lock ---
-    try:
-        req_ref = db.collection(REQUESTS_COLLECTION).document(user_id)
-        req_doc = req_ref.get()
-        if req_doc.exists:
-            req_data = req_doc.to_dict() or {}
-            email_lower = req_data.get("emailLower")
-            provider_id = req_data.get("providerId") or req_data.get("provider")
-            if email_lower and provider_id:
-                lock_id = deletion_lock_id(email_lower, provider_id)
-                db.collection(LOCKS_COLLECTION).document(lock_id).delete()
-            now = datetime.now(timezone.utc)
-            req_ref.update(
-                {
+            req_ref = db.collection(REQUESTS_COLLECTION).document(user_id)
+            req_doc = req_ref.get()
+            if req_doc.exists:
+                req_data = req_doc.to_dict() or {}
+                email_lower = req_data.get("emailLower")
+                provider_id = req_data.get("providerId") or req_data.get("provider")
+                if email_lower and provider_id:
+                    lock_id = deletion_lock_id(email_lower, provider_id)
+                    db.collection(LOCKS_COLLECTION).document(lock_id).delete()
+                now = datetime.now(timezone.utc)
+                req_ref.update({
                     "status": "deleted",
                     "deletedAt": now,
                     "updatedAt": now,
-                }
-            )
-    except Exception as e:
-        logger.warning(f"[NUKE] Failed to finalize deletion request for {user_id}: {e}")
+                })
+        except Exception as e:
+            logger.warning(f"[NUKE] Failed to finalize deletion request for {user_id}: {e}")
 
-    logger.info(f"[NUKE] SUCCESS. Account {user_id} is gone.")
-    return {"status": "completed", "user_id": user_id}
+    logger.info(f"[NUKE] Result for {user_id}: {result}")
+    return result
 @router.post("/internal/tasks/merge_migration")
 async def handle_merge_migration_task(request: Request):
     """

@@ -7,7 +7,7 @@ print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -133,6 +133,8 @@ app.include_router(ads.router, tags=["Ads"])
 from app.routes import quiz_analytics
 app.include_router(quiz_analytics.router, tags=["Quiz Analytics"])
 
+# [NEW] App Config (Maintenance Mode / Feature Flags)
+app.include_router(app_config.router, tags=["App Config"])
 
 if usage_router_available:
     app.include_router(usage.router, tags=["Usage"])

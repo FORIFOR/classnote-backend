@@ -15,6 +15,7 @@ from app.routes.sessions import (
     _upsert_session_member,
 )
 from app.task_queue import enqueue_quiz_task, enqueue_summarize_task
+from app.services.app_config import is_feature_enabled, get_maintenance_error_response
 from app.util_models import ImportYouTubeRequest, ImportYouTubeResponse, YouTubeCheckRequest, YouTubeCheckResponse, YouTubeTrack
 
 router = APIRouter()
@@ -147,6 +148,10 @@ def _infer_duration_sec(items: List[dict]) -> Optional[float]:
 
 @router.post("/imports/youtube", response_model=ImportYouTubeResponse)
 async def import_youtube(req: ImportYouTubeRequest, current_user: CurrentUser = Depends(get_current_user)):
+    # [FeatureGate] Check if YouTube import is enabled
+    if not is_feature_enabled("youtubeImport"):
+        raise HTTPException(status_code=503, detail=get_maintenance_error_response("youtubeImport"))
+
     try:
         # Simple Validation using regex or urllib
         # Use existing parser to ensure it's a youtube ID, but pass the full URL to worker
@@ -218,8 +223,9 @@ async def import_youtube(req: ImportYouTubeRequest, current_user: CurrentUser = 
     if has_transcript:
         # Transcript provided: Bypass download/STT and trigger Summary/Quiz directly
         try:
-            enqueue_summarize_task(session_id, user_id=owner_uid)
-            enqueue_quiz_task(session_id, user_id=owner_uid)
+            # [FIX] Use session-based idempotency keys to prevent duplicate consumption
+            enqueue_summarize_task(session_id, user_id=owner_uid, idempotency_key=f"import_summary:{session_id}")
+            enqueue_quiz_task(session_id, user_id=owner_uid, idempotency_key=f"import_quiz:{session_id}")
         except Exception as exc:
             logger.exception(f"Failed to enqueue summary/quiz for {session_id}: {exc}")
             # Non-blocking error?

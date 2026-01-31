@@ -11,6 +11,7 @@ from google.cloud import firestore
 from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.firebase import db
 from app.services.apple import apple_service
+from app.services.app_config import is_feature_enabled, get_maintenance_error_response
 from app.util_models import BillingConfirmRequest, AppStoreNotificationRequest, BillingConfirmResponse
 from app.utils.idempotency import idempotency, ResourceAlreadyProcessed
 
@@ -197,6 +198,14 @@ async def confirm_ios_purchase(
     request_id = str(uuid.uuid4())
     if response is not None:
         response.headers["X-Request-Id"] = request_id
+
+    # [FeatureGate] Check if payment feature is enabled
+    if not is_feature_enabled("payment"):
+        raise HTTPException(
+            status_code=503,
+            detail=get_maintenance_error_response("payment"),
+            headers={"X-Request-Id": request_id},
+        )
 
     if not apple_service.verifier:
         raise HTTPException(
