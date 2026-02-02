@@ -26,9 +26,12 @@ from app.dependencies import get_current_user, CurrentUser
 from app.util_models import (
     AsyncJobType,
     AsyncJobStatus,
+    SummaryStage,
+    QuizStage,
     GenerateRequest,
     GenerateResponse,
     JobStatusResponse,
+    PartialSummary,
 )
 from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
 
@@ -134,6 +137,7 @@ def _get_or_create_job(
             "userId": user_id,
             "accountId": account_id,
             "status": AsyncJobStatus.QUEUED.value,
+            "stage": "queued",  # Stage for progress UI
             "idempotencyKey": idempotency_key,
             "createdAt": now,
             "updatedAt": now,
@@ -144,6 +148,7 @@ def _get_or_create_job(
             "resultRef": None,
             "resultUrl": None,
             "progress": None,
+            "partial": None,  # Partial results during generation
             "retryCount": 0,
             "request": request_params or {},
         }
@@ -225,17 +230,29 @@ async def get_job_status(
     if job_data.get("accountId") != current_user.account_id:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # Build partial results if available
+    partial_data = job_data.get("partial")
+    partial = None
+    if partial_data:
+        partial = PartialSummary(
+            tldr=partial_data.get("tldr"),
+            overview=partial_data.get("overview"),
+            keyPoints=partial_data.get("keyPoints"),
+        )
+
     return JobStatusResponse(
         jobId=job_data["id"],
         type=AsyncJobType(job_data["type"]),
         sessionId=job_data["sessionId"],
         status=AsyncJobStatus(job_data["status"]),
+        stage=job_data.get("stage"),
         createdAt=job_data["createdAt"],
         updatedAt=job_data["updatedAt"],
         completedAt=job_data.get("completedAt"),
         resultUrl=job_data.get("resultUrl"),
         errorReason=job_data.get("errorReason"),
         progress=job_data.get("progress"),
+        partial=partial,
     )
 
 
@@ -485,3 +502,37 @@ def fail_job(job_id: str, error_reason: str, is_permanent: bool = False):
 def update_job_progress(job_id: str, progress: float):
     """Update job progress (0.0 - 1.0)."""
     _update_job_status(job_id, AsyncJobStatus.RUNNING, progress=progress)
+
+
+def update_job_stage(
+    job_id: str,
+    stage: str,
+    progress: Optional[float] = None,
+    partial: Optional[dict] = None,
+):
+    """
+    Update job stage and optionally partial results.
+
+    Args:
+        job_id: Job ID
+        stage: Current stage (e.g., "generating_tldr", "generating_overview")
+        progress: Progress value 0.0-1.0
+        partial: Partial results dict (tldr, overview, keyPoints)
+    """
+    now = datetime.now(timezone.utc)
+    update_data = {
+        "stage": stage,
+        "updatedAt": now,
+    }
+
+    if progress is not None:
+        update_data["progress"] = progress
+
+    if partial is not None:
+        update_data["partial"] = partial
+
+    try:
+        _jobs_collection().document(job_id).update(update_data)
+        logger.debug(f"[Job] {job_id} stage={stage} progress={progress}")
+    except Exception as e:
+        logger.warning(f"[Job] Failed to update stage for {job_id}: {e}")

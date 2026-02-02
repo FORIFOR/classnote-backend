@@ -90,6 +90,28 @@ class AsyncJobStatus(str, Enum):
     FAILED = "failed"
 
 
+class SummaryStage(str, Enum):
+    """Stages for summary generation (for progress UI)."""
+    QUEUED = "queued"
+    LOADING_TRANSCRIPT = "loading_transcript"
+    GENERATING_TLDR = "generating_tldr"
+    GENERATING_OVERVIEW = "generating_overview"
+    GENERATING_STRUCTURE = "generating_structure"
+    FORMATTING_JSON = "formatting_json"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class QuizStage(str, Enum):
+    """Stages for quiz generation."""
+    QUEUED = "queued"
+    LOADING_TRANSCRIPT = "loading_transcript"
+    GENERATING_QUESTIONS = "generating_questions"
+    FORMATTING = "formatting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class GenerateRequest(BaseModel):
     """Request body for :generate endpoints."""
     promptVersion: Optional[str] = None
@@ -107,18 +129,27 @@ class GenerateResponse(BaseModel):
     existingResult: bool = False  # True if job was already completed
 
 
+class PartialSummary(BaseModel):
+    """Partial summary results (returned during generation)."""
+    tldr: Optional[List[str]] = None  # TL;DR bullet points
+    overview: Optional[str] = None  # Brief overview
+    keyPoints: Optional[List[str]] = None  # Key points extracted
+
+
 class JobStatusResponse(BaseModel):
     """Response for GET /jobs/{jobId}."""
     jobId: str
     type: AsyncJobType
     sessionId: str
     status: AsyncJobStatus
+    stage: Optional[str] = None  # Current stage (queued, generating_tldr, etc.)
     createdAt: datetime
     updatedAt: datetime
     completedAt: Optional[datetime] = None
     resultUrl: Optional[str] = None
     errorReason: Optional[str] = None
     progress: Optional[float] = None  # 0.0 - 1.0
+    partial: Optional[PartialSummary] = None  # Partial results during generation
 
 
 class TranscriptionMode(str, Enum):

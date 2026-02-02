@@ -245,7 +245,15 @@ def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: s
 
 # ---------- Local fallback workers ---------- #
 
-def _update_root_job_status(job_id: str, status: str, result_url: str = None, error_reason: str = None):
+def _update_root_job_status(
+    job_id: str,
+    status: str,
+    result_url: str = None,
+    error_reason: str = None,
+    stage: str = None,
+    progress: float = None,
+    partial: dict = None,
+):
     """Update job status in root jobs collection (for new async job system)."""
     if not job_id:
         return
@@ -262,6 +270,12 @@ def _update_root_job_status(job_id: str, status: str, result_url: str = None, er
         update_data["resultUrl"] = result_url
     if error_reason:
         update_data["errorReason"] = error_reason
+    if stage:
+        update_data["stage"] = stage
+    if progress is not None:
+        update_data["progress"] = progress
+    if partial is not None:
+        update_data["partial"] = partial
     try:
         db.collection("jobs").document(job_id).update(update_data)
     except Exception as e:
@@ -271,16 +285,18 @@ def _update_root_job_status(job_id: str, status: str, result_url: str = None, er
 async def _run_local_summarize(session_id: str, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
 
-    # Mark job as running
-    _update_root_job_status(job_id, "running")
+    # Stage 1: Mark job as running
+    _update_root_job_status(job_id, "running", stage="loading_transcript", progress=0.1)
 
     try:
         doc = doc_ref.get()
         if not doc.exists:
             logger.warning(f"[local summarize] session not found: {session_id}")
-            _update_root_job_status(job_id, "failed", error_reason="Session not found")
+            _update_root_job_status(job_id, "failed", stage="failed", error_reason="Session not found")
             return
         data = doc.to_dict()
+
+        # Stage 2: Load transcript
         transcript = resolve_transcript_text(session_id, data)
         if not transcript:
             logger.warning(f"[local summarize] transcript empty: {session_id}")
@@ -293,22 +309,39 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
                 "playlistUpdatedAt": datetime.utcnow(),
                 "status": "録音済み",
             })
-            _update_root_job_status(job_id, "failed", error_reason="Transcript is empty")
+            _update_root_job_status(job_id, "failed", stage="failed", error_reason="Transcript is empty")
             return
+
         doc_ref.update({
             "summaryStatus": "running",
             "summaryError": None,
             "summaryUpdatedAt": datetime.utcnow()
         })
+
+        # Stage 3: Generate summary (with stage updates)
+        _update_root_job_status(job_id, "running", stage="generating_structure", progress=0.3)
+
         result = await llm.generate_summary_and_tags(
             transcript,
             mode=data.get("mode", "lecture"),
         )
+
+        # Stage 4: Formatting
+        _update_root_job_status(job_id, "running", stage="formatting_json", progress=0.8)
+
         summary_md = result.get("summaryMarkdown")
         summary_json = result.get("summaryJson") or {}
         summary_type = result.get("summaryType") or data.get("mode", "lecture")
         summary_json_version = result.get("summaryJsonVersion") or 1
         tags = result.get("tags") or []
+
+        # Extract partial for final update (TL;DR from summaryJson if available)
+        partial_data = None
+        if summary_json:
+            tldr = summary_json.get("tldr") or summary_json.get("overview_bullets")
+            if tldr:
+                partial_data = {"tldr": tldr if isinstance(tldr, list) else [tldr]}
+
         update_payload = {
             "summaryStatus": "completed",
             "summaryMarkdown": summary_md,
@@ -322,11 +355,17 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
         }
         doc_ref.update(update_payload)
 
-        # Update both legacy and new job collections
+        # Stage 5: Completed
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
         result_url = f"/sessions/{session_id}/artifacts/summary"
-        _update_root_job_status(job_id, "succeeded", result_url=result_url)
+        _update_root_job_status(
+            job_id, "succeeded",
+            stage="completed",
+            progress=1.0,
+            result_url=result_url,
+            partial=partial_data,
+        )
 
         # Log usage
         await usage_logger.log(
@@ -343,7 +382,7 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             "summaryUpdatedAt": datetime.utcnow(),
             "status": "録音済み",
         })
-        _update_root_job_status(job_id, "failed", error_reason=str(e))
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason=str(e))
         # Log error
         await usage_logger.log(
             user_id=data.get("userId", "unknown"),
@@ -357,15 +396,17 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
 async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
 
-    # Mark job as running
-    _update_root_job_status(job_id, "running")
+    # Stage 1: Mark job as running
+    _update_root_job_status(job_id, "running", stage="loading_transcript", progress=0.1)
 
     doc = doc_ref.get()
     if not doc.exists:
         logger.warning(f"[local quiz] session not found: {session_id}")
-        _update_root_job_status(job_id, "failed", error_reason="Session not found")
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason="Session not found")
         return
     data = doc.to_dict()
+
+    # Stage 2: Load transcript
     transcript = resolve_transcript_text(session_id, data)
     if not transcript:
         logger.warning(f"[local quiz] transcript empty: {session_id}")
@@ -375,17 +416,24 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizUpdatedAt": datetime.utcnow(),
             "status": "録音済み",
         })
-        _update_root_job_status(job_id, "failed", error_reason="Transcript is empty")
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason="Transcript is empty")
         return
 
-    # Trigger LLM
+    # Stage 3: Generate quiz
     try:
         doc_ref.update({
             "quizStatus": "running",
             "quizError": None,
             "quizUpdatedAt": datetime.utcnow()
         })
+
+        _update_root_job_status(job_id, "running", stage="generating_questions", progress=0.3)
+
         quiz_md = await llm.generate_quiz(transcript, mode=data.get("mode", "lecture"), count=count)
+
+        # Stage 4: Formatting
+        _update_root_job_status(job_id, "running", stage="formatting", progress=0.8)
+
         doc_ref.update({
             "quizStatus": "completed",
             "quizMarkdown": quiz_md,
@@ -393,11 +441,11 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizError": None,
         })
 
-        # Update both legacy and new job collections
+        # Stage 5: Completed
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
         result_url = f"/sessions/{session_id}/artifacts/quiz"
-        _update_root_job_status(job_id, "succeeded", result_url=result_url)
+        _update_root_job_status(job_id, "succeeded", stage="completed", progress=1.0, result_url=result_url)
     except Exception as e:
         logger.exception(f"[local quiz] failed: {e}")
         doc_ref.update({
@@ -405,7 +453,7 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizError": str(e),
             "quizUpdatedAt": datetime.utcnow(),
         })
-        _update_root_job_status(job_id, "failed", error_reason=str(e))
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason=str(e))
 
 async def _run_local_playlist(session_id: str, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
