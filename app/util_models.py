@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 
@@ -69,6 +69,57 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     LOCKED = "locked"    # [NEW] Job blocked by quota/billing
+    # [NEW] Async job statuses
+    QUEUED = "queued"
+    SUCCEEDED = "succeeded"
+
+
+class AsyncJobType(str, Enum):
+    """Types of async jobs that can be queued."""
+    SUMMARY = "summary"
+    QUIZ = "quiz"
+    TRANSCRIPT = "transcript"
+    PLAYLIST = "playlist"
+
+
+class AsyncJobStatus(str, Enum):
+    """Status for async jobs (Cloud Tasks based)."""
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class GenerateRequest(BaseModel):
+    """Request body for :generate endpoints."""
+    promptVersion: Optional[str] = None
+    mode: Optional[str] = None  # standard, short, detailed
+    language: Optional[str] = None
+    force: bool = False  # Force regeneration even if exists
+
+
+class GenerateResponse(BaseModel):
+    """Response for :generate endpoints (202 Accepted)."""
+    jobId: str
+    status: AsyncJobStatus
+    statusUrl: str
+    estimatedSeconds: Optional[int] = None
+    existingResult: bool = False  # True if job was already completed
+
+
+class JobStatusResponse(BaseModel):
+    """Response for GET /jobs/{jobId}."""
+    jobId: str
+    type: AsyncJobType
+    sessionId: str
+    status: AsyncJobStatus
+    createdAt: datetime
+    updatedAt: datetime
+    completedAt: Optional[datetime] = None
+    resultUrl: Optional[str] = None
+    errorReason: Optional[str] = None
+    progress: Optional[float] = None  # 0.0 - 1.0
+
 
 class TranscriptionMode(str, Enum):
     CLOUD_GOOGLE = "cloud_google"
@@ -182,12 +233,13 @@ class ChatMessagesResponse(BaseModel):
     messages: List[SessionChatMessage]
     
 # Job Models
-JobType = Literal["summary", "quiz", "calendar_sync", "transcribe", "diarize", "translate", "qa"]
+JobType = Literal["summary", "quiz", "calendar_sync", "transcribe", "diarize", "translate", "qa", "playlist"]
 
 class JobRequest(BaseModel):
     type: JobType
     params: Dict[str, Any] = {}
     idempotencyKey: Optional[str] = None
+    force: bool = False  # [FIX] Force re-generation even if completed
 
     model_config = {"populate_by_name": True}
 
@@ -232,17 +284,21 @@ class TranscriptChunkAppendRequest(BaseModel):
     source: Optional[str] = "device"
     updateSessionTranscript: bool = False
     finalize: bool = False
+    ifVersion: Optional[int] = None  # [SYNC] Optimistic locking: reject if server version != ifVersion
 
 class TranscriptChunkReplaceRequest(BaseModel):
     chunks: List[TranscriptChunkInput]
     source: Optional[str] = "batch"
     updateSessionTranscript: bool = False
+    ifVersion: Optional[int] = None  # [SYNC] Optimistic locking: reject if server version != ifVersion
+    replaceRange: Optional[Dict[str, int]] = None  # [SYNC] {fromMs, toMs} - delete chunks in range before insert
 
 class TranscriptChunkAppendResponse(BaseModel):
     sessionId: str
     chunkIds: List[str]
     count: int
     status: JobStatus = JobStatus.COMPLETED
+    transcriptVersion: int = 0  # [SYNC] New version after this operation
 
 class VideoUrlUpdateRequest(BaseModel):
     videoUrl: str
@@ -436,6 +492,8 @@ class CloudUsageReport(BaseModel):
     """
     [vNext] Monthly Cloud Transcription Quota Report
     Used to inform the UI about remaining minutes and sessions.
+
+    Supports both camelCase (native) and snake_case (iOS CodingKeys fallback) keys.
     """
     limitSeconds: float
     usedSeconds: float
@@ -444,6 +502,42 @@ class CloudUsageReport(BaseModel):
     sessionsStarted: int
     canStart: bool
     reasonIfBlocked: Optional[str] = None
+
+    # [FIX] iOS互換性: snake_case キーも出力（CodingKeys両対応）
+    @computed_field
+    @property
+    def limit_seconds(self) -> float:
+        return self.limitSeconds
+
+    @computed_field
+    @property
+    def used_seconds(self) -> float:
+        return self.usedSeconds
+
+    @computed_field
+    @property
+    def remaining_seconds(self) -> float:
+        return self.remainingSeconds
+
+    @computed_field
+    @property
+    def session_limit(self) -> int:
+        return self.sessionLimit
+
+    @computed_field
+    @property
+    def sessions_started(self) -> int:
+        return self.sessionsStarted
+
+    @computed_field
+    @property
+    def can_start(self) -> bool:
+        return self.canStart
+
+    @computed_field
+    @property
+    def reason_if_blocked(self) -> Optional[str]:
+        return self.reasonIfBlocked
 
 class MeResponse(BaseModel):
     id: Optional[str] = None  # iOS expects this field (alias for uid)
@@ -479,7 +573,11 @@ class MeResponse(BaseModel):
     
     # [vNext] Consolidated Cloud Usage Report
     cloud: Optional[CloudUsageReport] = None
-    
+
+    # [FIX] iOS互換性: cloudMinutesUsed/cloudMinutesLimit フィールド
+    cloudMinutesUsed: Optional[float] = None
+    cloudMinutesLimit: Optional[float] = None
+
     # [Security] App Store Receipt Validation
     appAccountToken: Optional[str] = None  # [NEW] UUID for StoreKit 2
 
@@ -495,6 +593,54 @@ class MeResponse(BaseModel):
     # List of features that require phone verification to use
     # Possible values: "share", "publicProfile", "subscriptionRestore", "accountMerge"
     phoneRequiredFor: Optional[List[str]] = None
+
+    # [NEW 2026-01] Account Suspension (BAN)
+    suspended: bool = False
+    suspendedAt: Optional[datetime] = None
+    suspendedReason: Optional[str] = None
+
+
+class FeatureGates(BaseModel):
+    """Feature availability flags for the current user/plan."""
+    cloudStt: bool = True
+    summarization: bool = True
+    quiz: bool = True
+    cloudSync: bool = True
+    export: bool = True
+    share: bool = True
+
+
+class MeLiteResponse(BaseModel):
+    """
+    Lightweight /users/me response for app startup.
+
+    Design principles:
+    - No JIT writes (read-only)
+    - No usage calculation (just plan-based gates)
+    - Minimal Firestore reads (users + accounts only)
+    - Target response time: <100ms
+    """
+    uid: str
+    accountId: Optional[str] = None
+    plan: str = "free"
+    displayName: Optional[str] = None
+    username: Optional[str] = None
+    hasUsername: bool = False
+    photoUrl: Optional[str] = None
+    provider: Optional[str] = None
+    providers: List[str] = []
+
+    # Feature gates (based on plan, no usage check)
+    featureGates: FeatureGates = Field(default_factory=FeatureGates)
+
+    # Minimal flags for UI
+    needsPhoneVerification: bool = False
+    needsSnsLogin: bool = False
+    suspended: bool = False
+
+    # Cache hint for client
+    cacheValidUntil: Optional[datetime] = None
+
 
 class MeUpdateRequest(BaseModel):
     displayName: Optional[str] = None
@@ -643,6 +789,7 @@ class SessionResponse(BaseModel):
     canManage: Optional[bool] = None # [NEW] Explicit permission flag
     ownerUserId: Optional[str] = None
     ownerId: Optional[str] = None # [NEW] Legacy alias for backward compatibility
+    ownerAccountId: Optional[str] = None # [NEW] Account-based ownership
     participantUserIds: List[str] = []
     participants: Optional[dict] = None  # [NEW] Map of uid -> role/joinedAt
     visibility: str = "private"
@@ -706,13 +853,36 @@ class ImageNoteDTO(BaseModel):
     localId: Optional[str] = None # [NEW]
 
 
+class SessionMemberSummary(BaseModel):
+    """[NEW] Lightweight member info for session detail response"""
+    uid: str
+    username: Optional[str] = None
+    displayName: Optional[str] = None
+    displayNameSnapshot: Optional[str] = None
+    role: str = "viewer"
+    photoUrl: Optional[str] = None
+
+class ReactionsSummary(BaseModel):
+    """[NEW] Reaction counts with English keys for iOS compatibility"""
+    fire: int = 0
+    clap: int = 0
+    angel: int = 0
+    mindblown: int = 0
+    heartHands: int = 0
+
 class SessionDetailResponse(SessionResponse):
     transcriptText: Optional[str] = None
+    transcriptChunkCount: int = 0  # [NEW] For sync status / chunked loading
     notes: Optional[str] = None
     assets: Optional[AssetResolveResponse] = None # For full asset paths
     googleCalendar: Optional[dict] = None # Legacy
     reactionIncr: Optional[int] = 0 # For UI optimization
-    
+
+    # [NEW] Members list for iOS compatibility
+    members: Optional[List[SessionMemberSummary]] = None
+    # [NEW] Reaction summary with English keys
+    reactionsSummary: Optional[ReactionsSummary] = None
+
     # Also include raw segments if needed by UI (optional)
     segments: Optional[List[dict]] = None
     diarizedSegments: Optional[List[dict]] = None
@@ -890,6 +1060,30 @@ class EntitlementResponse(BaseModel):
     entitled: bool
     plan: str # free, basic, pro
     expiresAt: Optional[int] = None # Timestamp in ms
+
+
+class SubscriptionClaimSubscriptionInfo(BaseModel):
+    """Nested subscription info for SubscriptionClaimResponse"""
+    plan: Optional[str] = None
+    productId: Optional[str] = None
+    originalTransactionId: Optional[str] = None
+    expiresAt: Optional[int] = None  # Timestamp in ms
+    environment: Optional[str] = None
+    source: str = "apple"
+
+
+class SubscriptionClaimResponse(BaseModel):
+    """
+    Response for /subscription/apple:claim endpoint.
+    Matches iOS SubscriptionSyncResponse structure.
+    """
+    status: str  # "verified", "pending", "failed"
+    accountId: Optional[str] = None
+    subscription: Optional[SubscriptionClaimSubscriptionInfo] = None
+    retryAfter: Optional[int] = None  # Seconds to wait before retry
+    message: Optional[str] = None
+    transactionId: Optional[str] = None
+
 
 # --- Quiz Analytics Models ---
 

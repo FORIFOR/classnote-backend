@@ -2,12 +2,16 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime, timezone
 from app.services.ops_logger import OpsLogger, Severity, EventType
+from app.services.metrics import track_api_request
+from app.middleware.request_id import RequestIdMiddleware, get_request_id
+from app.middleware.rate_limit import limiter, rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -36,6 +40,10 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+# Rate Limiter setup
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """
@@ -55,12 +63,24 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         headers=headers
     )
 
-# [NEW] Ops Logger Middleware
+# [ENHANCED] Ops Logger & Metrics Middleware
 @app.middleware("http")
 async def ops_logger_middleware(request: Request, call_next):
     start_time = datetime.now(timezone.utc)
     response = await call_next(request)
     process_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+
+    # Get request_id from middleware (set by RequestIdMiddleware)
+    request_id = getattr(request.state, "request_id", None)
+
+    # Track metrics for all requests (except health checks)
+    if request.url.path not in ["/health", "/", "/docs", "/redoc", "/openapi.json"]:
+        track_api_request(
+            endpoint=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            latency_ms=process_time
+        )
 
     # Log API Error or suspicious latency
     if response.status_code >= 500:
@@ -69,21 +89,23 @@ async def ops_logger_middleware(request: Request, call_next):
             event_type=EventType.API_ERROR,
             endpoint=request.url.path,
             status_code=response.status_code,
+            request_id=request_id,
             message=f"API 500 Error: {request.url.path}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host, "email": getattr(request.state, "email", None)},
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host if request.client else None, "email": getattr(request.state, "email", None)},
             trace_id=request.headers.get("X-Cloud-Trace-Context"),
             uid=getattr(request.state, "uid", None)
         )
     # 400系は INFO/WARN レベル (認証エラーなどは除外してもよいが、ここでは全て記録しフィルタで分ける)
     # ただし大量になるので 401/403/429/402 など重要なものに絞るのが一般的
     elif response.status_code in [402, 409, 429]:
-         OpsLogger().log(
+        OpsLogger().log(
             severity=Severity.WARN,
             event_type=EventType.API_ERROR,
             endpoint=request.url.path,
             status_code=response.status_code,
+            request_id=request_id,
             message=f"API Client Error: {response.status_code}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host, "email": getattr(request.state, "email", None)},
+            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host if request.client else None, "email": getattr(request.state, "email", None)},
             trace_id=request.headers.get("X-Cloud-Trace-Context"),
             uid=getattr(request.state, "uid", None)
         )
@@ -107,6 +129,9 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+# Request ID Middleware (must be added after CORS, runs before ops_logger)
+app.add_middleware(RequestIdMiddleware)
 
 # Include Routers
 app.include_router(account.router, tags=["Account"])
@@ -135,6 +160,9 @@ app.include_router(quiz_analytics.router, tags=["Quiz Analytics"])
 
 # [NEW] App Config (Maintenance Mode / Feature Flags)
 app.include_router(app_config.router, tags=["App Config"])
+
+# [NEW] Async Jobs API (Summary/Quiz Generation) - v2
+app.include_router(jobs.router, tags=["Jobs"])
 
 if usage_router_available:
     app.include_router(usage.router, tags=["Usage"])

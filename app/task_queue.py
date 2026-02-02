@@ -123,11 +123,15 @@ def enqueue_quiz_task(
     idempotency_key: str | None = None,
     user_id: str | None = None,
     usage_reserved: bool = False,
+    background_tasks: BackgroundTasks = None,
 ):
     # 同様に実装
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
         logger.info("Running quiz task locally")
-        asyncio.create_task(_run_local_quiz(session_id, count, job_id))
+        if background_tasks:
+            background_tasks.add_task(_run_local_quiz, session_id, count, job_id)
+        else:
+            asyncio.create_task(_run_local_quiz(session_id, count, job_id))
         return
 
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
@@ -241,12 +245,40 @@ def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: s
 
 # ---------- Local fallback workers ---------- #
 
+def _update_root_job_status(job_id: str, status: str, result_url: str = None, error_reason: str = None):
+    """Update job status in root jobs collection (for new async job system)."""
+    if not job_id:
+        return
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    update_data = {
+        "status": status,
+        "updatedAt": now,
+    }
+    if status in ["succeeded", "failed"]:
+        update_data["completedAt"] = now
+        update_data["leaseUntil"] = None
+    if result_url:
+        update_data["resultUrl"] = result_url
+    if error_reason:
+        update_data["errorReason"] = error_reason
+    try:
+        db.collection("jobs").document(job_id).update(update_data)
+    except Exception as e:
+        logger.warning(f"[job_status] Failed to update job {job_id}: {e}")
+
+
 async def _run_local_summarize(session_id: str, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
+
+    # Mark job as running
+    _update_root_job_status(job_id, "running")
+
     try:
         doc = doc_ref.get()
         if not doc.exists:
             logger.warning(f"[local summarize] session not found: {session_id}")
+            _update_root_job_status(job_id, "failed", error_reason="Session not found")
             return
         data = doc.to_dict()
         transcript = resolve_transcript_text(session_id, data)
@@ -261,6 +293,7 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
                 "playlistUpdatedAt": datetime.utcnow(),
                 "status": "録音済み",
             })
+            _update_root_job_status(job_id, "failed", error_reason="Transcript is empty")
             return
         doc_ref.update({
             "summaryStatus": "running",
@@ -288,8 +321,13 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             "status": "要約済み",
         }
         doc_ref.update(update_payload)
+
+        # Update both legacy and new job collections
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
+        result_url = f"/sessions/{session_id}/artifacts/summary"
+        _update_root_job_status(job_id, "succeeded", result_url=result_url)
+
         # Log usage
         await usage_logger.log(
             user_id=data.get("userId", "unknown"),
@@ -305,6 +343,7 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             "summaryUpdatedAt": datetime.utcnow(),
             "status": "録音済み",
         })
+        _update_root_job_status(job_id, "failed", error_reason=str(e))
         # Log error
         await usage_logger.log(
             user_id=data.get("userId", "unknown"),
@@ -317,9 +356,14 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
 
 async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
+
+    # Mark job as running
+    _update_root_job_status(job_id, "running")
+
     doc = doc_ref.get()
     if not doc.exists:
         logger.warning(f"[local quiz] session not found: {session_id}")
+        _update_root_job_status(job_id, "failed", error_reason="Session not found")
         return
     data = doc.to_dict()
     transcript = resolve_transcript_text(session_id, data)
@@ -331,6 +375,7 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizUpdatedAt": datetime.utcnow(),
             "status": "録音済み",
         })
+        _update_root_job_status(job_id, "failed", error_reason="Transcript is empty")
         return
 
     # Trigger LLM
@@ -347,8 +392,12 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizUpdatedAt": datetime.utcnow(),
             "quizError": None,
         })
+
+        # Update both legacy and new job collections
         if job_id:
-             db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
+            db.collection("sessions").document(session_id).collection("jobs").document(job_id).update({"status": "completed"})
+        result_url = f"/sessions/{session_id}/artifacts/quiz"
+        _update_root_job_status(job_id, "succeeded", result_url=result_url)
     except Exception as e:
         logger.exception(f"[local quiz] failed: {e}")
         doc_ref.update({
@@ -356,6 +405,7 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
             "quizError": str(e),
             "quizUpdatedAt": datetime.utcnow(),
         })
+        _update_root_job_status(job_id, "failed", error_reason=str(e))
 
 async def _run_local_playlist(session_id: str, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
@@ -446,17 +496,6 @@ async def _run_local_highlights(session_id: str):
     })
 
 
-async def _run_local_playlist(session_id: str):
-    doc_ref = db.collection("sessions").document(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        logger.warning(f"[local playlist] session not found: {session_id}")
-        return
-    doc_ref.update({
-        "playlistStatus": "failed",
-        "playlistError": "deprecated",
-        "playlistUpdatedAt": datetime.utcnow()
-    })
 def enqueue_generate_highlights_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
     """
     ハイライト生成タスクをキューに入れる。
@@ -503,11 +542,18 @@ def enqueue_nuke_user_task(user_id: str):
         logger.error(f"Failed to enqueue Nuke task for {user_id}: {e}")
         raise e
 
-def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: str | None = None):
+
+async def _run_local_nuke(user_id: str):
     """
-    プレイリスト生成タスクをキューに入れる。
+    Local fallback for complete account deletion.
+    Uses the nuke_user_complete service function.
     """
-    logger.info("Playlist task is deprecated; skipping enqueue.")
+    from app.services.session_cleanup import nuke_user_complete
+    logger.info(f"[LocalNuke] Starting complete deletion for {user_id}")
+    result = nuke_user_complete(user_id)
+    logger.info(f"[LocalNuke] Result for {user_id}: {result}")
+    return result
+
 
 def enqueue_transcribe_task(
     session_id: str,
@@ -719,10 +765,11 @@ async def _run_local_youtube_import(session_id: str, url: str, language: str):
         # [Security] Pass userId if available
         data = doc_ref.get().to_dict() or {}
         uid = data.get("ownerUserId") or data.get("userId")
-        
+
         # Trigger next steps (Summary/Quiz/Playlist)
-        enqueue_summarize_task(session_id, user_id=uid)
-        enqueue_quiz_task(session_id, user_id=uid)
+        # [FIX] Use session-based idempotency key to prevent duplicate consumption
+        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
+        enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
         enqueue_playlist_task(session_id, user_id=uid)
     except Exception as e:
         logger.exception("Local YouTube Import Failed")
@@ -879,10 +926,11 @@ async def _run_local_transcribe(session_id: str, force: bool = False, engine: st
         _update_job_status("completed")
 
         # Trigger downstream tasks (summary, quiz)
+        # [FIX] Use session-based idempotency key to prevent duplicate consumption
         if updates.get("transcriptText"):
             uid = data.get("ownerUserId") or data.get("userId")
-            enqueue_summarize_task(session_id, user_id=uid)
-            enqueue_quiz_task(session_id, user_id=uid)
+            enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
+            enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
 
         logger.info(f"[local transcribe] completed for session: {session_id}")
 
