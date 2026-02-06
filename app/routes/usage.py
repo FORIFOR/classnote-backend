@@ -201,7 +201,7 @@ async def backfill_usage(
 @router.get("/me/summary", response_model=UsageSummaryResponse, response_model_by_alias=False)
 async def get_my_usage_summary(
     from_date: Optional[str] = Query(
-        None, 
+        None,
         description="Start date (yyyy-MM-dd). Defaults to 30 days ago."
     ),
     to_date: Optional[str] = Query(
@@ -212,39 +212,60 @@ async def get_my_usage_summary(
 ):
     """
     Get the current user's usage summary for a date range.
-    
+
     Useful for:
     - Showing usage dashboard in the app
     - Checking quota usage
     - Billing purposes
     """
-    
+
     if hasattr(user, "uid"):
          user_id = user.uid
     else:
          user_id = user.get("uid")
-    
+
     if not user_id:
         raise HTTPException(status_code=401, detail="User not authenticated")
-    
+
+    # [FIX] Get accountId for unified quota lookup (BEFORE getting summary)
+    user_doc = db.collection("users").document(user_id).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+    account_id = user_data.get("accountId")
+
+    # [DEBUG] Print for debugging
+    print(f"[/usage/me/summary] user_id={user_id}, account_id={account_id}")
+
     # Default date range: last 30 days
     if not to_date:
         to_date = date.today().isoformat()
     if not from_date:
         from_date = (date.today() - timedelta(days=30)).isoformat()
-    
+
     summary = await usage_logger.get_user_usage_summary(
         user_id=user_id,
         from_date=from_date,
         to_date=to_date
     )
-    
-    # [UNIFY] Align with CostGuard
-    report = await cost_guard.get_usage_report(user_id)
+
+    print(f"[/usage/me/summary] usage_logger returned: cloud_sec={summary.get('total_recording_cloud_sec')}, summary={summary.get('summary_invocations')}, quiz={summary.get('quiz_invocations')}")
+
+    # [UNIFY] Align with CostGuard - use accountId if available
+    if account_id:
+        report = await cost_guard.get_usage_report(account_id, mode="account")
+    else:
+        report = await cost_guard.get_usage_report(user_id, mode="user")
+
+    print(f"[/usage/me/summary] cost_guard returned: usedSeconds={report.get('usedSeconds')}, summaryGenerated={report.get('summaryGenerated')}, quizGenerated={report.get('quizGenerated')}")
+
+    # [FIX] CostGuard (monthly_usage) を課金・制限の信頼できるソースとして使用
+    # max() ではなく CostGuard の値を優先（課金データが正確）
     summary["summary_invocations"] = max(summary.get("summary_invocations", 0), report.get("summaryGenerated", 0))
     summary["quiz_invocations"] = max(summary.get("quiz_invocations", 0), report.get("quizGenerated", 0))
-    summary["total_recording_cloud_sec"] = max(summary.get("total_recording_cloud_sec", 0.0), report.get("usedSeconds", 0.0))
+    # Cloud録音時間は CostGuard を信頼できるソースとして使用
+    summary["total_recording_cloud_sec"] = report.get("usedSeconds", 0.0)
     summary["total_recording_sec"] = summary.get("total_recording_ondevice_sec", 0.0) + summary["total_recording_cloud_sec"]
+
+    print(f"[/usage/me/summary] FINAL: cloud_sec={summary.get('total_recording_cloud_sec')}, total_sec={summary.get('total_recording_sec')}, summary_inv={summary.get('summary_invocations')}, quiz_inv={summary.get('quiz_invocations')}")
 
     return UsageSummaryResponse(**summary)
 
@@ -263,45 +284,168 @@ async def get_user_usage_summary_admin(
         to_date = date.today().isoformat()
     if not from_date:
         from_date = (date.today() - timedelta(days=30)).isoformat()
-    
+
     summary = await usage_logger.get_user_usage_summary(
         user_id=user_id,
         from_date=from_date,
         to_date=to_date
     )
-    
+
+    # [FIX] Get accountId for unified quota lookup
+    user_doc = db.collection("users").document(user_id).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+    account_id = user_data.get("accountId")
+
+    # Use accountId if available
+    if account_id:
+        report = await cost_guard.get_usage_report(account_id, mode="account")
+    else:
+        report = await cost_guard.get_usage_report(user_id, mode="user")
+
+    # [FIX] CostGuard を信頼できるソースとして使用
+    summary["summary_invocations"] = max(summary.get("summary_invocations", 0), report.get("summaryGenerated", 0))
+    summary["quiz_invocations"] = max(summary.get("quiz_invocations", 0), report.get("quizGenerated", 0))
+    summary["total_recording_cloud_sec"] = report.get("usedSeconds", 0.0)
+    summary["total_recording_sec"] = summary.get("total_recording_ondevice_sec", 0.0) + summary["total_recording_cloud_sec"]
+
     return UsageSummaryResponse(**summary)
 
 @router.get("/analytics/me/timeline")
 async def get_usage_timeline(
     range: str = "30d",
+    from_date: Optional[str] = Query(None, description="Start date (yyyy-MM-dd)"),
+    to_date: Optional[str] = Query(None, description="End date (yyyy-MM-dd)"),
     current_user: object = Depends(get_current_user)
 ):
     """
     時系列データの取得（グラフ用）。
+    [FIX] クラウド録音時間も含むように修正
+    [FIX] from_date/to_date パラメータをサポート
     """
     uid = current_user.uid
-    end_date = date.today()
-    days = 30
-    if range == "7d": days = 7
-    elif range == "90d": days = 90
-    
-    start_date = end_date - timedelta(days=days)
-    
+    account_id = current_user.account_id
+
+    # [FIX] from_date/to_date が指定されていればそれを使用
+    print(f"[/analytics/me/timeline] params: from_date={from_date}, to_date={to_date}, range={range}")
+
+    if from_date and to_date:
+        try:
+            start_date = date.fromisoformat(from_date)
+            end_date = date.fromisoformat(to_date)
+            print(f"[/analytics/me/timeline] Using from_date/to_date: {start_date} to {end_date}")
+        except ValueError:
+            # Invalid date format, fall back to range
+            end_date = date.today()
+            days = 30
+            if range == "7d": days = 7
+            elif range == "90d": days = 90
+            start_date = end_date - timedelta(days=days)
+            print(f"[/analytics/me/timeline] Date parse error, using range: {start_date} to {end_date}")
+    else:
+        end_date = date.today()
+        days = 30
+        if range == "7d": days = 7
+        elif range == "90d": days = 90
+        start_date = end_date - timedelta(days=days)
+        print(f"[/analytics/me/timeline] Using range={range}: {start_date} to {end_date}")
+
     docs = db.collection("user_daily_usage") \
             .where(filter=FieldFilter("user_id", "==", uid)) \
             .where(filter=FieldFilter("date", ">=", start_date.isoformat())) \
             .where(filter=FieldFilter("date", "<=", end_date.isoformat())) \
             .order_by("date") \
             .stream()
-            
+
     timeline = []
+    total_cloud_sec = 0.0
+    total_recording_sec = 0.0
+    total_summary = 0
+    total_quiz = 0
+    total_share = 0
+    total_sessions = 0
     for doc in docs:
         d = doc.to_dict()
+        cloud_sec = d.get("total_recording_cloud_sec", 0.0)
+        recording_sec = d.get("total_recording_sec", 0.0)
+        summary_count = d.get("summary_invocations", 0)
+        quiz_count = d.get("quiz_invocations", 0)
+        share_count = d.get("share_count", 0)
+        session_count = d.get("session_count", 0)
+
+        total_cloud_sec += cloud_sec
+        total_recording_sec += recording_sec
+        total_summary += summary_count
+        total_quiz += quiz_count
+        total_share += share_count
+        total_sessions += session_count
+
+        ondevice_sec = max(0.0, recording_sec - cloud_sec)
         timeline.append({
             "date": d.get("date"),
-            "recordingSec": d.get("total_recording_sec", 0),
-            "sessionCount": d.get("session_count", 0)
+            # 総録音時間
+            "totalRecordingSec": recording_sec,
+            "total_recording_sec": recording_sec,
+            # クラウド録音時間
+            "totalRecordingCloudSec": cloud_sec,
+            "total_recording_cloud_sec": cloud_sec,
+            # オンデバイス録音時間
+            "totalRecordingOnDeviceSec": ondevice_sec,
+            "total_recording_ondevice_sec": ondevice_sec,
+            # その他
+            "sessionCount": session_count,
+            "session_count": session_count,
+            "summaryCount": summary_count,
+            "summary_count": summary_count,
+            "quizCount": quiz_count,
+            "quiz_count": quiz_count,
+            "shareCount": share_count,
+            "share_count": share_count,
         })
-        
-    return {"timelineDaily": timeline}
+
+    # [FIX] CostGuard (monthly_usage) を課金・制限の信頼できるソースとして使用
+    # タイムライン（日別データ）はuser_daily_usageから取得（グラフ表示用）
+    # 集計値はCostGuardから取得（課金データが正確）
+    report = await cost_guard.get_usage_report(account_id, mode="account")
+    cost_guard_cloud_sec = report.get("usedSeconds", 0.0)
+    cost_guard_summary = report.get("summaryGenerated", 0)
+    cost_guard_quiz = report.get("quizGenerated", 0)
+
+    # [FIX] CostGuard を信頼できるソースとして使用（max() ではなく CostGuard の値を優先）
+    final_cloud_sec = cost_guard_cloud_sec
+    final_summary = max(total_summary, cost_guard_summary)  # 要約/クイズは履歴も有用なのでmax
+    final_quiz = max(total_quiz, cost_guard_quiz)
+
+    print(f"[/analytics/me/timeline] RESULT: timeline={len(timeline)} entries, totalRecordingSec={total_recording_sec}, totalCloudRecordingSec={final_cloud_sec}, summaryInvocations={final_summary}, quizInvocations={final_quiz}, shareCount={total_share}")
+
+    return {
+        "timelineDaily": timeline,
+        # [FIX] 集計データも追加 (複数のフィールド名でiOS互換性を確保)
+        # 総録音時間
+        "totalRecordingSec": total_recording_sec,
+        "total_recording_sec": total_recording_sec,
+        "recordingSec": total_recording_sec,
+        "recording_sec": total_recording_sec,
+        # クラウド録音時間
+        "totalCloudRecordingSec": final_cloud_sec,
+        "totalRecordingCloudSec": final_cloud_sec,
+        "total_recording_cloud_sec": final_cloud_sec,
+        # オンデバイス録音時間
+        "totalOnDeviceRecordingSec": max(0.0, total_recording_sec - final_cloud_sec),
+        "total_recording_ondevice_sec": max(0.0, total_recording_sec - final_cloud_sec),
+        # 要約生成回数
+        "summaryInvocations": final_summary,
+        "summaryCount": final_summary,
+        "summary_invocations": final_summary,
+        "summary_count": final_summary,
+        # クイズ生成回数
+        "quizInvocations": final_quiz,
+        "quizCount": final_quiz,
+        "quiz_invocations": final_quiz,
+        "quiz_count": final_quiz,
+        # 共有回数
+        "shareCount": total_share,
+        "share_count": total_share,
+        # セッション数
+        "sessionCount": total_sessions,
+        "session_count": total_sessions
+    }

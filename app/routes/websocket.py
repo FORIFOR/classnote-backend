@@ -195,12 +195,14 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     # Session State Data (Defined early for scope)
     session_data = {}
     uid = None
+    quota_id = None      # [FIX] Initialize for finally block scope
+    quota_mode = "user"  # [FIX] Initialize for finally block scope
     start_time = time.time()
     limit_sec = 0.0
     used_sec = 0.0
     remaining_sec = 0.0
     plan = "free"
-    NO_AUDIO_TIMEOUT = 20.0
+    NO_AUDIO_TIMEOUT = 60.0  # Increased from 20s to handle network delays and app backgrounding
     audio_started_at = None
     frame_count = 0
 
@@ -396,7 +398,9 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     tmp_file = tmp_dir / f"{session_id}_{uuid.uuid4().hex}.raw"
 
     # Backpressure Queue - Drop oldest if full to prevent latency buildup
-    audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=50)
+    # Increased from 50 to 500 (~30 seconds buffer) for long recordings
+    audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=500)
+    audio_drop_count = 0  # Track dropped chunks for debugging
 
     stt_task = None
     stop_event = asyncio.Event()
@@ -428,93 +432,171 @@ async def ws_stream(websocket: WebSocket, session_id: str):
     # STT Instance
     stt_v2 = StreamingSTTV2()
 
-    # Generator for STT
-    async def queue_generator():
-        chunk_count_gen = 0
-        while True:
-            try:
-                # Wait for audio with timeout for Heartbeat
-                chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.5)
-
-                if chunk is None:
-                    # End of stream
-                    break
-
-                chunk_count_gen += 1
-                yield chunk
-
-            except asyncio.TimeoutError:
-                if not stop_requested and started:
-                    # Heartbeat (Silence) to keep connection alive
-                    logger.debug(f"[/ws/stream] Sending heartbeat silence (chunk #{chunk_count_gen})")
-                    yield stt_v2.create_silence_chunk(duration_ms=100)
-                continue
-
     async def run_stt(lang: str, rate: int):
-        nonlocal transcript_segments, current_partial, segment_counter, last_final_end_ms
-        logger.info(f"[/ws/stream] Starting V2 STT task (lang={lang})")
+        nonlocal transcript_segments, current_partial, segment_counter, last_final_end_ms, consumed_quota_sec
 
-        try:
-            generator = queue_generator()
+        # [AUTO-RECONNECT] Support for sessions longer than 5 minutes
+        reconnect_count = 0
+        MAX_RECONNECTS = 24  # 5分 x 24 = 120分 (Basic上限)
 
-            async for event in stt_v2.recognize_stream(generator, sample_rate=rate, language_code=lang):
-                if stop_event.is_set():
-                    break
+        def _create_stream_generator():
+            """Create a new generator that reads from the shared audio queue."""
+            async def _gen():
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.5)
+                        if chunk is None:
+                            break
+                        yield chunk
+                    except asyncio.TimeoutError:
+                        if not stop_requested and started:
+                            yield stt_v2.create_silence_chunk(duration_ms=100)
+                        continue
+            return _gen()
 
-                if "transcript" in event:
-                    transcript_text = event.get("transcript", "")
-                    is_final = event.get("is_final", False)
-                    
-                    # Estimate timing based on audio bytes received
-                    current_time_ms = int((total_audio_bytes / 32.0))  # 16kHz * 2bytes = 32000 bytes/sec
+        while reconnect_count < MAX_RECONNECTS:
+            stream_num = reconnect_count + 1
+            logger.info(f"[/ws/stream] Starting V2 STT stream #{stream_num} (lang={lang})")
 
-                    if is_final and transcript_text:
-                        # Save as confirmed segment
-                        segment_counter += 1
-                        segment = {
-                            "id": f"seg_{segment_counter:04d}",
-                            "text": transcript_text,
-                            "startMs": last_final_end_ms,
-                            "endMs": current_time_ms,
-                            "isFinal": True,
-                            "segmentIndex": segment_index,
+            should_reconnect = False
+
+            try:
+                generator = _create_stream_generator()
+
+                async for event in stt_v2.recognize_stream(generator, sample_rate=rate, language_code=lang):
+                    if stop_event.is_set():
+                        logger.info(f"[/ws/stream] Stop event detected, ending STT stream #{stream_num}")
+                        return
+
+                    if "transcript" in event:
+                        transcript_text = event.get("transcript", "")
+                        is_final = event.get("is_final", False)
+
+                        # Estimate timing based on audio bytes received
+                        current_time_ms = int((total_audio_bytes / 32.0))  # 16kHz * 2bytes = 32000 bytes/sec
+
+                        if is_final and transcript_text:
+                            # Save as confirmed segment
+                            segment_counter += 1
+                            segment = {
+                                "id": f"seg_{segment_counter:04d}",
+                                "text": transcript_text,
+                                "startMs": last_final_end_ms,
+                                "endMs": current_time_ms,
+                                "isFinal": True,
+                                "segmentIndex": segment_index,
+                                "seq": last_seq
+                            }
+                            transcript_segments.append(segment)
+                            last_final_end_ms = current_time_ms
+                            current_partial = ""  # Clear partial after final
+                            logger.debug(f"[/ws/stream] Final segment #{segment_counter}: {len(transcript_text)} chars (segmentIndex={segment_index})")
+                        else:
+                            # Update current partial (for draft)
+                            current_partial = transcript_text
+
+                        resp = {
+                            "event": "final" if is_final else "partial",
+                            "transcript": transcript_text,
+                            "confidence": event.get("confidence", 0.0),
                             "seq": last_seq
                         }
-                        transcript_segments.append(segment)
-                        last_final_end_ms = current_time_ms
-                        current_partial = ""  # Clear partial after final
-                        logger.debug(f"[/ws/stream] Final segment #{segment_counter}: {len(transcript_text)} chars (segmentIndex={segment_index})")
-                    else:
-                        # Update current partial (for draft)
-                        current_partial = transcript_text
+                        try:
+                            await websocket.send_json(resp)
+                        except Exception as e:
+                            logger.warning(f"[/ws/stream] Write error: {e}")
+                            return
 
-                    resp = {
-                        "event": "final" if is_final else "partial",
-                        "transcript": transcript_text,
-                        "confidence": event.get("confidence", 0.0),
-                        "seq": last_seq
-                    }
-                    try:
-                        await websocket.send_json(resp)
-                    except Exception as e:
-                        logger.warning(f"[/ws/stream] Write error: {e}")
-                        break
+                    if "vad_event" in event:
+                        try:
+                            await websocket.send_json({"event": "vad", "state": event["vad_event"]})
+                        except Exception:
+                            pass
 
-                if "vad_event" in event:
+                    # [AUTO-RECONNECT] Handle stream_ended events
+                    if "stream_ended" in event:
+                        reason = event.get("stream_ended")
+                        message = event.get("message", "Stream ended")
+
+                        if reason == "max_duration":
+                            # 5分制限に達した - クォータを確認して再接続を試みる
+                            quota_remaining_now = remaining_sec - consumed_quota_sec if remaining_sec > 0 else float('inf')
+
+                            # Basic で残りクォータがある場合（60秒以上）
+                            if plan == "basic" and quota_remaining_now > 60:  # 60秒以上残っていれば再接続
+                                logger.info(f"[/ws/stream] 5-minute limit reached on stream #{stream_num}, reconnecting... "
+                                           f"(consumed={consumed_quota_sec:.0f}s, quota_remaining={quota_remaining_now:.0f}s, plan={plan})")
+                                should_reconnect = True
+
+                                # クライアントに再接続を通知（オプション）
+                                try:
+                                    await websocket.send_json({
+                                        "event": "stream_reconnecting",
+                                        "streamNumber": stream_num + 1,
+                                        "consumedSeconds": consumed_quota_sec,
+                                        "message": "Reconnecting STT stream (5-minute limit)"
+                                    })
+                                except Exception:
+                                    pass
+                                break  # 内側のループを抜けて再接続
+                            else:
+                                # クォータ切れ - 終了
+                                logger.warning(f"[/ws/stream] Quota exhausted after stream #{stream_num}, cannot reconnect "
+                                              f"(consumed={consumed_quota_sec:.0f}s, remaining={quota_remaining_now:.0f}s)")
+                                try:
+                                    await websocket.send_json({
+                                        "event": "stream_ended",
+                                        "reason": "quota_exhausted",
+                                        "message": "Monthly quota reached",
+                                        "consumedSeconds": consumed_quota_sec
+                                    })
+                                except Exception:
+                                    pass
+                                return
+                        else:
+                            # client_timeout 等は再接続せず終了
+                            logger.info(f"[/ws/stream] STT stream #{stream_num} ended: {reason} - {message}")
+                            try:
+                                await websocket.send_json({
+                                    "event": "stream_ended",
+                                    "reason": reason,
+                                    "message": message
+                                })
+                            except Exception:
+                                pass
+                            return
+
+            except Exception as e:
+                logger.error(f"[/ws/stream] STT Error on stream #{stream_num}: {e}", exc_info=True)
+                if not stop_requested:
                     try:
-                        await websocket.send_json({"event": "vad", "state": event["vad_event"]})
+                        await websocket.send_json({"event": "error", "message": str(e)})
                     except Exception:
                         pass
+                return
 
-        except Exception as e:
-            logger.error(f"[/ws/stream] STT Error: {e}", exc_info=True)
-            if not stop_requested:
-                try:
-                    await websocket.send_json({"event": "error", "message": str(e)})
-                except Exception:
-                    pass
-        finally:
-            logger.info(f"[/ws/stream] V2 STT task finished. Accumulated {len(transcript_segments)} final segments.")
+            if should_reconnect:
+                reconnect_count += 1
+                # 短い待機で音声バッファを溜める
+                await asyncio.sleep(0.1)
+                continue
+            else:
+                # 正常終了 (stopイベント等)
+                break
+
+        if reconnect_count >= MAX_RECONNECTS:
+            logger.warning(f"[/ws/stream] Max reconnect limit reached ({MAX_RECONNECTS})")
+            try:
+                await websocket.send_json({
+                    "event": "stream_ended",
+                    "reason": "max_reconnects",
+                    "message": f"Maximum recording duration reached ({MAX_RECONNECTS * 5} minutes)"
+                })
+            except Exception:
+                pass
+
+        logger.info(f"[/ws/stream] V2 STT task finished. Streams used: {reconnect_count + 1}, "
+                   f"Accumulated {len(transcript_segments)} final segments.")
 
     try:
         while True:
@@ -695,12 +777,21 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                     if audio_queue.full():
                         try:
                             _ = audio_queue.get_nowait()
+                            audio_drop_count += 1
+                            if audio_drop_count == 1 or audio_drop_count % 100 == 0:
+                                logger.warning(f"[/ws/stream] Audio queue full, dropped {audio_drop_count} chunks so far. session={session_id}")
                         except asyncio.QueueEmpty:
                             pass
                     await audio_queue.put(pcm)
 
     except WebSocketDisconnect:
         logger.info(f"[/ws/stream] Disconnected session={session_id}")
+    except RuntimeError as e:
+        # [FIX] Handle "Cannot call receive once a disconnect message has been received"
+        if "disconnect" in str(e).lower():
+            logger.info(f"[/ws/stream] Client already disconnected session={session_id}")
+        else:
+            logger.error(f"[/ws/stream] RuntimeError: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"[/ws/stream] Unexpected: {e}", exc_info=True)
     finally:
@@ -737,34 +828,51 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                     user_doc = db.collection("users").document(uid).get()
                     if user_doc.exists and user_doc.to_dict().get("plan", "free") == "free":
                         from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-                        
+
+                        # [FIX] Use session-based idempotency key to prevent duplicate consumption
+                        summary_idem_key = f"auto_summary:{session_id}"
+                        quiz_idem_key = f"auto_quiz:{session_id}"
+
                         logger.info(f"[FreePlan] Auto-triggering Summary/Quiz for {session_id} (Streaming)")
-                        enqueue_summarize_task(session_id, user_id=uid)
-                        enqueue_quiz_task(session_id, count=3, user_id=uid)
+                        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=summary_idem_key)
+                        enqueue_quiz_task(session_id, count=3, user_id=uid, idempotency_key=quiz_idem_key)
                 except Exception as e:
                      logger.error(f"[FreePlan] Auto-trigger failed (Stream): {e}")
 
-        # Log Usage for Billing
-        if total_audio_bytes > 0:
+        # [FIX] Update cloud_stt_sec quota in Firestore
+        if consumed_quota_sec > 0 and quota_id:
             try:
-                # 16kHz, 16bit (2bytes) -> 32000 bytes/sec
-                rec_sec = total_audio_bytes / 32000.0
-                uid = session_data.get("userId") or session_data.get("ownerUserId") or session_id
-                target_account_id = session_data.get("ownerAccountId") or uid
-                
-                # Fire and forget usage log
+                month_key = cost_guard._get_month_key()
+                quota_ref = cost_guard._get_monthly_doc_ref(quota_id, mode=quota_mode)
+                quota_ref.set({
+                    "cloud_stt_sec": firestore.Increment(consumed_quota_sec),
+                    "updated_at": datetime.now(timezone.utc)
+                }, merge=True)
+                logger.info(f"[/ws/stream] Updated cloud_stt_sec: +{consumed_quota_sec:.1f}s for {quota_mode}={quota_id} ({month_key})")
+            except Exception as e:
+                logger.error(f"[/ws/stream] Failed to update cloud_stt_sec: {e}")
+
+        # Log Usage for Analytics (use consumed_quota_sec for consistency with billing)
+        if consumed_quota_sec > 0:
+            try:
+                # Use the same value as quota update for consistency
+                # quota_id is used for billing, but we log under uid for user-level analytics
+                target_uid = session_data.get("userId") or session_data.get("ownerUserId") or uid
+
+                # Fire and forget usage log - use consumed_quota_sec (same as billing)
                 asyncio.create_task(usage_logger.log(
-                    user_id=target_account_id, # Log to account for quota enforcement
+                    user_id=target_uid,  # Log to user ID for consistency with daily usage lookup
                     session_id=session_id,
                     feature="transcribe",
                     event_type="success",
                     payload={
-                        "recording_sec": rec_sec,
+                        "recording_sec": consumed_quota_sec,  # Use same value as billing
                         "type": "cloud",
                         "mode": session_data.get("mode"),
                         "tags": session_data.get("tags")
                     }
                 ))
+                logger.info(f"[/ws/stream] Logged usage: {consumed_quota_sec:.1f}s for user={target_uid}")
             except Exception as e:
                 logger.error(f"[/ws/stream] Failed to log usage: {e}")
 

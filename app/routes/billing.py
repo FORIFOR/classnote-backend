@@ -3,10 +3,11 @@ import os
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from google.cloud import firestore
+from pydantic import BaseModel, Field
 
 from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.firebase import db
@@ -14,6 +15,39 @@ from app.services.apple import apple_service
 from app.services.app_config import is_feature_enabled, get_maintenance_error_response
 from app.util_models import BillingConfirmRequest, AppStoreNotificationRequest, BillingConfirmResponse
 from app.utils.idempotency import idempotency, ResourceAlreadyProcessed
+
+
+# =============================================================================
+# Request/Response Models for Entitlements Sync
+# =============================================================================
+
+class EntitlementItem(BaseModel):
+    """Single entitlement item from iOS app."""
+    product_id: str = Field(..., alias="productId")
+    original_transaction_id: str = Field(..., alias="originalTransactionId")
+    transaction_id: Optional[str] = Field(None, alias="transactionId")
+    expiration_date: Optional[str] = Field(None, alias="expirationDate")
+
+    class Config:
+        populate_by_name = True
+
+
+class EntitlementsSyncRequest(BaseModel):
+    """Request to sync entitlements from iOS app."""
+    items: List[EntitlementItem]
+
+
+class EntitlementsSyncResponse(BaseModel):
+    """Response after syncing entitlements."""
+    ok: bool
+    plan: str
+    entitled: bool
+    synced_count: int = Field(..., alias="syncedCount")
+    expires_at: Optional[int] = Field(None, alias="expiresAt")
+    details: Optional[List[dict]] = None
+
+    class Config:
+        populate_by_name = True
 
 
 logger = logging.getLogger("app.billing")
@@ -189,6 +223,231 @@ def _diff_transaction_info(primary: Any, secondary: Any) -> dict:
     return diff
 
 
+# =============================================================================
+# POST /billing/ios/entitlements/sync - Sync entitlements from iOS app
+# =============================================================================
+
+@router.post("/ios/entitlements/sync", response_model=EntitlementsSyncResponse)
+async def sync_ios_entitlements(
+    req: EntitlementsSyncRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    response: Response = None,
+):
+    """
+    Sync entitlements from iOS app to server.
+
+    This endpoint is called by the iOS app when:
+    - App launches and detects entitlements via Transaction.currentEntitlements
+    - User redeems an Offer Code (in-app or externally)
+    - Transaction.updates receives a new transaction
+
+    The server will:
+    1. Link user_id <-> original_transaction_id in DB
+    2. Call Apple's Get All Subscription Statuses API to verify
+    3. Update the user's plan in DB
+    4. Optionally set appAccountToken if not already set
+
+    This ensures the server is always in sync even if:
+    - Offer Code was redeemed outside the app
+    - App Store Server Notifications were missed
+    """
+    request_id = str(uuid.uuid4())
+    if response is not None:
+        response.headers["X-Request-Id"] = request_id
+
+    if not is_feature_enabled("payment"):
+        raise HTTPException(
+            status_code=503,
+            detail=get_maintenance_error_response("payment"),
+        )
+
+    if not req.items:
+        return EntitlementsSyncResponse(
+            ok=True,
+            plan="free",
+            entitled=False,
+            synced_count=0,
+        )
+
+    # Get account ID
+    link_doc = db.collection("uid_links").document(current_user.uid).get()
+    account_id = link_doc.to_dict().get("accountId") if link_doc.exists else None
+
+    # Generate appAccountToken from account_id (UUID format required by Apple)
+    app_account_token = None
+    if account_id:
+        # Convert account_id to UUID format if not already
+        try:
+            app_account_token = str(uuid.UUID(account_id))
+        except ValueError:
+            # If account_id is not UUID, create a deterministic UUID from it
+            app_account_token = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"classnote.{account_id}"))
+
+    synced_details = []
+    best_plan = "free"
+    best_expires_at = None
+    is_entitled = False
+
+    for item in req.items:
+        original_transaction_id = item.original_transaction_id
+        product_id = item.product_id
+
+        logger.info(
+            "entitlements_sync_item",
+            extra={
+                "uid": current_user.uid,
+                "accountId": account_id,
+                "originalTransactionId": original_transaction_id,
+                "productId": product_id,
+            }
+        )
+
+        # 1. Store user_id <-> original_transaction_id mapping
+        db.collection("apple_transactions").document(original_transaction_id).set({
+            "uid": current_user.uid,
+            "accountId": account_id,
+            "productId": product_id,
+            "source": "entitlements_sync",
+            "lastSyncAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        # 2. Call Apple API to get authoritative subscription status
+        apple_status = apple_service.get_subscription_status_for_account(
+            original_transaction_id,
+            expected_app_account_token=app_account_token
+        )
+
+        if not apple_status.get("found"):
+            logger.warning(
+                "entitlements_sync_not_found_in_apple",
+                extra={
+                    "originalTransactionId": original_transaction_id,
+                    "uid": current_user.uid,
+                }
+            )
+            synced_details.append({
+                "originalTransactionId": original_transaction_id,
+                "status": "not_found",
+                "error": "Subscription not found in Apple API",
+            })
+            continue
+
+        status = apple_status.get("status", "unknown")
+        active = apple_status.get("active", False)
+        expires_date = apple_status.get("expires_date")
+        actual_product_id = apple_status.get("product_id") or product_id
+        existing_token = apple_status.get("app_account_token")
+
+        # Determine plan from product_id
+        plan = _plan_for_product_id(actual_product_id)
+        if not active:
+            plan = "free"
+
+        # 3. Set appAccountToken if not already set (links subscription to our user)
+        if app_account_token and not existing_token:
+            token_set = apple_service.set_app_account_token(
+                original_transaction_id,
+                app_account_token
+            )
+            if token_set:
+                logger.info(
+                    "entitlements_sync_token_set",
+                    extra={
+                        "originalTransactionId": original_transaction_id,
+                        "appAccountToken": app_account_token,
+                    }
+                )
+
+        # 4. Update entitlements collection
+        entitlement_id = f"apple:{original_transaction_id}"
+        entitlement_ref = db.collection("entitlements").document(entitlement_id)
+        existing_entitlement = entitlement_ref.get()
+
+        entitlement_data = {
+            "status": status,
+            "plan": plan,
+            "productId": actual_product_id,
+            "currentPeriodEnd": _ms_to_datetime(expires_date) if expires_date else None,
+            "provider": "apple",
+            "providerEntitlementId": original_transaction_id,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedBy": "entitlements_sync",
+        }
+
+        if not existing_entitlement.exists:
+            entitlement_data["ownerAccountId"] = account_id
+            entitlement_data["ownerUserId"] = current_user.uid
+            entitlement_data["createdAt"] = firestore.SERVER_TIMESTAMP
+        else:
+            # Verify ownership
+            existing_owner = existing_entitlement.to_dict().get("ownerAccountId")
+            if existing_owner and existing_owner != account_id:
+                logger.warning(
+                    "entitlements_sync_ownership_conflict",
+                    extra={
+                        "entitlementId": entitlement_id,
+                        "existingOwner": existing_owner,
+                        "requestingAccount": account_id,
+                    }
+                )
+                synced_details.append({
+                    "originalTransactionId": original_transaction_id,
+                    "status": "ownership_conflict",
+                    "error": "Subscription owned by another account",
+                })
+                continue
+
+        entitlement_ref.set(entitlement_data, merge=True)
+
+        # 5. Update account plan if this is the best entitlement
+        if active and plan != "free":
+            is_entitled = True
+            if plan == "basic":  # or compare priority
+                best_plan = plan
+                best_expires_at = expires_date
+
+        synced_details.append({
+            "originalTransactionId": original_transaction_id,
+            "status": status,
+            "plan": plan,
+            "active": active,
+            "expiresAt": expires_date,
+        })
+
+    # 6. Update account with best plan
+    if account_id and is_entitled:
+        db.collection("accounts").document(account_id).set({
+            "plan": best_plan,
+            "planExpiresAt": _ms_to_datetime(best_expires_at) if best_expires_at else None,
+            "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        db.collection("users").document(current_user.uid).update({
+            "plan": best_plan,
+            "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+        })
+
+    logger.info(
+        "entitlements_sync_completed",
+        extra={
+            "uid": current_user.uid,
+            "accountId": account_id,
+            "syncedCount": len(synced_details),
+            "resultPlan": best_plan,
+            "entitled": is_entitled,
+        }
+    )
+
+    return EntitlementsSyncResponse(
+        ok=True,
+        plan=best_plan,
+        entitled=is_entitled,
+        synced_count=len(synced_details),
+        expires_at=best_expires_at,
+        details=synced_details,
+    )
+
+
 @router.post("/ios/confirm", response_model=BillingConfirmResponse)
 async def confirm_ios_purchase(
     req: BillingConfirmRequest,
@@ -291,13 +550,20 @@ async def confirm_ios_purchase(
         raise HTTPException(status_code=400, detail="Bundle ID mismatch")
     
     # Environment check (Sandbox vs Production)
-    # apple_service.environment is VerifierEnvironment enum
-    # We can check fields.get("environment") string.
-    jws_env = fields.get("environment", "").lower()
-    if apple_service.environment:
-        # Check mismatch if we are in Production but got Sandbox receipt, or vice versa
-        # Note: server lib environment handles this verification usually.
-        pass
+    # Only Production transactions should update account.plan and account.appleEntitlementId
+    jws_env = fields.get("environment", "Production")
+    is_production = jws_env == "Production"
+
+    if not is_production:
+        logger.info(
+            "billing.ios.confirm.sandbox_transaction",
+            extra={
+                "uid": current_user.uid,
+                "environment": jws_env,
+                "originalTransactionId": original_transaction_id,
+                "note": "Sandbox transactions are recorded but do not affect account plan"
+            }
+        )
 
     subscription_data = {
         **fields,
@@ -336,20 +602,23 @@ async def confirm_ios_purchase(
     # [FIX] Create entitlement ID for linking
     entitlement_id = f"apple:{original_transaction_id}" if original_transaction_id else None
 
-    db.collection("users").document(current_user.uid).update({
-        "plan": plan,
-        "subscriptionPlatform": "ios",
-        "planUpdatedAt": firestore.SERVER_TIMESTAMP,
-        "appleEntitlementId": entitlement_id,  # [FIX] Set entitlement ID
-    })
+    # [FIX] Only update user/account plan for Production transactions
+    # Sandbox transactions are recorded in entitlements but don't affect plan
+    if is_production:
+        db.collection("users").document(current_user.uid).update({
+            "plan": plan,
+            "subscriptionPlatform": "ios",
+            "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+            "appleEntitlementId": entitlement_id,
+        })
 
-    # [Unified Account] Sync Plan to Account
+    # [Unified Account] Sync Plan to Account (Production only)
     link_ref = db.collection("uid_links").document(current_user.uid)
     link_doc = link_ref.get()
     account_id = None
     if link_doc.exists:
         account_id = link_doc.to_dict().get("accountId")
-        if account_id:
+        if account_id and is_production:
              # We should store expiresAt on the account for JIT checks
              update_data = {
                  "plan": plan,
@@ -357,7 +626,7 @@ async def confirm_ios_purchase(
                  "planUpdatedAt": firestore.SERVER_TIMESTAMP,
                  "lastTransactionId": fields.get("transactionId"),
                  "originalTransactionId": original_transaction_id,
-                 "appleEntitlementId": entitlement_id,  # [FIX] Set entitlement ID
+                 "appleEntitlementId": entitlement_id,
              }
 
              db.collection("accounts").document(account_id).set(update_data, merge=True)
@@ -422,8 +691,16 @@ async def confirm_ios_purchase(
                         "requestingUid": current_user.uid,
                     }
                 )
-                # Don't overwrite owner, but still update status
-                # (This allows the original owner to keep entitlement)
+                # [FIX] Return 409 Conflict instead of silently accepting
+                # This prevents one account from claiming another's subscription
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "entitlement_owned_by_another_account",
+                        "message": "This subscription is already linked to a different account",
+                        "ownerAccountId": existing_owner,
+                    }
+                )
 
         entitlement_ref.set(entitlement_data, merge=True)
 
@@ -438,6 +715,158 @@ async def confirm_ios_purchase(
         productId=product_id,
         requestId=request_id,
     )
+
+
+@router.post("/apple/reconcile")
+async def reconcile_apple_subscriptions():
+    """
+    Daily reconciliation task: Verify all active Apple subscriptions against Apple API.
+
+    This endpoint should be called by Cloud Scheduler (cron job) once per day.
+    It fetches all subscriptions marked as active/billing_retry/grace_period and
+    verifies their current status with Apple's Get All Subscription Statuses API.
+
+    Returns:
+        Summary of reconciliation results
+    """
+    if not apple_service.client:
+        raise HTTPException(status_code=503, detail="App Store client not configured")
+
+    logger.info("subscription_reconciliation_started")
+
+    # 1. Get all active subscriptions from our database
+    active_statuses = ["active", "billing_retry", "grace_period"]
+
+    try:
+        entitlements_query = db.collection("entitlements")\
+            .where("provider", "==", "apple")\
+            .where("status", "in", active_statuses)
+
+        entitlements = list(entitlements_query.stream())
+    except Exception as e:
+        # Firestore may require a composite index for this query
+        # Fallback: query without status filter
+        logger.warning(f"Composite index may be missing, falling back: {e}")
+        entitlements_query = db.collection("entitlements").where("provider", "==", "apple")
+        entitlements = [
+            doc for doc in entitlements_query.stream()
+            if doc.to_dict().get("status") in active_statuses
+        ]
+
+    results = {
+        "checked": 0,
+        "unchanged": 0,
+        "updated": 0,
+        "expired": 0,
+        "revoked": 0,
+        "errors": 0,
+        "details": []
+    }
+
+    for entitlement_doc in entitlements:
+        entitlement_id = entitlement_doc.id
+        entitlement_data = entitlement_doc.to_dict()
+        original_transaction_id = entitlement_data.get("providerEntitlementId")
+        owner_account_id = entitlement_data.get("ownerAccountId")
+        current_status = entitlement_data.get("status")
+
+        if not original_transaction_id:
+            continue
+
+        results["checked"] += 1
+
+        try:
+            # 2. Call Apple API
+            apple_status = apple_service.get_subscription_status_for_account(original_transaction_id)
+
+            if not apple_status.get("found"):
+                logger.warning(
+                    "reconciliation_subscription_not_found",
+                    extra={
+                        "entitlementId": entitlement_id,
+                        "originalTransactionId": original_transaction_id,
+                    }
+                )
+                results["errors"] += 1
+                continue
+
+            new_status = apple_status.get("status", "unknown")
+            is_active = apple_status.get("active", False)
+            new_plan = "basic" if is_active else "free"
+
+            # 3. Compare and update if different
+            if new_status != current_status:
+                logger.info(
+                    "reconciliation_status_changed",
+                    extra={
+                        "entitlementId": entitlement_id,
+                        "originalTransactionId": original_transaction_id,
+                        "ownerAccountId": owner_account_id,
+                        "oldStatus": current_status,
+                        "newStatus": new_status,
+                    }
+                )
+
+                # Update entitlement
+                expires_date = apple_status.get("expires_date")
+                db.collection("entitlements").document(entitlement_id).update({
+                    "status": new_status,
+                    "plan": new_plan,
+                    "currentPeriodEnd": _ms_to_datetime(expires_date) if expires_date else None,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "updatedBy": "reconciliation",
+                    "lastReconciliationAt": firestore.SERVER_TIMESTAMP,
+                })
+
+                # Update account plan if needed
+                if owner_account_id:
+                    db.collection("accounts").document(owner_account_id).update({
+                        "plan": new_plan,
+                        "planExpiresAt": _ms_to_datetime(expires_date) if expires_date else None,
+                        "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+                    })
+
+                results["updated"] += 1
+
+                if new_status == "expired":
+                    results["expired"] += 1
+                elif new_status == "revoked":
+                    results["revoked"] += 1
+
+                results["details"].append({
+                    "entitlementId": entitlement_id,
+                    "originalTransactionId": original_transaction_id,
+                    "change": f"{current_status} -> {new_status}",
+                })
+            else:
+                # Update lastReconciliationAt even if unchanged
+                db.collection("entitlements").document(entitlement_id).update({
+                    "lastReconciliationAt": firestore.SERVER_TIMESTAMP,
+                })
+                results["unchanged"] += 1
+
+        except Exception as e:
+            logger.error(
+                "reconciliation_error",
+                extra={
+                    "entitlementId": entitlement_id,
+                    "originalTransactionId": original_transaction_id,
+                    "error": str(e),
+                }
+            )
+            results["errors"] += 1
+
+    logger.info(
+        "subscription_reconciliation_completed",
+        extra={
+            "checked": results["checked"],
+            "updated": results["updated"],
+            "unchanged": results["unchanged"],
+            "errors": results["errors"],
+        }
+    )
+
+    return results
 
 
 @router.post("/apple/notifications")
@@ -509,13 +938,29 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
             )
 
         if uid:
-            # [Unified Account] Sync to Account
+            # [FIX] Only Production transactions should update account.plan
+            webhook_env = fields.get("environment", "Production")
+            is_production_webhook = webhook_env == "Production"
+
+            if not is_production_webhook:
+                logger.info(
+                    "billing.webhook.sandbox_transaction",
+                    extra={
+                        "uid": uid,
+                        "environment": webhook_env,
+                        "originalTransactionId": original_transaction_id,
+                        "notificationType": notification_type,
+                        "note": "Sandbox transactions are recorded but do not affect account plan"
+                    }
+                )
+
+            # [Unified Account] Sync to Account (Production only)
             link_ref = db.collection("uid_links").document(uid)
             link_doc = link_ref.get()
             account_id = None
             if link_doc.exists:
                 account_id = link_doc.to_dict().get("accountId")
-                if account_id:
+                if account_id and is_production_webhook:
                     db.collection("accounts").document(account_id).set({
                         "plan": plan,
                         "planExpiresAt": _ms_to_datetime(fields.get("expiresDateMs")),
@@ -537,7 +982,7 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                          }
                      )
 
-            # Update entitlements collection (source of truth)
+            # Update entitlements collection (record both Production and Sandbox for auditing)
             if original_transaction_id:
                 entitlement_id = f"apple:{original_transaction_id}"
                 entitlement_ref = db.collection("entitlements").document(entitlement_id)
@@ -546,7 +991,7 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                     "plan": plan,
                     "productId": product_id,
                     "currentPeriodEnd": _ms_to_datetime(fields.get("expiresDateMs")),
-                    "environment": fields.get("environment"),
+                    "environment": webhook_env,
                     "lastNotificationType": notification_type,
                     "updatedAt": firestore.SERVER_TIMESTAMP,
                     "updatedBy": "webhook",
@@ -561,6 +1006,7 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                     entitlement_update["createdAt"] = firestore.SERVER_TIMESTAMP
                 entitlement_ref.set(entitlement_update, merge=True)
 
+            # Update user subscription record (always, for history)
             db.collection("users").document(uid).collection("subscriptions").document("apple").set(
                 {
                     **summary_data,
@@ -569,12 +1015,15 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                 },
                 merge=True,
             )
-            db.collection("users").document(uid).update({
-                "plan": plan,
-                "subscriptionPlatform": "ios",
-                "planUpdatedAt": firestore.SERVER_TIMESTAMP,
-                "appleEntitlementId": f"apple:{original_transaction_id}" if original_transaction_id else None,
-            })
+
+            # Update user plan (Production only)
+            if is_production_webhook:
+                db.collection("users").document(uid).update({
+                    "plan": plan,
+                    "subscriptionPlatform": "ios",
+                    "planUpdatedAt": firestore.SERVER_TIMESTAMP,
+                    "appleEntitlementId": f"apple:{original_transaction_id}" if original_transaction_id else None,
+                })
         else:
             logger.warning(
                 "Notification received without user mapping: originalTransactionId=%s",

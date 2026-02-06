@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from typing import List, Optional
 from datetime import datetime
 from google.cloud import firestore
@@ -8,11 +8,14 @@ from google.cloud import firestore
 from app.firebase import db
 from app.dependencies import get_current_user, CurrentUser, CurrentUser
 from app.util_models import SessionResponse, TaskResponse, DecisionResponse
+from app.middleware.rate_limit import limiter, RateLimits
 
 router = APIRouter(prefix="/search", tags=["Search"])
 
 @router.get("/sessions", response_model=List[SessionResponse])
+@limiter.limit(RateLimits.SEARCH)  # 30 requests/minute
 async def search_sessions(
+    request: Request,  # Required for rate limiter
     q: Optional[str] = Query(None, description="Query text (title match or simple search)"),
     mode: Optional[str] = None,
     tag: Optional[str] = None,

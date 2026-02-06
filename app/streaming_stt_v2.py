@@ -137,5 +137,16 @@ class StreamingSTTV2:
                         yield {"vad_event": evt}
 
         except Exception as e:
-            logger.error(f"[StreamingSTTv2] Error: {e}")
-            raise e
+            error_str = str(e).lower()
+            # [FIX] Handle known STT stream errors gracefully
+            if "max duration" in error_str or "5 minutes" in error_str:
+                logger.warning("[StreamingSTTv2] Stream reached 5-minute limit (expected for long recordings)")
+                yield {"stream_ended": "max_duration", "message": "Stream reached 5-minute limit"}
+                return
+            elif "timed out" in error_str and "no more client requests" in error_str:
+                logger.warning("[StreamingSTTv2] Stream timed out waiting for client audio")
+                yield {"stream_ended": "client_timeout", "message": "No audio received"}
+                return
+            else:
+                logger.error(f"[StreamingSTTv2] Error: {e}")
+                raise e

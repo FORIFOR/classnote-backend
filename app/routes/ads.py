@@ -74,7 +74,7 @@ async def get_placement(
     """
     Get an ad placement for the given slot (e.g., 'summary_generating').
     """
-    # 1. Plan Check: If Premium, don't show ads
+    # 1. Plan Check: If Basic (paid plan), don't show ads
     if current_user and current_user.plan != "free":
         return PlacementResponse(ad=None)
     

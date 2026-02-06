@@ -2,13 +2,31 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from google.cloud import firestore
+from pydantic import BaseModel
 import logging
 
 from app.admin_auth import get_current_admin_user
 from app.services.ops_logger import OpsLogger, EventType, Severity
+from app.services.metrics import MetricsService, MetricName
+from app.services.job_manager import job_manager, JobStatus, ErrorCategory, can_retry
+from firebase_admin import auth as firebase_auth
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 logger = logging.getLogger("app.admin")
+
+
+# --- Account Disable/Enable Models ---
+
+class DisableAccountRequest(BaseModel):
+    reason: Optional[str] = None
+    scope: str = "all"
+    expiresAt: Optional[datetime] = None
+    revokeTokens: bool = True
+    disableFirebaseAuth: bool = True
+
+
+class EnableAccountRequest(BaseModel):
+    reason: Optional[str] = None
 
 # Initialize Firestore (or use shared instance)
 # For admin routes, we might want a fresh client or reuse from app.firebase
@@ -267,6 +285,185 @@ async def user_actions(uid: str, action_body: Dict[str, Any], admin_user: dict =
         
     raise HTTPException(400, "Invalid action")
 
+
+# --- Account Disable/Enable Endpoints ---
+
+@router.post("/users/{uid}/disable")
+async def disable_user_account(
+    uid: str,
+    req: DisableAccountRequest,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    アカウントを停止（凍結/BAN）する。
+    - Firestore の status を disabled に設定
+    - Firebase Auth のユーザーを無効化（オプション）
+    - リフレッシュトークンを無効化（オプション）
+    """
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    admin_uid = admin_user.get("uid")
+
+    # 1. Get user's accountId
+    user_ref = db.collection("users").document(uid)
+    user_doc = user_ref.get()
+
+    if not user_doc.exists:
+        raise HTTPException(404, "User not found")
+
+    user_data = user_doc.to_dict()
+    account_id = user_data.get("accountId")
+
+    # 2. Update Account status (primary)
+    if account_id:
+        acc_ref = db.collection("accounts").document(account_id)
+        acc_ref.set({
+            "status": "disabled",
+            "disabledAt": now,
+            "disabledReason": req.reason,
+            "disabledBy": admin_uid,
+            "disabledExpiresAt": req.expiresAt,
+            "updatedAt": now,
+        }, merge=True)
+
+    # 3. Update User status (backup/legacy)
+    user_ref.set({
+        "status": "disabled",
+        "securityState": "banned",
+        "disabledAt": now,
+        "disabledReason": req.reason,
+        "disabledBy": admin_uid,
+        "updatedAt": now,
+    }, merge=True)
+
+    # 4. Disable Firebase Auth (prevents new logins)
+    if req.disableFirebaseAuth:
+        try:
+            firebase_auth.update_user(uid, disabled=True)
+            logger.info(f"Firebase Auth disabled for uid={uid}")
+        except Exception as e:
+            logger.error(f"Failed to disable Firebase Auth for uid={uid}: {e}")
+
+    # 5. Revoke refresh tokens (force logout on next token refresh)
+    if req.revokeTokens:
+        try:
+            firebase_auth.revoke_refresh_tokens(uid)
+            logger.info(f"Refresh tokens revoked for uid={uid}")
+        except Exception as e:
+            logger.error(f"Failed to revoke tokens for uid={uid}: {e}")
+
+    # 6. Audit log
+    db.collection("admin_audit").add({
+        "action": "disable_user",
+        "targetUid": uid,
+        "targetAccountId": account_id,
+        "reason": req.reason,
+        "by": admin_uid,
+        "at": now,
+        "options": {
+            "disableFirebaseAuth": req.disableFirebaseAuth,
+            "revokeTokens": req.revokeTokens,
+            "expiresAt": req.expiresAt.isoformat() if req.expiresAt else None
+        }
+    })
+
+    # 7. Ops log
+    OpsLogger().log(
+        severity=Severity.WARN,
+        event_type=EventType.ADMIN_ACTION,
+        uid=uid,
+        message=f"User account DISABLED by admin: {req.reason or 'No reason provided'}",
+        debug={"adminUid": admin_uid, "accountId": account_id}
+    )
+
+    return {
+        "uid": uid,
+        "accountId": account_id,
+        "status": "disabled",
+        "disabledAt": now.isoformat(),
+        "reason": req.reason
+    }
+
+
+@router.post("/users/{uid}/enable")
+async def enable_user_account(
+    uid: str,
+    req: EnableAccountRequest,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    アカウント停止を解除する。
+    """
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    admin_uid = admin_user.get("uid")
+
+    # 1. Get user's accountId
+    user_ref = db.collection("users").document(uid)
+    user_doc = user_ref.get()
+
+    if not user_doc.exists:
+        raise HTTPException(404, "User not found")
+
+    user_data = user_doc.to_dict()
+    account_id = user_data.get("accountId")
+
+    # 2. Update Account status
+    if account_id:
+        acc_ref = db.collection("accounts").document(account_id)
+        acc_ref.set({
+            "status": "active",
+            "disabledAt": None,
+            "disabledReason": None,
+            "disabledBy": None,
+            "disabledExpiresAt": None,
+            "updatedAt": now,
+        }, merge=True)
+
+    # 3. Update User status
+    user_ref.set({
+        "status": "active",
+        "securityState": firestore.DELETE_FIELD,
+        "disabledAt": firestore.DELETE_FIELD,
+        "disabledReason": firestore.DELETE_FIELD,
+        "disabledBy": firestore.DELETE_FIELD,
+        "quarantineUntil": firestore.DELETE_FIELD,
+        "updatedAt": now,
+    }, merge=True)
+
+    # 4. Re-enable Firebase Auth
+    try:
+        firebase_auth.update_user(uid, disabled=False)
+        logger.info(f"Firebase Auth enabled for uid={uid}")
+    except Exception as e:
+        logger.error(f"Failed to enable Firebase Auth for uid={uid}: {e}")
+
+    # 5. Audit log
+    db.collection("admin_audit").add({
+        "action": "enable_user",
+        "targetUid": uid,
+        "targetAccountId": account_id,
+        "reason": req.reason,
+        "by": admin_uid,
+        "at": now,
+    })
+
+    # 6. Ops log
+    OpsLogger().log(
+        severity=Severity.INFO,
+        event_type=EventType.ADMIN_ACTION,
+        uid=uid,
+        message=f"User account ENABLED by admin: {req.reason or 'No reason provided'}",
+        debug={"adminUid": admin_uid, "accountId": account_id}
+    )
+
+    return {
+        "uid": uid,
+        "accountId": account_id,
+        "status": "active"
+    }
+
+
 @router.get("/sessions/{session_id}")
 async def get_session_detail(session_id: str, admin_user: dict = Depends(get_current_admin_user)):
     """
@@ -394,3 +591,262 @@ async def purge_user(uid: str, admin_user: dict = Depends(get_current_admin_user
     )
     
     return {"ok": True, "deleted": deleted_counts}
+
+
+@router.get("/metrics/summary")
+async def get_metrics_summary(
+    hours: int = Query(1, ge=1, le=24),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Get metrics summary for the last N hours.
+    Returns aggregated metrics for monitoring dashboards.
+    """
+    metrics_service = MetricsService()
+    summary = metrics_service.get_metrics_summary(hours=hours)
+
+    return {
+        "hours": hours,
+        "metrics": summary
+    }
+
+
+@router.get("/metrics/gauges")
+async def get_metrics_gauges(
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Get current gauge metrics (queue depth, active connections, etc.).
+    """
+    db = get_db()
+
+    # Fetch all gauge metrics
+    gauges = {}
+    try:
+        docs = list(db.collection("metrics_gauges").stream())
+        for doc in docs:
+            data = doc.to_dict()
+            gauges[data.get("metric", doc.id)] = {
+                "value": data.get("value"),
+                "labels": data.get("labels", {}),
+                "updatedAt": data.get("updatedAt")
+            }
+    except Exception as e:
+        logger.error(f"Failed to fetch gauges: {e}")
+
+    return {"gauges": gauges}
+
+
+# --- Job Management ---
+
+@router.get("/jobs/{session_id}")
+async def get_session_jobs(
+    session_id: str,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Get all jobs for a session with detailed status.
+    """
+    db = get_db()
+
+    session_doc = db.collection("sessions").document(session_id).get()
+    if not session_doc.exists:
+        raise HTTPException(404, "Session not found")
+
+    jobs_ref = db.collection("sessions").document(session_id).collection("jobs")
+    jobs = []
+
+    for job_doc in jobs_ref.stream():
+        job_data = job_doc.to_dict()
+        job_data["id"] = job_doc.id
+        job_data["sessionId"] = session_id
+
+        # Check if retryable
+        error_category = job_data.get("errorCategory")
+        retry_count = job_data.get("retryCount", 0)
+        if error_category and job_data.get("status") == "failed":
+            try:
+                cat = ErrorCategory(error_category)
+                job_data["canRetry"] = can_retry(cat, retry_count)
+            except ValueError:
+                job_data["canRetry"] = False
+        else:
+            job_data["canRetry"] = False
+
+        jobs.append(job_data)
+
+    return {"sessionId": session_id, "jobs": jobs}
+
+
+@router.post("/jobs/{session_id}/{job_id}/retry")
+async def retry_job(
+    session_id: str,
+    job_id: str,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    Manually retry a failed job.
+
+    This will:
+    1. Check if job exists and is failed
+    2. Verify retry is allowed (category + count)
+    3. Increment retry count
+    4. Re-enqueue the job
+    """
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    admin_uid = admin_user.get("uid")
+
+    # 1. Get job
+    job = job_manager.get_job(session_id, job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    job_type = job.get("type")
+    job_status = job.get("status")
+    error_category = job.get("errorCategory")
+    retry_count = job.get("retryCount", 0)
+
+    # 2. Check if retry is allowed
+    if job_status not in ["failed", "abandoned"]:
+        raise HTTPException(400, f"Cannot retry job with status: {job_status}")
+
+    # Admin can force retry even if normally not allowed
+    force_retry = True
+
+    if not force_retry:
+        if error_category:
+            try:
+                cat = ErrorCategory(error_category)
+                if not can_retry(cat, retry_count):
+                    raise HTTPException(
+                        400,
+                        f"Job cannot be retried: category={error_category}, retryCount={retry_count}"
+                    )
+            except ValueError:
+                pass
+
+    # 3. Get session owner for re-enqueue
+    session_doc = db.collection("sessions").document(session_id).get()
+    if not session_doc.exists:
+        raise HTTPException(404, "Session not found")
+
+    session_data = session_doc.to_dict()
+    owner_uid = session_data.get("ownerUid") or session_data.get("userId")
+
+    # 4. Record retry
+    new_retry_count = job_manager.record_retry(session_id, job_id)
+
+    # 5. Re-enqueue based on job type
+    from app.task_queue import (
+        enqueue_summarize_task,
+        enqueue_quiz_task,
+        enqueue_transcribe_task,
+        enqueue_translate_task,
+    )
+
+    idempotency_key = f"admin_retry_{job_id}_{new_retry_count}"
+
+    if job_type == "summary" or job_type == "summarize":
+        enqueue_summarize_task(session_id, job_id=job_id, user_id=owner_uid, idempotency_key=idempotency_key)
+    elif job_type == "quiz":
+        enqueue_quiz_task(session_id, job_id=job_id, user_id=owner_uid, idempotency_key=idempotency_key)
+    elif job_type == "transcribe":
+        enqueue_transcribe_task(session_id, user_id=owner_uid)
+    elif job_type == "translate":
+        target_lang = job.get("metadata", {}).get("targetLang", "en")
+        enqueue_translate_task(session_id, target_lang, user_id=owner_uid)
+    else:
+        raise HTTPException(400, f"Unknown job type: {job_type}")
+
+    # 6. Audit log
+    OpsLogger().log(
+        severity=Severity.INFO,
+        event_type=EventType.ADMIN_ACTION,
+        server_session_id=session_id,
+        job_id=job_id,
+        message=f"Job manually retried by admin (attempt #{new_retry_count})",
+        debug={"adminUid": admin_uid, "jobType": job_type, "previousError": job.get("errorMessage")}
+    )
+
+    return {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "type": job_type,
+        "retryCount": new_retry_count,
+        "status": "queued",
+        "retriedBy": admin_uid,
+        "retriedAt": now.isoformat()
+    }
+
+
+@router.get("/jobs/failed")
+async def list_failed_jobs(
+    hours: int = Query(24, ge=1, le=168),
+    limit: int = Query(100, ge=1, le=500),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    List recently failed jobs across all sessions.
+    """
+    db = get_db()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    # Query recent sessions and check their jobs
+    # Note: This is not optimal for large scale - would need a dedicated index
+    sessions_query = db.collection("sessions")\
+        .order_by("updatedAt", direction=firestore.Query.DESCENDING)\
+        .limit(500)
+
+    failed_jobs = []
+
+    for session_doc in sessions_query.stream():
+        session_id = session_doc.id
+
+        jobs_query = session_doc.reference.collection("jobs")\
+            .where("status", "in", ["failed", "abandoned"])\
+            .limit(20)
+
+        for job_doc in jobs_query.stream():
+            job_data = job_doc.to_dict()
+            updated_at = job_data.get("updatedAt") or job_data.get("createdAt")
+
+            # Filter by time
+            if updated_at and hasattr(updated_at, "timestamp"):
+                if updated_at < cutoff:
+                    continue
+
+            job_data["id"] = job_doc.id
+            job_data["sessionId"] = session_id
+
+            # Check if retryable
+            error_category = job_data.get("errorCategory")
+            retry_count = job_data.get("retryCount", 0)
+            if error_category:
+                try:
+                    cat = ErrorCategory(error_category)
+                    job_data["canRetry"] = can_retry(cat, retry_count)
+                except ValueError:
+                    job_data["canRetry"] = False
+            else:
+                job_data["canRetry"] = False
+
+            failed_jobs.append(job_data)
+
+            if len(failed_jobs) >= limit:
+                break
+
+        if len(failed_jobs) >= limit:
+            break
+
+    # Sort by updatedAt descending
+    failed_jobs.sort(
+        key=lambda x: x.get("updatedAt") or x.get("createdAt") or datetime.min,
+        reverse=True
+    )
+
+    return {
+        "hours": hours,
+        "count": len(failed_jobs),
+        "jobs": failed_jobs[:limit]
+    }

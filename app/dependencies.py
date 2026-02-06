@@ -6,6 +6,7 @@ from firebase_admin import auth
 from google.cloud import firestore
 from app.firebase import db
 from app.services.account_deletion import LOCKS_COLLECTION, deletion_lock_id
+from app.services.profiling import phase, Phase
 import time
 from datetime import datetime, timezone, timedelta
 import datetime as dt_module # Fallback
@@ -136,7 +137,10 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
 
 def _resolve_user_from_token(token: str) -> CurrentUser:
     try:
-        decoded_token = auth.verify_id_token(token, check_revoked=False)
+        # Time token verification
+        with phase(Phase.AUTH_VERIFY):
+            decoded_token = auth.verify_id_token(token, check_revoked=False)
+
         uid = decoded_token.get("uid")
         email = decoded_token.get("email")
         # Firebase Auth phone_number is top-level claim
@@ -153,7 +157,9 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
             )
 
         # [CRITICAL] Always resolve accountId - this is the canonical identity
-        account_id = _resolve_account_id_for_uid(uid, phone_number)
+        # Time account resolution (includes Firestore calls)
+        with phase(Phase.AUTH, op="resolve_account"):
+            account_id = _resolve_account_id_for_uid(uid, phone_number)
 
         return CurrentUser(
             uid=uid,
@@ -183,6 +189,44 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
 
 
 
+def _check_account_disabled(account_id: str, uid: str) -> None:
+    """
+    Check if account or user is disabled. Raises 403 if disabled.
+    """
+    # Check account status first
+    acc_doc = db.collection("accounts").document(account_id).get()
+    if acc_doc.exists:
+        acc_data = acc_doc.to_dict()
+        if acc_data.get("status") == "disabled":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": {
+                        "code": "ACCOUNT_DISABLED",
+                        "message": "このアカウントは利用停止中です。",
+                        "reason": acc_data.get("disabledReason"),
+                        "disabledAt": acc_data.get("disabledAt").isoformat() if acc_data.get("disabledAt") else None
+                    }
+                }
+            )
+
+    # Also check user-level status (legacy/backup)
+    user_doc = db.collection("users").document(uid).get()
+    if user_doc.exists:
+        user_data = user_doc.to_dict()
+        if user_data.get("status") == "disabled" or user_data.get("securityState") == "banned":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": {
+                        "code": "ACCOUNT_DISABLED",
+                        "message": "このアカウントは利用停止中です。",
+                        "reason": user_data.get("disabledReason") or user_data.get("securityNote"),
+                    }
+                }
+            )
+
+
 async def get_current_user(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -195,6 +239,10 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     user = _resolve_user_from_token(token)
+
+    # [SECURITY] Check if account is disabled
+    _check_account_disabled(user.account_id, user.uid)
+
     # [NEW] Inject UID into request state for OpsLogger
     request.state.uid = user.uid
     request.state.email = user.email
@@ -299,16 +347,33 @@ def ensure_can_view(session_data: dict, user_or_uid: Union[str, CurrentUser], se
 
     owner_account_id = session_data.get("ownerAccountId")
 
-    # [CRITICAL] Require ownerAccountId - sessions without it need migration
+    # [MIGRATION COMPAT] For sessions without ownerAccountId, use legacy uid-based checks
     if not owner_account_id:
-        # Temporary compatibility: check ownerUid match during migration period
-        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId")
+        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("userId")
+
+        # Owner check (legacy)
         if owner_uid == uid:
             logger.warning(f"[ensure_can_view] Session missing ownerAccountId, uid match used (migration needed)")
             return
+
+        # Shared access check (legacy) - allow viewers to access
+        shared_users = session_data.get("sharedUserIds") or session_data.get("sharedWithUserIds") or []
+        shared_map = session_data.get("sharedWith") or {}
+        if uid in shared_users or shared_map.get(uid):
+            logger.warning(f"[ensure_can_view] Session missing ownerAccountId, shared uid match used")
+            return
+
+        # Session member check (legacy)
+        if session_id:
+            member = _get_session_member(session_id, uid)
+            if member:
+                logger.warning(f"[ensure_can_view] Session missing ownerAccountId, member match used")
+                return
+
+        # No access
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Session requires migration (missing ownerAccountId)"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this session"
         )
 
     # 1. Account Match (Primary check)
@@ -356,16 +421,23 @@ def ensure_is_owner(session_data: dict, user_or_uid: Union[str, CurrentUser], se
 
     owner_account_id = session_data.get("ownerAccountId")
 
-    # [CRITICAL] Require ownerAccountId - sessions without it need migration
+    # [MIGRATION COMPAT] For sessions without ownerAccountId, use legacy uid-based checks
     if not owner_account_id:
-        # Temporary compatibility: check ownerUid match during migration period
-        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId")
+        owner_uid = session_data.get("ownerUid") or session_data.get("ownerUserId") or session_data.get("userId")
         if owner_uid == uid:
             logger.warning(f"[ensure_is_owner] Session missing ownerAccountId, uid match used (migration needed)")
             return
+
+        # Session member with owner role (legacy)
+        if session_id:
+            member = _get_session_member(session_id, uid)
+            if member and member.get("role") == "owner":
+                logger.warning(f"[ensure_is_owner] Session missing ownerAccountId, member role match used")
+                return
+
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Session requires migration (missing ownerAccountId)"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can perform this operation"
         )
 
     # Account Match (Primary check)

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from google.cloud import firestore
 from datetime import datetime, timezone
 import logging
@@ -11,14 +12,18 @@ logger = logging.getLogger("app.account")
 
 router = APIRouter()
 
-@router.post("/me/phone:link")
+@router.post("/me/phone:link", deprecated=True)
 def link_phone(user: CurrentUser = Depends(get_current_user)):
     """
+    [DEPRECATED] Use POST /phone/link instead.
+
     Links the current authenticated UID to an Account based on the verified phone number.
     The ID Token MUST contain a 'phone_number' claim (verified by Firebase).
-    
+
     Implements 'Reject-less' logic with strict Transaction Safety (Read-Before-Write).
     Also performs Session Migration if an attach (user switch) occurs.
+
+    Migration: Call POST /phone/link with {"phoneE164": "<phone>"} instead.
     """
     logger.info(f"Link phone request: uid={user.uid} phone={user.phone_number}")
 
@@ -197,11 +202,15 @@ def link_phone(user: CurrentUser = Depends(get_current_user)):
             except Exception as e:
                 logger.error(f"Session migration failed: {e}")
 
-    return {
-        "ok": True, 
-        "accountResolution": final_result["accountResolution"], 
-        "accountId": target_acc_id
-    }
+    return JSONResponse(
+        content={
+            "ok": True,
+            "accountResolution": final_result["accountResolution"],
+            "accountId": target_acc_id
+        },
+        headers={"Deprecation": "true", "Link": "</phone/link>; rel=\"successor-version\""}
+    )
+
 
 def _absorb_unlinked_sessions(uid: str, account_id: str):
     """
@@ -503,33 +512,40 @@ def migrate(req: MigrateReq, new_uid: str = Depends(get_current_user)):
         logger.error(f"Migration failed: {e}")
         raise HTTPException(500, f"Migration failed: {e}")
 
-# ---------- Async Account Deletion ----------
+# ---------- Async Account Deletion (DEPRECATED - use /users/me:delete) ----------
 
-@router.post("/me:delete")
+@router.post("/me:delete", deprecated=True)
 def request_delete(user: CurrentUser = Depends(get_current_user)):
     """
+    [DEPRECATED] Use POST /users/me:delete instead.
+
     Request async account deletion.
+    This endpoint is deprecated and will be removed in a future version.
     """
     uid = user.uid
     user_ref = db.collection("users").document(uid)
     snap = user_ref.get()
-    
+
     if not snap.exists:
-        # Already gone
-        return {"ok": True, "state": "done"}
+        return JSONResponse(
+            content={"ok": True, "state": "done"},
+            headers={"Deprecation": "true", "Link": "</users/me:delete>; rel=\"successor-version\""}
+        )
 
     data = snap.to_dict() or {}
     deletion = data.get("deletion") or {}
     state = deletion.get("state", "none")
 
     if state in ("queued", "running"):
-         return {"ok": True, "state": state, "jobId": deletion.get("jobId"), "startedAt": deletion.get("startedAt")}
-    
+        return JSONResponse(
+            content={"ok": True, "state": state, "jobId": deletion.get("jobId"), "startedAt": deletion.get("startedAt")},
+            headers={"Deprecation": "true", "Link": "</users/me:delete>; rel=\"successor-version\""}
+        )
+
     # If previously failed, we retry.
-    
     job_id = f"del_{uid}_{int(datetime.now(timezone.utc).timestamp())}"
     now = datetime.now(timezone.utc)
-    
+
     # Update State first
     user_ref.set({
         "deletion": {
@@ -544,31 +560,38 @@ def request_delete(user: CurrentUser = Depends(get_current_user)):
         enqueue_nuke_user_task(uid)
     except Exception as e:
         logger.error(f"Failed to enqueue nuke for {uid}: {e}")
-        # Revert state or keep queued? 
-        # Keep queued, maybe a sweeper picks it up?
-        # For now, return error or success with warning?
-        # User retry is better.
-        # But we already set 'queued'. 
-        
-    return {"ok": True, "state": "queued", "jobId": job_id}
+
+    return JSONResponse(
+        content={"ok": True, "state": "queued", "jobId": job_id},
+        headers={"Deprecation": "true", "Link": "</users/me:delete>; rel=\"successor-version\""}
+    )
 
 
-@router.get("/me:delete/status")
+@router.get("/me:delete/status", deprecated=True)
 def delete_status(user: CurrentUser = Depends(get_current_user)):
     """
+    [DEPRECATED] Use GET /users/me:delete/status instead.
+
     Poll this to check deletion progress.
     Once 'done', client should wipe local data and signout.
     """
     uid = user.uid
     user_ref = db.collection("users").document(uid)
     snap = user_ref.get()
-    
+
     if not snap.exists:
-        return {"state": "done"}
-        
+        return JSONResponse(
+            content={"ok": True, "state": "done"},
+            headers={"Deprecation": "true", "Link": "</users/me:delete/status>; rel=\"successor-version\""}
+        )
+
     deletion = (snap.to_dict().get("deletion") or {})
-    return {
-        "state": deletion.get("state", "none"),
-        "jobId": deletion.get("jobId"),
-        "error": deletion.get("error")
-    }
+    return JSONResponse(
+        content={
+            "ok": True,
+            "state": deletion.get("state", "none"),
+            "jobId": deletion.get("jobId"),
+            "error": deletion.get("error")
+        },
+        headers={"Deprecation": "true", "Link": "</users/me:delete/status>; rel=\"successor-version\""}
+    )

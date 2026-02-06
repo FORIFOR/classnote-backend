@@ -1,17 +1,46 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime, timezone
+import json
+import logging
 from app.services.ops_logger import OpsLogger, Severity, EventType
 from app.services.metrics import track_api_request
+from app.services.profiling import (
+    RequestProfiler, set_profiler, reset_profiler, PROFILING_ENABLED
+)
 from app.middleware.request_id import RequestIdMiddleware, get_request_id
 from app.middleware.rate_limit import limiter, rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+
+profile_logger = logging.getLogger("app.profile")
 
 print("DEBUG: app/main.py starting...")
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs
+# [STARTUP CHECK] Validate required environment variables
+# Missing env vars will cause startup failure, making issues visible at deploy time
+REQUIRED_ENV_VARS = [
+    # "LINE_CHANNEL_ID",  # Required for LINE login - uncomment when configured
+]
+RECOMMENDED_ENV_VARS = [
+    "LINE_CHANNEL_ID",  # LINE login (optional but logged if missing)
+    "GCP_PROJECT",
+    "VERTEX_LOCATION",
+]
+
+def _check_env_vars():
+    missing_required = [k for k in REQUIRED_ENV_VARS if not os.getenv(k)]
+    if missing_required:
+        raise RuntimeError(f"[STARTUP ERROR] Missing required env vars: {', '.join(missing_required)}")
+
+    missing_recommended = [k for k in RECOMMENDED_ENV_VARS if not os.getenv(k)]
+    if missing_recommended:
+        print(f"[STARTUP WARNING] Missing recommended env vars: {', '.join(missing_recommended)}")
+
+_check_env_vars()
+
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -63,18 +92,53 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         headers=headers
     )
 
-# [ENHANCED] Ops Logger & Metrics Middleware
+# [ENHANCED] Ops Logger & Metrics Middleware with Phase Profiling
 @app.middleware("http")
 async def ops_logger_middleware(request: Request, call_next):
+    # Skip profiling for health/static endpoints
+    skip_profiling = request.url.path in ["/health", "/", "/docs", "/redoc", "/openapi.json", "/favicon.ico"]
+
+    # Initialize profiler for this request (lightweight - just stores start time)
+    profiler = None
+    if PROFILING_ENABLED and not skip_profiling:
+        request_id = getattr(request.state, "request_id", None)
+        profiler = RequestProfiler(request_id=request_id)
+        profiler.set_request_info(
+            endpoint=request.url.path,
+            method=request.method,
+        )
+        set_profiler(profiler)
+        request.state.profiler = profiler
+
     start_time = datetime.now(timezone.utc)
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        # Always reset profiler context
+        if profiler:
+            reset_profiler()
+
     process_time = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 
     # Get request_id from middleware (set by RequestIdMiddleware)
     request_id = getattr(request.state, "request_id", None)
 
+    # Update profiler with response info and log
+    if profiler:
+        profiler.status_code = response.status_code
+        profiler.user_id = getattr(request.state, "uid", None)
+
+        # Log profile data (structured JSON for Cloud Logging analysis)
+        # Only logs details for sampled/slow/error requests
+        try:
+            log_payload = profiler.get_log_payload()
+            # Use structured logging for Cloud Logging compatibility
+            profile_logger.info(json.dumps(log_payload, ensure_ascii=False))
+        except Exception:
+            pass  # Never let profiling break the request
+
     # Track metrics for all requests (except health checks)
-    if request.url.path not in ["/health", "/", "/docs", "/redoc", "/openapi.json"]:
+    if not skip_profiling:
         track_api_request(
             endpoint=request.url.path,
             method=request.method,
@@ -91,7 +155,13 @@ async def ops_logger_middleware(request: Request, call_next):
             status_code=response.status_code,
             request_id=request_id,
             message=f"API 500 Error: {request.url.path}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host if request.client else None, "email": getattr(request.state, "email", None)},
+            props={
+                "latencyMs": int(process_time),
+                "method": request.method,
+                "remoteIp": request.client.host if request.client else None,
+                "email": getattr(request.state, "email", None),
+                "phases": profiler.get_phases_summary() if profiler else None,
+            },
             trace_id=request.headers.get("X-Cloud-Trace-Context"),
             uid=getattr(request.state, "uid", None)
         )
@@ -105,7 +175,12 @@ async def ops_logger_middleware(request: Request, call_next):
             status_code=response.status_code,
             request_id=request_id,
             message=f"API Client Error: {response.status_code}",
-            props={"latencyMs": int(process_time), "method": request.method, "remoteIp": request.client.host if request.client else None, "email": getattr(request.state, "email", None)},
+            props={
+                "latencyMs": int(process_time),
+                "method": request.method,
+                "remoteIp": request.client.host if request.client else None,
+                "email": getattr(request.state, "email", None),
+            },
             trace_id=request.headers.get("X-Cloud-Trace-Context"),
             uid=getattr(request.state, "uid", None)
         )
@@ -149,6 +224,7 @@ app.include_router(google.router, tags=["Google"])
 app.include_router(search.router, tags=["Search"])
 app.include_router(reactions.router, tags=["Reactions"])
 app.include_router(admin.router, tags=["Admin"])
+app.include_router(ops.router, tags=["Ops"])  # Deployment safety & presence
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)
@@ -163,6 +239,9 @@ app.include_router(app_config.router, tags=["App Config"])
 
 # [NEW] Async Jobs API (Summary/Quiz Generation) - v2
 app.include_router(jobs.router, tags=["Jobs"])
+
+# [NEW] TODO Management API
+app.include_router(todos.router, tags=["TODOs"])
 
 if usage_router_available:
     app.include_router(usage.router, tags=["Usage"])

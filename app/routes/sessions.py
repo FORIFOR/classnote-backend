@@ -3,12 +3,13 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 import traceback
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Body, Header
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Body, Header, Request
 from fastapi.responses import JSONResponse
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from pydantic import BaseModel
+from app.middleware.rate_limit import limiter, RateLimits
 
 from app.firebase import db, storage_client, AUDIO_BUCKET_NAME, MEDIA_BUCKET_NAME
 from app.dependencies import get_current_user, get_verified_user, CurrentUser, CurrentUser, ensure_can_view, ensure_is_owner
@@ -19,18 +20,19 @@ from app.task_queue import (
     enqueue_translate_task,
     enqueue_qa_task,
     enqueue_cleanup_sessions_task,
+    enqueue_playlist_task,
 )
 
 
 from app.services import llm
 from app.services.usage import usage_logger
 from app.services.cost_guard import cost_guard
-from app.services.transcripts import resolve_transcript_text, has_transcript_chunks
+from app.services.transcripts import resolve_transcript_text, has_transcript_chunks, get_transcript_chunks_paginated, count_transcript_chunks
 from app.services.session_event_bus import publish_session_event
 from app import google_calendar
 import google.auth
 from google.auth import iam
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from app.util_models import (
     SessionResponse,
@@ -86,6 +88,7 @@ from app.util_models import (
     DerivedStatusResponse,
     PlaylistArtifactResponse,
     AudioStatus,
+    AudioMeta,  # [FIX] Add missing import
     JobStatus,
     QaEnqueueResponse,
     QaStatusResponse,
@@ -102,6 +105,19 @@ from app.util_models import (
 
     RetryTranscriptionRequest,
     AssetManifest,
+    SessionMemberSummary,
+    ReactionsSummary,
+    # SummaryV2 Models
+    SummaryV2,
+    SummaryV2Item,
+    SummaryV2Response,
+    SummaryV2GenerateRequest,
+    SummaryV2FeedbackRequest,
+    SummaryV2FeedbackResponse,
+    UserMark,
+    UserMarkType,
+    TranscriptSegment,
+    TranscriptSegmentsResponse,
 )
 
 class RegenerateTranscriptRequest(BaseModel):
@@ -245,6 +261,84 @@ def _cascade_delete_session(session_id: str, session_data: dict, owner_uid: str)
     Wrapper for shared cascade logic.
     """
     return cascade_delete_session(session_id, session_data, owner_uid, db=db)
+
+
+def _generate_pseudo_chunks_from_text(text: str, duration_sec: float = None) -> List[dict]:
+    """
+    [FIX A-2] Generate pseudo transcript chunks from full transcriptText.
+
+    Used when transcript_chunks subcollection is empty but transcriptText exists
+    (e.g., cloud_google writes directly to transcriptText without chunks).
+
+    This allows iOS to see "server transcript" via the chunks API.
+
+    Args:
+        text: Full transcript text
+        duration_sec: Optional recording duration for time estimation
+
+    Returns:
+        List of pseudo-chunks with estimated timing
+    """
+    if not text:
+        return []
+
+    CHUNK_SIZE = 1000  # Characters per chunk (approximate)
+    chunks = []
+
+    # Split text into chunks (try to break at sentence boundaries)
+    sentences = text.replace('。', '。\n').replace('．', '．\n').replace('. ', '.\n').split('\n')
+
+    current_chunk = ""
+    chunk_idx = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(current_chunk) + len(sentence) > CHUNK_SIZE and current_chunk:
+            # Save current chunk
+            chunks.append(current_chunk)
+            current_chunk = sentence
+        else:
+            current_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    # Calculate timing (estimate if duration unknown)
+    total_chars = len(text)
+    if duration_sec and duration_sec > 0:
+        chars_per_sec = total_chars / duration_sec
+    else:
+        # Estimate: ~5 characters per second for Japanese speech
+        chars_per_sec = 5.0
+        duration_sec = total_chars / chars_per_sec
+
+    # Build chunk objects with estimated timing
+    result = []
+    cumulative_chars = 0
+
+    for idx, chunk_text in enumerate(chunks):
+        chunk_len = len(chunk_text)
+        start_sec = cumulative_chars / chars_per_sec
+        end_sec = (cumulative_chars + chunk_len) / chars_per_sec
+
+        result.append({
+            "id": f"pseudo_{idx}",
+            "sequenceIndex": idx,
+            "text": chunk_text,
+            "startMs": int(start_sec * 1000),
+            "endMs": int(end_sec * 1000),
+            "speakerId": None,
+            "createdAt": None,
+            "_source": "fallback_transcriptText",  # Debug marker
+        })
+
+        cumulative_chars += chunk_len
+
+    return result
 
 
 def _resolve_session(session_id: str, user_id: Optional[str] = None, account_id: Optional[str] = None):
@@ -436,7 +530,7 @@ def signing_credentials(service_account_email: str) -> Optional[service_account.
              return base_creds
 
         # 3. IAMCredentials signBlob を使う signer（秘密鍵ファイル不要）
-        req = Request()
+        req = GoogleAuthRequest()
         signer = iam.Signer(req, base_creds, service_account_email)
 
         # 4. generate_signed_url が要求する「署名できる」Credentials を構築
@@ -526,6 +620,7 @@ async def _create_session_internal(
     source: str = "ios",
     tags: Optional[List[str]] = None,
     display_name: Optional[str] = None,
+    owner_account_id: Optional[str] = None,  # [FIX] Add account_id parameter
 ) -> dict:
     """
     [OFFLINE-FIRST] Internal session creation helper.
@@ -544,6 +639,7 @@ async def _create_session_internal(
         "ownerId": owner_uid,
         "ownerUserId": owner_uid,
         "ownerUid": owner_uid,
+        "ownerAccountId": owner_account_id,  # [FIX] Required for account-based queries
         "status": "録音中",
         "transcriptionMode": transcription_mode,
         "visibility": visibility,
@@ -612,17 +708,16 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
     Raises HTTPException (409) if limit reached.
 
     Plan limits (2026-01 revision):
-    - free: 
+    - free:
         - Server sessions: max 5 (deletedAt=null)
         - Cloud sessions: max 3 (cloudEntitledSessionIds)
         - On-device: unlimited (no limit check)
-    - premium/pro: UNLIMITED (only rate limits apply)
-    
+    - basic: Higher limits (see BASIC_LIMITS)
+
     Error codes:
     - server_session_limit: 5+ server sessions
     - cloud_session_limit: 3+ cloud sessions
     """
-    # Normalize plan (pro -> premium)
     try:
         user_ref = db.collection("users").document(user_uid)
         user_snapshot = user_ref.get()
@@ -632,14 +727,14 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
 
     user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
     plan = user_data.get("plan", "free")
-    
-    # Normalize: pro -> premium
-    if plan == "pro":
-        plan = "premium"
 
-    # [PREMIUM] No limits - early return
-    if plan == "premium":
-        return {"allowed": True, "cloudEntitled": True, "plan": "premium"}
+    # Normalize: standard -> basic
+    if plan == "standard":
+        plan = "basic"
+
+    # [BASIC] Higher limits - early return with cloud entitled
+    if plan == "basic":
+        return {"allowed": True, "cloudEntitled": True, "plan": "basic"}
 
     # --- FREE PLAN CHECKS ---
     
@@ -714,8 +809,9 @@ def _create_session_transaction(transaction, session_ref, user_ref, session_data
     # [FIX] Handle case where document doesn't exist (to_dict() returns None)
     user_data = (user_snap.to_dict() if user_snap.exists else {}) or {}
     plan = user_data.get("plan", "free")
-    if plan == "pro": plan = "premium"
-    
+    if plan == "standard":
+        plan = "basic"
+
     # 1. Cloud Entitlement Logic (Free only)
     if plan == "free" and (mode_str == "cloud_google"):
         cloud_ids = user_data.get("cloudEntitledSessionIds") or []
@@ -724,11 +820,11 @@ def _create_session_transaction(transaction, session_ref, user_ref, session_data
         cloud_ids.append(session_ref.id)
         # [FIX] Use set(merge=True) instead of update() to handle non-existent docs
         transaction.set(user_ref, {"cloudEntitledSessionIds": cloud_ids}, merge=True)
-    
+
     # Needs Cleanup check (moved from CostGuard return value check)
     # We can check serverSessionCount here too just to decide on cleanup
     needs_cleanup = False
-    if plan == "premium" and int(user_data.get("serverSessionCount", 0)) >= 300:
+    if plan == "basic" and int(user_data.get("serverSessionCount", 0)) >= 300:
         needs_cleanup = True
 
     # 2. Create Session Doc
@@ -836,6 +932,18 @@ async def create_session(
         except Exception as e:
             logger.warning(f"[CreateSession] Usage report fetch failed: {e}")
             usage_report = {}
+
+        # [NEW] Plan Check - Free users cannot use cloud transcription
+        plan = usage_report.get("plan", "free")
+        if plan == "free":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "CLOUD_STT_REQUIRES_PAID_PLAN",
+                    "message": "Cloud transcription requires a paid plan (Basic).",
+                    "requiredPlan": "basic"
+                }
+            )
 
         if usage_report and not usage_report.get("canStart", True):
             reason = usage_report.get("reasonIfBlocked")
@@ -1008,7 +1116,8 @@ async def create_session(
         ensure_can_view(final_data, current_user, session_id)
         # Return existing
         owner_id = final_data.get("ownerUserId") or final_data.get("userId")
-        is_owner = (owner_id == current_user.uid)
+        owner_account_id = final_data.get("ownerAccountId")
+        is_owner = (owner_id == current_user.uid) or (owner_account_id and owner_account_id == current_user.account_id)
         return SessionResponse(
             id=session_id,
             clientSessionId=final_data.get("clientSessionId"),
@@ -1023,7 +1132,8 @@ async def create_session(
             isOwner=is_owner,
             canManage=is_owner,
             ownerUserId=owner_id,
-            ownerId=owner_id
+            ownerId=owner_id,
+            ownerAccountId=final_data.get("ownerAccountId")
         )
 
     # If created:
@@ -1094,7 +1204,8 @@ async def create_session(
         isOwner=True,
         canManage=True,
         ownerUserId=current_user.uid,
-        ownerId=current_user.uid
+        ownerId=current_user.uid,
+        ownerAccountId=current_user.account_id
     )
 
 
@@ -1106,11 +1217,33 @@ async def start_cloud_session(
     """
     [NEW] Explicitly start cloud transcription (and burn a cloud session ticket).
     This separates session creation (always allowed) from cloud limit enforcement.
+
+    [POLICY] Free plan users cannot use cloud transcription.
     """
+    account_id = current_user.account_id
+
+    # [NEW] Plan Check - Free users cannot use cloud transcription
+    try:
+        plan_report = await cost_guard.get_usage_report(account_id, mode="account")
+        plan = plan_report.get("plan", "free")
+    except Exception as e:
+        logger.warning(f"[cloud:start] Failed to get plan for {account_id}: {e}")
+        plan = "free"
+
+    if plan == "free":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "CLOUD_STT_REQUIRES_PAID_PLAN",
+                "message": "Cloud transcription requires a paid plan (Basic).",
+                "requiredPlan": "basic"
+            }
+        )
+
     # 1. Resolve Session & Permissions
     doc_ref, snapshot, resolved_id = _resolve_session(session_id, user_id=current_user.uid)
     data = snapshot.to_dict()
-    
+
     if data.get("ownerUid") != current_user.uid:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -1124,7 +1257,7 @@ async def start_cloud_session(
 
     # 3. Check Global Usage (Minutes, Bans)
     try:
-        usage_report = await cost_guard.get_usage_report(current_user.uid)
+        usage_report = await cost_guard.get_usage_report(account_id, mode="account")
         if not usage_report.get("canStart", True):
              raise HTTPException(status_code=409, detail={
                  "error": {
@@ -1214,16 +1347,28 @@ async def list_sessions(
     to_date: Optional[str] = None,
     current_user: CurrentUser = Depends(get_current_user)
 ):
+    """
+    List sessions for the authenticated user.
+
+    [PERFORMANCE] limit is capped at 100 to prevent timeout.
+    For large datasets, use pagination with from_date/to_date.
+    """
+    # [PERFORMANCE] Cap limit to prevent timeout on large requests
+    MAX_LIMIT = 100
+    if limit > MAX_LIMIT:
+        logger.warning(f"[list_sessions] Requested limit={limit} exceeds max, capping to {MAX_LIMIT}")
+        limit = MAX_LIMIT
+
     # Enforce filtering by authenticated user
     # If filter user_id is provided, it must match current_user (unless admin, but we assume no admin here yet)
     if user_id and user_id != current_user.uid:
          # Optionally allow if user is admin, but for now strict:
          # raise HTTPException(403, "Cannot list other users sessions")
          pass # Or just overwrite it
-    
+
     # Always use authenticated ID
     target_user_id = current_user.uid
-    
+
     # [Account Architecture] Use account_id directly from CurrentUser (always available now)
     account_id = current_user.account_id
 
@@ -1239,36 +1384,39 @@ async def list_sessions(
     owned_docs = []
     shared_docs = []
 
+    # [PERFORMANCE] Use smaller query limit for better response time
+    query_limit = min(limit + 20, 150)  # Small buffer for deduplication
+
     # [Account Architecture] Query sessions by ownerAccountId (primary)
     # Legacy uid queries are kept temporarily for unmigrated sessions
     try:
         # Owned
         if scope_owned:
             # [PRIMARY] Query by accountId
-            acc_query = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(limit * 2)
+            acc_query = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(query_limit)
             owned_docs = list(acc_query.stream())
 
-            # [LEGACY] Also query by uid for unmigrated sessions
-            uid_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(limit * 2)
-            uid_docs = list(uid_query.stream())
-            # Merge and dedupe later
-            owned_docs += uid_docs
+            # [LEGACY] Also query by uid for unmigrated sessions (only if we have room)
+            if len(owned_docs) < query_limit:
+                uid_query = db.collection("sessions").where("ownerUserId", "==", target_user_id).limit(query_limit - len(owned_docs))
+                uid_docs = list(uid_query.stream())
+                # Merge and dedupe later
+                owned_docs += uid_docs
 
         # Shared (New Model)
         if scope_shared:
-            shared_query = db.collection("sessions").where("participantUserIds", "array_contains", target_user_id).limit(limit * 2)
+            shared_query = db.collection("sessions").where("participantUserIds", "array_contains", target_user_id).limit(query_limit)
             shared_docs = list(shared_query.stream())
-        
-        # Fallback to old sharedWith model (legacy)
+
+        # Fallback to old sharedWith model (legacy) - skip if we already have enough
         legacy_shared_docs = []
-        if scope_shared: # Always check legacy if sharing is in scope
+        if scope_shared and len(owned_docs) + len(shared_docs) < limit:
             try:
-                # Optimized: Only fetch if needed? No, safety first.
-                q_legacy = db.collection("sessions").where(filter=FieldFilter(f"sharedWith.{target_user_id}", "==", True)).limit(limit * 2)
+                q_legacy = db.collection("sessions").where(filter=FieldFilter(f"sharedWith.{target_user_id}", "==", True)).limit(query_limit)
                 legacy_shared_docs = list(q_legacy.stream())
             except Exception:
                 pass  # Ignore legacy query errors
-             
+
         # Merge all
         merged = owned_docs + shared_docs + legacy_shared_docs
     except Exception as e:
@@ -1353,8 +1501,17 @@ async def list_sessions(
         has_transcript = bool(data.get("transcriptText"))
         # Fallback for duration if not set
         duration_sec = data.get("durationSec")
-        if duration_sec is None and data.get("audio"):
-             duration_sec = data["audio"].get("durationSec")
+        audio_info = data.get("audio") or {}
+        audio_meta = data.get("audioMeta") or {}
+        if duration_sec is None:
+             duration_sec = audio_meta.get("durationSec") or audio_info.get("durationSec")
+
+        # [NEW] Audio metadata for iOS download sync
+        has_audio = audio_info.get("hasAudio", False) or data.get("audioStatus") == "uploaded"
+        audio_size = audio_meta.get("sizeBytes") or audio_meta.get("size") or audio_info.get("sizeBytes")
+        audio_sha = audio_meta.get("payloadSha256") or audio_meta.get("sha256") or data.get("audioSha256")
+        audio_updated = audio_info.get("uploadedAt") or data.get("audioUpdatedAt")
+        audio_content_type = audio_meta.get("contentType") or audio_info.get("contentType")
 
         result.append(SessionResponse(
             id=data["id"],
@@ -1367,10 +1524,11 @@ async def list_sessions(
             cloudTicket=data.get("cloudTicket"),
             cloudAllowedUntil=data.get("cloudAllowedUntil"),
             cloudStatus=data.get("cloudStatus"),
-            isOwner=(owner_id == target_user_id),
-            canManage=(owner_id == target_user_id), # [FIX] Permissions
+            isOwner=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
+            canManage=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
             ownerUserId=owner_id,
             ownerId=owner_id, # [FIX] Legacy Alias
+            ownerAccountId=data.get("ownerAccountId"),  # [NEW] Account-based ownership
             participantUserIds=p_ids,
             participants=data.get("participants"),
             visibility=data.get("visibility", "private"),
@@ -1386,13 +1544,19 @@ async def list_sessions(
             hasQuiz=data["hasQuiz"],
             durationSec=duration_sec,
             wordCount=data.get("wordCount"),
-            
+
             # [Offline Sync]
             clientSessionId=data.get("clientSessionId"),
             source=data.get("source"),
             transcriptStatus=data.get("transcriptStatus", "ready"), # "ready" if existing
             # createdAt was already passed above
-            localId=data.get("localId") # [NEW]
+            localId=data.get("localId"), # [NEW]
+            # [NEW] Audio metadata for iOS download sync
+            hasAudio=has_audio,
+            audioSizeBytes=audio_size,
+            audioSha256=audio_sha,
+            audioUpdatedAt=audio_updated,
+            audioContentType=audio_content_type,
         ))
 
     return result
@@ -1405,8 +1569,28 @@ async def import_session_transcript(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
-    [NEW] Import existing transcript text (effectively free).
-    Does not check cloud limits.
+    [IMPORT] Import pre-existing transcript text (no cloud cost).
+
+    Use this endpoint to import transcript text that was generated elsewhere
+    (e.g., from another service, manual transcription, or pre-existing notes).
+    This does NOT consume cloud transcription quota.
+
+    Request body:
+    - text: The transcript text to import (required)
+    - source: Origin identifier, e.g., "import", "manual" (required)
+    - modelInfo: Optional metadata about source model
+    - processingTimeSec: Optional processing duration for analytics
+    - isFinal: Mark as final transcript (default: true)
+
+    Behavior:
+    - Sets transcriptText directly
+    - Sets summaryStatus to "pending" for auto-summary
+    - Does NOT check or consume cloud limits
+
+    Use cases:
+    - Importing transcripts from external services
+    - Uploading manual transcriptions
+    - Migrating data from other apps
     """
     doc_ref, snapshot, _ = _resolve_session(session_id, user_id=current_user.uid)
     if not snapshot.exists:
@@ -1665,8 +1849,17 @@ async def import_session_audio(
         has_transcript = bool(data.get("transcriptText"))
         # Fallback for duration if not set
         duration_sec = data.get("durationSec")
-        if duration_sec is None and data.get("audio"):
-             duration_sec = data["audio"].get("durationSec")
+        audio_info = data.get("audio") or {}
+        audio_meta = data.get("audioMeta") or {}
+        if duration_sec is None:
+             duration_sec = audio_meta.get("durationSec") or audio_info.get("durationSec")
+
+        # [NEW] Audio metadata for iOS download sync
+        has_audio = audio_info.get("hasAudio", False) or data.get("audioStatus") == "uploaded"
+        audio_size = audio_meta.get("sizeBytes") or audio_meta.get("size") or audio_info.get("sizeBytes")
+        audio_sha = audio_meta.get("payloadSha256") or audio_meta.get("sha256") or data.get("audioSha256")
+        audio_updated = audio_info.get("uploadedAt") or data.get("audioUpdatedAt")
+        audio_content_type = audio_meta.get("contentType") or audio_info.get("contentType")
 
         result.append(SessionResponse(
             id=data["id"],
@@ -1677,13 +1870,14 @@ async def import_session_audio(
             createdAt=data.get("createdAt"),
             tags=data.get("tags"),
             ownerUserId=owner_id,
+            ownerAccountId=data.get("ownerAccountId"),  # [NEW] Account-based ownership
             participantUserIds=p_ids,
             participants=data.get("participants"),
             visibility=data.get("visibility", "private"),
             autoTags=data.get("autoTags", []),
             topicSummary=data.get("topicSummary"),
-            isOwner=(owner_id == target_user_id),
-            canManage=(owner_id == target_user_id), # [FIX] Permissions
+            isOwner=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
+            canManage=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
             ownerId=owner_id, # [FIX] Legacy Alias
             sharedWithCount=len(p_ids),
             sharedUserIds=p_ids,
@@ -1714,7 +1908,18 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
 
     # Enforce permission check
     ensure_can_view(data, current_user, resolved_id)
-    
+
+    # [FIX] Self-repair: Add ownerAccountId if missing (background, non-blocking)
+    if not data.get("ownerAccountId") and current_user.account_id:
+        owner_uid = data.get("ownerUid") or data.get("ownerUserId") or data.get("userId")
+        if owner_uid == current_user.uid:
+            try:
+                doc_ref.update({"ownerAccountId": current_user.account_id})
+                data["ownerAccountId"] = current_user.account_id
+                logger.info(f"[SELF-REPAIR] Added ownerAccountId to session {resolved_id}")
+            except Exception as e:
+                logger.warning(f"[SELF-REPAIR] Failed to add ownerAccountId to {resolved_id}: {e}")
+
     data["id"] = doc.id
     for key in ["createdAt", "summaryUpdatedAt", "quizUpdatedAt", "startedAt", "endedAt"]:
         if key in data and data[key] and hasattr(data[key], 'isoformat'):
@@ -1723,9 +1928,19 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     data["hasSummary"] = (data.get("summaryStatus") == JobStatus.COMPLETED.value)
     data["hasQuiz"] = (data.get("quizStatus") == JobStatus.COMPLETED.value)
     # [FIX] hasTranscript flag based on actual text content
-    data["hasTranscript"] = bool(data.get("transcriptText"))
-    if data.get("transcriptText") and not data.get("transcriptTextLen"):
-        data["transcriptTextLen"] = len(data.get("transcriptText") or "")
+    full_text = data.get("transcriptText") or ""
+    data["hasTranscript"] = bool(full_text)
+    data["transcriptTextLen"] = len(full_text) if full_text else 0
+
+    # [PERF] Return only 500-char preview; client should use /transcript_chunks for full text
+    if len(full_text) > 500:
+        data["transcriptText"] = full_text[:500]
+
+    # [NEW] Chunk count for sync status
+    try:
+        data["transcriptChunkCount"] = count_transcript_chunks(resolved_id)
+    except Exception:
+        data["transcriptChunkCount"] = 0
     
     data["sharedUserIds"] = list((data.get("sharedWith") or {}).keys())
     data["sharedWithCount"] = len(data["sharedUserIds"])
@@ -1781,14 +1996,72 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     else:
         data["audioMeta"] = None
 
-    # [FIX] Explicitly populate permission fields
+    # [FIX] Explicitly populate permission fields (camelCase for iOS compatibility)
     owner_id = data.get("ownerUserId") or data.get("ownerUid") or data.get("userId")
     data["ownerUserId"] = owner_id
-    is_owner = (owner_id == current_user.uid)
+    data["ownerUid"] = owner_id          # [FIX] iOS CodingKeys expects ownerUid
+    data["userId"] = owner_id            # [FIX] iOS fallback field
+    data["ownerId"] = owner_id           # [FIX] Legacy alias
+    owner_account_id = data.get("ownerAccountId")
+    if owner_account_id:
+        data["ownerAccountId"] = owner_account_id  # Ensure camelCase key present
+    is_owner = (owner_id == current_user.uid) or (owner_account_id and owner_account_id == current_user.account_id)
     data["isOwner"] = is_owner
-    # canManage logic: Owner or Editor (defaulting to isOwner for now)
-    data["canManage"] = is_owner 
-    data["ownerId"] = owner_id # [FIX] Legacy alias
+    data["canManage"] = is_owner
+
+    # [NEW] Add members list for iOS compatibility
+    try:
+        members_stream = db.collection("session_members").where("sessionId", "==", resolved_id).stream()
+        member_docs = list(members_stream)
+
+        # Batch fetch user profiles
+        uids = [m.to_dict().get("userId") for m in member_docs if m.to_dict().get("userId")]
+        user_map = {}
+        if uids:
+            refs = [db.collection("users").document(uid) for uid in uids]
+            try:
+                docs = db.get_all(refs)
+                for d in docs:
+                    if d.exists:
+                        user_map[d.id] = d.to_dict()
+            except Exception as e:
+                logger.warning(f"Failed to fetch user profiles for members: {e}")
+
+        members_list = []
+        for member in member_docs:
+            m_data = member.to_dict() or {}
+            uid = m_data.get("userId", "")
+            profile = user_map.get(uid, {})
+            members_list.append(SessionMemberSummary(
+                uid=uid,
+                username=profile.get("username"),
+                displayName=profile.get("displayName"),
+                displayNameSnapshot=m_data.get("displayNameSnapshot"),
+                role=m_data.get("role", "viewer"),
+                photoUrl=profile.get("photoUrl"),
+            ))
+        data["members"] = members_list
+    except Exception as e:
+        logger.warning(f"Failed to fetch members for session {resolved_id}: {e}")
+        data["members"] = []
+
+    # [NEW] Add reactionsSummary with English keys for iOS compatibility
+    emoji_to_key = {
+        "🔥": "fire",
+        "👏": "clap",
+        "😇": "angel",
+        "🤯": "mindblown",
+        "🫶": "heartHands",
+    }
+    reaction_counts = data.get("reactionCounts") or {}
+    reactions_summary = ReactionsSummary(
+        fire=reaction_counts.get("🔥", 0),
+        clap=reaction_counts.get("👏", 0),
+        angel=reaction_counts.get("😇", 0),
+        mindblown=reaction_counts.get("🤯", 0),
+        heartHands=reaction_counts.get("🫶", 0),
+    )
+    data["reactionsSummary"] = reactions_summary
 
     return data
 
@@ -1895,9 +2168,27 @@ async def get_calendar_sync_status(
 @router.post("/sessions/{session_id}/transcript")
 async def update_transcript(session_id: str, body: TranscriptUpdateRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
-    文字起こし＋話者分離セグメントをアップロード。
-    iOS オンデバイス STT で完結した場合、segments と source="device" を送信。
-    クラウド STT/diar コストを 0 にできる。
+    [DEVICE UPLOAD] Upload complete transcript with speaker diarization segments.
+
+    Use this endpoint when on-device STT (iOS/Sherpa) has completed transcription.
+    This sets the session's transcriptText directly and stores speaker segments.
+
+    Request body:
+    - transcriptText: Full transcript text (required)
+    - segments: Array of DiarizedSegment with speaker/timing info (optional)
+    - source: "device", "device_sherpa", "device_apple" (default: "device")
+    - transcriptSha256: Hash for deduplication (optional)
+    - isFinal: Mark transcription as complete (default: false)
+
+    Behavior:
+    - If session is configured for cloud_google mode and already has cloud
+      transcript, device updates are IGNORED to prevent overwriting.
+    - Automatically triggers summary generation if configured.
+
+    Returns:
+    - sessionId, status, source
+
+    Note: For incremental/streaming uploads, use transcript_chunks:append instead.
     """
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, snap, session_id = _resolve_session(session_id, current_user.uid)
@@ -1985,14 +2276,18 @@ async def update_transcript(session_id: str, body: TranscriptUpdateRequest, curr
         try:
             from app.task_queue import enqueue_summarize_task
             from app.routes.assets import _update_artifact_status
-            
+
+            # [FIX] Use session-based idempotency key to prevent duplicate summary consumption
+            # This prevents multiple transcript uploads (sync) from consuming multiple quotas
+            idempotency_key = f"auto_summary:{session_id}"
+            job_id = f"auto_sum_{session_id[:8]}"  # Stable job_id based on session
+
             # 1. Mark artifact as running immediately (UI Feedback)
-            job_id = f"auto_sum_{_now_timestamp().replace(microsecond=0).isoformat()}"
             _update_artifact_status(session_id, "summary", JobStatus.RUNNING, job_id=job_id)
-            
-            # 2. Enqueue Task
-            enqueue_summarize_task(session_id, current_user.uid, job_id=job_id)
-            logger.info(f"Auto-triggered summary for {session_id} (jobId={job_id})")
+
+            # 2. Enqueue Task with idempotency key
+            enqueue_summarize_task(session_id, job_id=job_id, idempotency_key=idempotency_key, user_id=current_user.uid)
+            logger.info(f"Auto-triggered summary for {session_id} (jobId={job_id}, idempotencyKey={idempotency_key})")
         except Exception as e:
             logger.error(f"Failed to auto-trigger summary for {session_id}: {e}")
             # Do not fail the transcript upload itself; just log the error.
@@ -2008,6 +2303,28 @@ async def append_transcript_chunks(
     body: TranscriptChunkAppendRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    [STREAMING WRITE] Append new transcript chunks during real-time recording.
+
+    Use this endpoint for incremental transcript updates during an active
+    recording session. Chunks are appended to the existing transcript.
+
+    Request body:
+    - chunks: Array of TranscriptChunkInput objects
+    - source: Origin of chunks ("device", "cloud", etc.)
+    - updateSessionTranscript: Whether to update session's transcriptText
+    - finalize: Mark session as transcription complete
+    - ifVersion: Optimistic lock - only write if server version matches
+
+    Returns:
+    - sessionId: The session ID
+    - chunkIds: IDs of created chunks
+    - count: Number of chunks added
+    - transcriptVersion: New version after write
+
+    Errors:
+    - 409 VERSION_CONFLICT: ifVersion doesn't match server version
+    """
     doc_ref = _session_doc_ref(session_id)
     snapshot = doc_ref.get()
     if not snapshot.exists:
@@ -2020,6 +2337,19 @@ async def append_transcript_chunks(
         raise HTTPException(status_code=400, detail="chunks is required")
     if len(body.chunks) > 500:
         raise HTTPException(status_code=400, detail="too many chunks")
+
+    # [SYNC] Optimistic locking: check version before write
+    current_version = data.get("transcriptVersion", 0)
+    if body.ifVersion is not None and body.ifVersion != current_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "VERSION_CONFLICT",
+                "message": "Transcript version mismatch. Please refresh and retry.",
+                "serverVersion": current_version,
+                "clientVersion": body.ifVersion,
+            }
+        )
 
     now = _now_timestamp()
     batch = db.batch()
@@ -2044,10 +2374,13 @@ async def append_transcript_chunks(
 
     batch.commit()
 
+    # [SYNC] Increment transcriptVersion
+    new_version = current_version + 1
     update_data = {
         "transcriptUpdatedAt": now,
         "updatedAt": now,
         "transcriptSource": body.source or "device",
+        "transcriptVersion": new_version,
     }
     if body.finalize:
         update_data["status"] = "録音済み"
@@ -2063,6 +2396,7 @@ async def append_transcript_chunks(
         chunkIds=chunk_ids,
         count=len(chunk_ids),
         status=JobStatus.COMPLETED,
+        transcriptVersion=new_version,
     )
 
 @router.post(
@@ -2074,6 +2408,29 @@ async def replace_transcript_chunks(
     body: TranscriptChunkReplaceRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    [BATCH WRITE] Replace transcript chunks within a time range.
+
+    Use this endpoint for batch corrections or cloud transcription results.
+    Existing chunks in the specified range are deleted before new chunks
+    are written.
+
+    Request body:
+    - chunks: Array of TranscriptChunkInput objects (replacement data)
+    - source: Origin of chunks ("batch", "cloud", etc.)
+    - updateSessionTranscript: Whether to update session's transcriptText
+    - ifVersion: Optimistic lock - only write if server version matches
+    - replaceRange: {fromMs, toMs} - delete chunks in this range first
+
+    Returns:
+    - sessionId: The session ID
+    - chunkIds: IDs of created chunks
+    - count: Number of chunks written
+    - transcriptVersion: New version after write
+
+    Errors:
+    - 409 VERSION_CONFLICT: ifVersion doesn't match server version
+    """
     doc_ref = _session_doc_ref(session_id)
     snapshot = doc_ref.get()
     if not snapshot.exists:
@@ -2087,13 +2444,39 @@ async def replace_transcript_chunks(
     if len(body.chunks) > 500:
         raise HTTPException(status_code=400, detail="too many chunks")
 
-    missing_ids = [c for c in body.chunks if not c.id]
-    if missing_ids:
-        raise HTTPException(status_code=400, detail="chunk id is required for replace")
+    # [SYNC] Optimistic locking: check version before write
+    current_version = data.get("transcriptVersion", 0)
+    if body.ifVersion is not None and body.ifVersion != current_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "VERSION_CONFLICT",
+                "message": "Transcript version mismatch. Please refresh and retry.",
+                "serverVersion": current_version,
+                "clientVersion": body.ifVersion,
+            }
+        )
 
     now = _now_timestamp()
     batch = db.batch()
     chunk_ids = []
+
+    # [SYNC] Range-based replace: delete existing chunks in the range first
+    if body.replaceRange:
+        from_ms = body.replaceRange.get("fromMs", 0)
+        to_ms = body.replaceRange.get("toMs")
+        if to_ms is not None:
+            # Find and delete chunks that overlap with the range
+            chunks_ref = _transcript_chunks_ref(session_id)
+            # Overlapping condition: chunk.startMs < toMs AND chunk.endMs > fromMs
+            existing_query = chunks_ref.where("startMs", "<", to_ms).where("endMs", ">", from_ms)
+            for doc in existing_query.stream():
+                batch.delete(doc.reference)
+    else:
+        # Legacy behavior: require chunk IDs for direct replacement
+        missing_ids = [c for c in body.chunks if not c.id]
+        if missing_ids:
+            raise HTTPException(status_code=400, detail="chunk id is required for replace (or use replaceRange)")
 
     for chunk in body.chunks:
         chunk_id = chunk.id or uuid.uuid4().hex
@@ -2105,6 +2488,7 @@ async def replace_transcript_chunks(
             "kind": chunk.kind or "batchFix",
             "version": chunk.version,
             "source": body.source or "batch",
+            "createdAt": now,
             "updatedAt": now,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
@@ -2113,10 +2497,13 @@ async def replace_transcript_chunks(
 
     batch.commit()
 
+    # [SYNC] Increment transcriptVersion
+    new_version = current_version + 1
     update_data = {
         "transcriptUpdatedAt": now,
         "updatedAt": now,
         "transcriptSource": body.source or "batch",
+        "transcriptVersion": new_version,
     }
     if body.updateSessionTranscript:
         update_data["transcriptText"] = resolve_transcript_text(session_id)
@@ -2128,6 +2515,7 @@ async def replace_transcript_chunks(
         chunkIds=chunk_ids,
         count=len(chunk_ids),
         status="accepted",
+        transcriptVersion=new_version,
     )
 
 @router.post("/sessions/{session_id}/device_sync", response_model=DeviceSyncResponse, status_code=202)
@@ -2188,6 +2576,7 @@ async def device_sync(
                 client_created_at=body.clientCreatedAt,
                 source=body.source or "ios",
                 display_name=current_user.display_name,
+                owner_account_id=current_user.account_id,  # [FIX] Required for account-based queries
             )
             session_created = True
             logger.info(f"[OFFLINE-FIRST] Created session {session_id} via device_sync for user {current_user.uid}")
@@ -2203,14 +2592,28 @@ async def device_sync(
         "updatedAt": _now_timestamp(),
     }
 
+    # [FIX] Self-repair: Add ownerAccountId if missing (migration for legacy sessions)
+    if not data.get("ownerAccountId") and current_user.account_id:
+        update_data["ownerAccountId"] = current_user.account_id
+        logger.info(f"[SELF-REPAIR] Added ownerAccountId to session {session_id}")
+
     if body.transcriptText is not None:
         update_data["transcriptText"] = body.transcriptText
     if body.segments is not None:
         segments_payload = [seg.dict() for seg in body.segments]
         update_data["diarizedSegments"] = segments_payload
         update_data["segments"] = segments_payload
+    # [DEBUG] Log notes update to diagnose disappearing notes issue
     if body.notes is not None:
-        update_data["notes"] = body.notes
+        existing_notes = data.get("notes") or ""
+        if body.notes != existing_notes:
+            logger.info(f"[device_sync] Notes changing for {session_id}: existing={repr(existing_notes[:50])} -> new={repr(body.notes[:50] if body.notes else '')}")
+        # [FIX] Don't overwrite notes with empty string if existing notes exist
+        # Only update if new notes have content, or if explicitly clearing (both are empty)
+        if body.notes or not existing_notes:
+            update_data["notes"] = body.notes
+        else:
+            logger.warning(f"[device_sync] Skipping notes clear for {session_id} - existing notes preserved")
 
     update_data["status"] = "録音済み"
 
@@ -2362,6 +2765,7 @@ async def update_session(session_id: str, req: UpdateSessionRequest, current_use
             mode=session_data.get("mode", ""),
             userId=session_data.get("userId", ""),
             ownerUserId=session_data.get("ownerUserId") or session_data.get("ownerUid") or session_data.get("userId"),
+            ownerAccountId=session_data.get("ownerAccountId"),  # [NEW] Account-based ownership
             status=session_data.get("status", ""),
             createdAt=session_data.get("createdAt"),
             tags=session_data.get("tags"),
@@ -2396,6 +2800,7 @@ async def update_session(session_id: str, req: UpdateSessionRequest, current_use
         mode=new_data.get("mode", ""),
         userId=new_data.get("userId", ""),
         ownerUserId=new_data.get("ownerUserId") or new_data.get("ownerUid") or new_data.get("userId"),
+        ownerAccountId=new_data.get("ownerAccountId"),  # [NEW] Account-based ownership
         status=new_data.get("status", ""),
         createdAt=new_data.get("createdAt"),
         tags=new_data.get("tags"),
@@ -2449,7 +2854,9 @@ async def update_session_meta(
 # ---------- Unified Job API ---------- #
 
 @router.post("/sessions/{session_id}/jobs", response_model=JobResponse)
+@limiter.limit(RateLimits.HEAVY)  # 10 requests/minute - heavy operation
 async def create_job(
+    request: Request,  # Required for rate limiter
     session_id: str,
     req: JobRequest,
     current_user: CurrentUser = Depends(get_current_user),
@@ -2496,10 +2903,8 @@ async def create_job(
     user_doc = db.collection("users").document(current_user.uid).get()
     user_data = user_doc.to_dict() if user_doc.exists else {}
     plan = user_data.get("plan", "free")
-    # Normalize pro -> premium, standard -> basic
-    if plan in ("pro", "premium"):
-        plan = "premium"
-    elif plan in ("basic", "standard"):
+    # Normalize standard -> basic
+    if plan in ("basic", "standard"):
         plan = "basic"
     else:
         plan = "free"
@@ -2833,7 +3238,8 @@ async def get_job_status(
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
     
-    if job_type in ["playlist", "generate_highlights"]:
+    # [FIX] generate_highlights is deprecated, but playlist is still supported
+    if job_type in ["generate_highlights"]:
         raise HTTPException(status_code=410, detail="Requested job type has been removed.")
     
     # 1. If job_type is a valid Singleton Job Type, use legacy/derived lookup
@@ -2895,7 +3301,19 @@ async def get_job_status(
             # Or assume the client should use GET .../qa/{id} or jobs/{id}
             status = "unknown"
             error = "Use GET v2/sessions/{id}/jobs/{jobId} or /qa/{id} for QA results"
-        
+        elif job_type == "playlist":
+            # Check derived doc first
+            derived = _derived_doc_ref(session_id, "playlist").get()
+            if derived.exists:
+                dd = derived.to_dict()
+                status = _map_derived_status(dd.get("status"))
+                error = dd.get("errorReason")
+                result = dd.get("result")
+            else:
+                status = _map_derived_status(data.get("playlistStatus"))
+                if status == "completed" and data.get("playlist"):
+                    result = {"items": data.get("playlist")}
+
         return JobResponse(
             jobId=job_type, # Singleton ID
             type=job_type,
@@ -2976,72 +3394,124 @@ async def get_artifact_summary(
     session_id: str,
     background_tasks: BackgroundTasks,
     current_user: CurrentUser = Depends(get_current_user),
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
 ):
+    """
+    [OPTIMIZED FOR POLLING] Summary artifact status endpoint.
+
+    Design:
+    - Fast path: If derived doc exists with completed/running status, return immediately
+    - Lazy trigger: Only enqueue if truly needed (missing or stale)
+    - ETag support: Return 304 Not Modified if status unchanged
+    """
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
 
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
 
-    # Robust Retry Logic:
-    # 1. Check if legacy summary exists and is completed (Migration Policy: Prefer Legacy if Derived missing)
-    #    (If we auto-triggered a derived summary, we might overwrite legacy with "pending", so strict check)
+    # [FAST PATH] Check derived doc first (single read)
     derived_ref = _derived_doc_ref(session_id, "summary")
-    # Small optimization: read doc once non-transactionally to check if we can skip logic
     derived_doc = derived_ref.get()
-    
-    should_use_legacy = False
-    if not derived_doc.exists:
-        if data.get("summaryStatus") == "completed" and (data.get("summaryJson") or data.get("summaryMarkdown")):
-            should_use_legacy = True
-    
-    if should_use_legacy:
-        # Fallback to Legacy Logic below
-        pass
-    else:
-        # 2. Derived exists OR Legacy not present -> Use Robust Ensure Logic
-        # helper will create pending if missing, or retry if stale running
-        derived_data = _ensure_summary_enqueued(session_id, current_user.uid, background_tasks)
-        if derived_data:
+
+    # Generate ETag from status + updatedAt for 304 support
+    def _generate_etag(status: str, updated_at) -> str:
+        ts = updated_at.isoformat() if hasattr(updated_at, 'isoformat') else str(updated_at)
+        return f'"{status}-{ts}"'
+
+    # [FAST PATH] If derived doc exists and is completed or actively running, return immediately
+    if derived_doc.exists:
+        derived_data = derived_doc.to_dict() or {}
+        status = derived_data.get("status", "pending")
+        updated_at = derived_data.get("updatedAt")
+
+        # ETag check for 304
+        etag = _generate_etag(status, updated_at)
+        if if_none_match and if_none_match == etag:
+            from fastapi.responses import Response
+            return Response(status_code=304)
+
+        # Completed or running: return immediately, no enqueue
+        if status in ["completed", "running", "processing"]:
             result = derived_data.get("result") or {}
             if "json" not in result and data.get("summaryJson"):
-                 result["json"] = data.get("summaryJson")
-            
+                result["json"] = data.get("summaryJson")
+
             meta = derived_data.get("meta") or {}
             if not meta and data.get("summaryType"):
                 meta = {
                     "schemaVersion": data.get("summaryJsonVersion"),
                     "type": data.get("summaryType")
                 }
-            return DerivedStatusResponse(
-                status=_map_derived_status(derived_data.get("status")),
+
+            response = DerivedStatusResponse(
+                status=_map_derived_status(status),
                 result=result,
                 meta=meta,
-                updatedAt=derived_data.get("updatedAt"),
+                updatedAt=updated_at,
                 errorReason=derived_data.get("errorReason"),
                 modelInfo=derived_data.get("modelInfo"),
                 idempotencyKey=derived_data.get("idempotencyKey"),
                 jobId=derived_data.get("jobId"),
             )
+            # Add ETag header
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                content=response.model_dump(mode="json", exclude_none=True),
+                headers={"ETag": etag, "Cache-Control": "private, max-age=5"}
+            )
 
-    # Legacy / Fallback Path
-    status = _map_derived_status(data.get("summaryStatus"))
-    result = None
-    if data.get("summaryMarkdown") or data.get("summaryJson"):
+        # Status is pending/failed - may need lazy trigger (fall through)
+
+    # [LEGACY CHECK] Check if legacy summary exists
+    should_use_legacy = False
+    if not derived_doc.exists:
+        if data.get("summaryStatus") == "completed" and (data.get("summaryJson") or data.get("summaryMarkdown")):
+            should_use_legacy = True
+
+    if should_use_legacy:
+        # Return legacy data immediately
+        status = "completed"
         result = {
             "markdown": data.get("summaryMarkdown"),
             "json": data.get("summaryJson"),
             "tags": data.get("autoTags") or data.get("tags") or [],
             "topicSummary": data.get("topicSummary"),
         }
-        status = "completed"
-    meta = None
-    if data.get("summaryType"):
-        meta = {
-            "schemaVersion": data.get("summaryJsonVersion"),
-            "type": data.get("summaryType")
-        }
-    return DerivedStatusResponse(status=status, result=result, meta=meta)
+        meta = None
+        if data.get("summaryType"):
+            meta = {
+                "schemaVersion": data.get("summaryJsonVersion"),
+                "type": data.get("summaryType")
+            }
+        return DerivedStatusResponse(status=status, result=result, meta=meta)
+
+    # [LAZY TRIGGER] Only enqueue if needed (missing, failed, or stale)
+    derived_data = _ensure_summary_enqueued(session_id, current_user.uid, background_tasks)
+    if derived_data:
+        result = derived_data.get("result") or {}
+        if "json" not in result and data.get("summaryJson"):
+             result["json"] = data.get("summaryJson")
+
+        meta = derived_data.get("meta") or {}
+        if not meta and data.get("summaryType"):
+            meta = {
+                "schemaVersion": data.get("summaryJsonVersion"),
+                "type": data.get("summaryType")
+            }
+        return DerivedStatusResponse(
+            status=_map_derived_status(derived_data.get("status")),
+            result=result,
+            meta=meta,
+            updatedAt=derived_data.get("updatedAt"),
+            errorReason=derived_data.get("errorReason"),
+            modelInfo=derived_data.get("modelInfo"),
+            idempotencyKey=derived_data.get("idempotencyKey"),
+            jobId=derived_data.get("jobId"),
+        )
+
+    # Fallback: return pending status
+    return DerivedStatusResponse(status="processing", result=None, meta=None)
 
 
 @router.get("/sessions/{session_id}/artifacts/playlist", response_model=PlaylistArtifactResponse)
@@ -3055,17 +3525,96 @@ async def get_artifact_playlist(
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
 
+    # [NEW] Extract audio duration for client-side verification
+    # Priority: direct durationSec > audioMeta.durationSec
+    audio_duration_sec = data.get("durationSec")
+    if not audio_duration_sec:
+        audio_meta = data.get("audioMeta") or {}
+        audio_duration_sec = audio_meta.get("durationSec")
+
+    # [FIX] Sanitize playlist items to prevent Pydantic validation errors
+    def _sanitize_playlist_items(items: Optional[list]) -> Optional[list]:
+        """
+        PlaylistItem スキーマに合わない不正なアイテムを除外する。
+        必須フィールド: title, startSec, endSec（idは自動生成）
+        """
+        if not items or not isinstance(items, list):
+            return None
+
+        sanitized = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            # 必須フィールドのチェック（idは除外 - 自動生成する）
+            if not all(k in item for k in ("title", "startSec", "endSec")):
+                logger.warning(f"[playlist] Skipping item with missing required fields: {item.get('title', 'unknown')}")
+                continue
+            # startSec と endSec が数値であることを確認
+            try:
+                float(item["startSec"])
+                float(item["endSec"])
+            except (TypeError, ValueError):
+                logger.warning(f"[playlist] Skipping item with invalid timing: {item.get('title', 'unknown')}")
+                continue
+            # [FIX] idがない場合は自動生成
+            if "id" not in item:
+                item["id"] = f"c{idx + 1}"
+            sanitized.append(item)
+
+        return sanitized if sanitized else None
+
+    # [STALE DETECTION] Helper to check if a running task is stale (>5 minutes)
+    STALE_THRESHOLD_SECONDS = 300  # 5 minutes
+    def _is_stale(updated_at) -> bool:
+        if not updated_at:
+            return True  # No timestamp means definitely stale
+        try:
+            if hasattr(updated_at, 'timestamp'):
+                # Firestore Timestamp
+                updated_ts = updated_at.timestamp()
+            elif hasattr(updated_at, 'isoformat'):
+                # datetime object
+                updated_ts = updated_at.timestamp()
+            else:
+                return True
+            now_ts = datetime.now(timezone.utc).timestamp()
+            return (now_ts - updated_ts) > STALE_THRESHOLD_SECONDS
+        except:
+            return True
+
     derived_doc = _derived_doc_ref(session_id, "playlist").get()
     if derived_doc.exists:
         derived_data = derived_doc.to_dict() or {}
+        derived_status = _map_derived_status(derived_data.get("status"))
+
+        # [STALE DETECTION] If running but stale, reset and retry
+        if derived_status == "running" and _is_stale(derived_data.get("updatedAt")):
+            logger.warning(f"[STALE] Playlist task stale for {session_id}, resetting...")
+            job_id = f"playlist_{uuid.uuid4().hex[:8]}"
+            enqueue_playlist_task(session_id, job_id=job_id, user_id=current_user.uid)
+            _derived_doc_ref(session_id, "playlist").set({
+                "status": "running",
+                "jobId": job_id,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "errorReason": None,
+                "retryCount": firestore.Increment(1),
+            }, merge=True)
+            doc_ref.update({"playlistStatus": "running"})
+            return PlaylistArtifactResponse(
+                status="running",
+                jobId=job_id,
+                items=None,
+                durationSec=audio_duration_sec,
+            )
+
         result = derived_data.get("result") or {}
         items = result.get("items") or result.get("playlist")
         if not items:
             items = data.get("playlist")
-        if items is not None and not isinstance(items, list):
-            items = None
+        # [FIX] Sanitize items to prevent Pydantic validation errors
+        items = _sanitize_playlist_items(items)
         return PlaylistArtifactResponse(
-            status=_map_derived_status(derived_data.get("status")),
+            status=derived_status,
             jobId=derived_data.get("jobId"),
             items=items,
             updatedAt=derived_data.get("updatedAt"),
@@ -3073,37 +3622,39 @@ async def get_artifact_playlist(
             modelInfo=derived_data.get("modelInfo"),
             idempotencyKey=derived_data.get("idempotencyKey"),
             version=derived_data.get("version"),
+            durationSec=audio_duration_sec,
         )
 
     status = _map_derived_status(data.get("playlistStatus"))
-    result_items = data.get("playlist")
-    if result_items is not None and not isinstance(result_items, list):
-        result_items = None
-    
+    # [FIX] Sanitize items to prevent Pydantic validation errors
+    result_items = _sanitize_playlist_items(data.get("playlist"))
+
     # [LAZY TRIGGER] If pending (missing items) and not already running, enqueue now.
     if not result_items and status != "running" and data.get("transcriptText"):
          job_id = f"playlist_{uuid.uuid4().hex[:8]}"
          enqueue_playlist_task(session_id, job_id=job_id, user_id=current_user.uid)
-         
+
          doc_ref.update({"playlistStatus": "running"})
          _derived_doc_ref(session_id, "playlist").set({
              "status": "running",
              "jobId": job_id,
              "updatedAt": firestore.SERVER_TIMESTAMP,
          }, merge=True)
-         
+
          return PlaylistArtifactResponse(
              status="running",
              result=None,
              items=None,
-             jobId=job_id
+             jobId=job_id,
+             durationSec=audio_duration_sec,
          )
 
     return PlaylistArtifactResponse(
          status=status,
          result=None,
          items=result_items,
-         jobId=None
+         jobId=None,
+         durationSec=audio_duration_sec,
     )
 
 @router.get("/sessions/{session_id}/artifacts/quiz", response_model=DerivedStatusResponse)
@@ -3180,6 +3731,21 @@ async def get_artifact_transcript(
     session_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    [STATUS] Get transcript artifact status and text.
+
+    Returns the current status of the transcript (pending/running/completed)
+    and the transcript text if available. This is primarily for checking
+    transcription job status and retrieving the final result.
+
+    Returns:
+    - status: "pending" | "running" | "completed"
+    - result: {text: string} if completed
+    - errorReason: Error message if failed
+
+    Note: For paginated transcript with speaker/timing data, use
+    GET /sessions/{id}/transcript_chunks instead.
+    """
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
 
@@ -3251,8 +3817,25 @@ async def upload_transcript_artifact(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Upload a transcript artifact from device (or other source).
-    If mode is device* or dual, this may update the main transcript.
+    [ARTIFACT WRITE] Upload transcript as a derived artifact.
+
+    Use this endpoint to store transcript from device sources as an artifact.
+    The transcript may or may not update the session's main transcriptText
+    depending on the session's transcriptionMode.
+
+    Request body:
+    - text: The transcript text (required)
+    - source: "device", "device_sherpa", etc. (required)
+    - modelInfo: Optional metadata about the STT model used
+    - processingTimeSec: Optional processing duration
+    - isFinal: Mark artifact as final (default: true)
+
+    Behavior by transcriptionMode:
+    - "device_*" or "dual": Updates session's transcriptText
+    - "cloud_google": Only stores as artifact (does not overwrite cloud transcript)
+
+    Note: For streaming/incremental uploads, use transcript_chunks:append.
+    For importing external transcripts, use import:transcript.
     """
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
@@ -3536,7 +4119,42 @@ async def delete_session(session_id: str, current_user: CurrentUser = Depends(ge
     return {"ok": True, "deleted": resolved_session_id}
 
 @router.post("/sessions/batch_delete")
-async def batch_delete_sessions(body: BatchDeleteRequest, current_user: CurrentUser = Depends(get_current_user)):
+async def batch_delete_sessions(
+    body: BatchDeleteRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    """
+    Delete multiple sessions in a single request.
+
+    IMPORTANT: This is a destructive operation. Use X-Idempotency-Key header
+    to prevent accidental duplicate deletions from retries.
+
+    Headers:
+    - X-Idempotency-Key: Unique key for this request (recommended, will be required in future)
+
+    Request body:
+    - ids: Array of session IDs to delete
+
+    Returns:
+    - ok: true if operation completed
+    - deleted: Number of sessions successfully deleted
+    - failed: Array of session IDs that failed to delete (if any)
+    - idempotencyKey: Echo of the provided key (if provided)
+    """
+    # [IDEMPOTENCY] Log warning if key not provided (preparation for future enforcement)
+    if not x_idempotency_key:
+        logger.warning(f"batch_delete called without X-Idempotency-Key by user {current_user.uid}")
+
+    # [IDEMPOTENCY] Check for duplicate request
+    if x_idempotency_key:
+        idempotency_ref = db.collection("idempotency_keys").document(f"batch_delete:{x_idempotency_key}")
+        idempotency_doc = idempotency_ref.get()
+        if idempotency_doc.exists:
+            cached_result = idempotency_doc.to_dict()
+            logger.info(f"Returning cached result for idempotency key: {x_idempotency_key}")
+            return cached_result.get("result", {"ok": True, "deleted": 0, "cached": True})
+
     if not body.ids:
         return {"ok": True, "deleted": 0}
 
@@ -3561,6 +4179,20 @@ async def batch_delete_sessions(body: BatchDeleteRequest, current_user: CurrentU
     result = {"ok": True, "deleted": deleted_count}
     if failed_ids:
         result["failed"] = failed_ids
+    if x_idempotency_key:
+        result["idempotencyKey"] = x_idempotency_key
+        # Store result for future duplicate requests (TTL: 24 hours)
+        try:
+            idempotency_ref = db.collection("idempotency_keys").document(f"batch_delete:{x_idempotency_key}")
+            idempotency_ref.set({
+                "result": result,
+                "userId": current_user.uid,
+                "createdAt": _now_timestamp(),
+                "expiresAt": datetime.now(timezone.utc) + timedelta(hours=24),
+            })
+        except Exception as e:
+            logger.warning(f"Failed to store idempotency key: {e}")
+
     return result
 
 # Audio URL
@@ -3579,12 +4211,36 @@ async def get_audio_url(session_id: str, current_user: CurrentUser = Depends(get
         
         audio_info = data.get("audio") or {}
         audio_status = data.get("audioStatus", "unknown")
-        audio_meta_dict = data.get("audioMeta")
+        audio_meta_dict = data.get("audioMeta") or {}
         try:
              audio_meta = AudioMeta(**audio_meta_dict) if audio_meta_dict else None
         except Exception as e:
              logger.warning(f"Invalid audioMeta for session {session_id}: {e}")
              audio_meta = None
+
+        # [NEW] Extract top-level metadata for iOS download sync
+        # Priority: audioMeta > audio > root
+        size_bytes = (
+            audio_meta_dict.get("sizeBytes") or
+            audio_meta_dict.get("size") or
+            audio_info.get("sizeBytes") or
+            data.get("sizeBytes")
+        )
+        sha256 = (
+            audio_meta_dict.get("payloadSha256") or
+            audio_meta_dict.get("sha256") or
+            data.get("audioSha256")
+        )
+        duration_sec = (
+            audio_meta_dict.get("durationSec") or
+            data.get("durationSec")
+        )
+        content_type = (
+            audio_meta_dict.get("contentType") or
+            audio_info.get("contentType") or
+            data.get("contentType")
+        )
+        audio_updated_at = audio_info.get("uploadedAt") or data.get("updatedAt")
         
         # Fast rejection based on Firestore status (no GCS call)
         if audio_status == AudioStatus.EXPIRED.value:
@@ -3622,9 +4278,15 @@ async def get_audio_url(session_id: str, current_user: CurrentUser = Depends(get
             
             if isinstance(cached_expires, datetime) and cached_expires > now_utc + timedelta(minutes=5):
                 return SignedCompressedAudioResponse(
-                    audioUrl=cached_url, 
+                    audioUrl=cached_url,
                     expiresAt=cached_expires,
-                    compressionMetadata=audio_meta
+                    compressionMetadata=audio_meta,
+                    # [NEW] iOS download sync metadata
+                    sizeBytes=size_bytes,
+                    sha256=sha256,
+                    durationSec=duration_sec,
+                    contentType=content_type,
+                    updatedAt=audio_updated_at,
                 )
 
         # Generate new signed URL (no blob.exists() check - trust Firestore status)
@@ -3665,9 +4327,15 @@ async def get_audio_url(session_id: str, current_user: CurrentUser = Depends(get
         })
         
         return SignedCompressedAudioResponse(
-            audioUrl=url, 
-            expiresAt=expires, 
-            compressionMetadata=audio_meta
+            audioUrl=url,
+            expiresAt=expires,
+            compressionMetadata=audio_meta,
+            # [NEW] iOS download sync metadata
+            sizeBytes=size_bytes,
+            sha256=sha256,
+            durationSec=duration_sec,
+            contentType=content_type,
+            updatedAt=audio_updated_at,
         )
     except HTTPException:
         raise
@@ -3677,13 +4345,18 @@ async def get_audio_url(session_id: str, current_user: CurrentUser = Depends(get
         raise HTTPException(500, detail=f"Server Error: {str(e)}")
 
 @router.post("/sessions/{session_id}/audio:prepareUpload", response_model=AudioPrepareResponse)
+@limiter.limit(RateLimits.UPLOAD)  # 5 requests/minute - upload operation
 async def prepare_audio_upload(
+    request: Request,  # Required for rate limiter
     session_id: str,
     body: AudioPrepareRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     オーディオアップロード用の署名付きURLを発行する。
+
+    [IDEMPOTENT] 同じセッションへのリトライでは、既存のstorage pathを再利用し、
+    DB書き込みをスキップして高速応答する。
     """
     try:
         # [FIX] Support clientSessionId fallback for offline-first clients
@@ -3700,7 +4373,7 @@ async def prepare_audio_upload(
                   logger.warning(f"[Security] Rejecting audio upload for session {session_id}: expired")
                   await usage_logger.track_security_event(current_user.uid, 5, "upload_denied_expired")
                   raise HTTPException(status_code=403, detail="Cloud processing limit reached for this session.")
-             
+
              # 2. Duration Limit (7200s)
              if body.durationSec and body.durationSec > 7200:
                   await usage_logger.track_security_event(current_user.uid, 5, "upload_denied_duration")
@@ -3718,11 +4391,44 @@ async def prepare_audio_upload(
         else:
             # Fallback for wav/others
              blob_path = f"sessions/{session_id}/audio.raw"
+
+        # [IDEMPOTENT] Check if prepare was already done for this session
+        # If audioStatus is PENDING or audio.gcsPath exists with same content type,
+        # skip DB write and just return fresh signed URL
+        existing_audio = data.get("audio", {})
+        existing_status = data.get("audioStatus")
+        existing_path = existing_audio.get("gcsPath") or data.get("audioPath")
+        existing_content_type = existing_audio.get("contentType") or data.get("contentType")
+        existing_delete_after = existing_audio.get("deleteAfterAt")
+
+        # Determine if we can reuse existing prepare state
+        is_idempotent_retry = (
+            existing_status in [AudioStatus.PENDING.value, "pending"] and
+            existing_path and
+            existing_content_type == target_content_type
+        )
+
+        storage_path = f"gs://{AUDIO_BUCKET_NAME}/{blob_path}"
+
+        if is_idempotent_retry:
+            # Reuse existing state, just generate fresh signed URL
+            logger.info(f"[Idempotent] Reusing existing prepare state for session {session_id}")
+            storage_path = existing_path
+            delete_after = existing_delete_after or (_now_timestamp() + timedelta(days=30))
+            # Extract blob path from gs:// URL
+            if storage_path.startswith("gs://"):
+                parts = storage_path.replace("gs://", "").split("/", 1)
+                if len(parts) == 2:
+                    blob_path = parts[1]
+        else:
+            delete_after = _now_timestamp() + timedelta(days=30)
+
+        # Always generate fresh signed URL (URLs expire)
         blob = storage_client.bucket(AUDIO_BUCKET_NAME).blob(blob_path)
         sa_email = _get_signing_email()
         if not sa_email:
              logger.warning("Service account email not found. Signed URL generation might fail.")
-        
+
         # Use IAM Signer credentials
         creds = signing_credentials(sa_email)
 
@@ -3731,26 +4437,25 @@ async def prepare_audio_upload(
             expiration=timedelta(minutes=15),
             method="PUT",
             content_type=target_content_type,
-            # service_account_email=sa_email, # Replaced by credentials
             credentials=creds,
         )
 
-        storage_path = f"gs://{AUDIO_BUCKET_NAME}/{blob_path}"
-        delete_after = _now_timestamp() + timedelta(days=30)
-        doc_ref.set({
-            "audio": {
-                "hasAudio": False,
-                "gcsPath": storage_path,
-                "sizeBytes": None,
-                "uploadedAt": None,
-                "deleteAfterAt": delete_after,
+        # Only write to DB if NOT an idempotent retry
+        if not is_idempotent_retry:
+            doc_ref.set({
+                "audio": {
+                    "hasAudio": False,
+                    "gcsPath": storage_path,
+                    "sizeBytes": None,
+                    "uploadedAt": None,
+                    "deleteAfterAt": delete_after,
+                    "contentType": target_content_type,
+                },
+                "audioPath": storage_path,
                 "contentType": target_content_type,
-            },
-            "audioPath": storage_path,
-            "contentType": target_content_type,
-            "audioStatus": AudioStatus.PENDING.value,
-            "updatedAt": _now_timestamp(),
-        }, merge=True)
+                "audioStatus": AudioStatus.PENDING.value,
+                "updatedAt": _now_timestamp(),
+            }, merge=True)
 
         return AudioPrepareResponse(
             uploadUrl=url,
@@ -4462,11 +5167,12 @@ async def join_session(body: JoinSessionRequest, current_user: CurrentUser = Dep
         createdAt=updated_session.get("createdAt"),
         tags=updated_session.get("tags"),
         ownerUserId=owner_id,
+        ownerAccountId=updated_session.get("ownerAccountId"),  # [NEW] Account-based ownership
         participantUserIds=p_ids,
         visibility=updated_session.get("visibility", "private"),
         autoTags=updated_session.get("autoTags", []),
         topicSummary=updated_session.get("topicSummary"),
-        isOwner=(owner_id == current_user.uid),
+        isOwner=(owner_id == current_user.uid) or (updated_session.get("ownerAccountId") and updated_session.get("ownerAccountId") == current_user.account_id),
         sharedWithCount=len(p_ids),
         sharedUserIds=p_ids,
     )
@@ -4742,11 +5448,32 @@ async def start_cloud_stt(
     Check if user can start Cloud STT (High Accuracy).
     Returns allowed=True with a ticket if quota is available.
     Returns allowed=False with lockedUntil if quota exceeded.
+
+    [POLICY] Free plan users cannot use cloud transcription.
     """
     uid = current_user.uid
-    
+    account_id = current_user.account_id
+
+    # [NEW] Plan Check - Free users cannot use cloud transcription
+    try:
+        usage_report = await cost_guard.get_usage_report(account_id, mode="account")
+        plan = usage_report.get("plan", "free")
+    except Exception as e:
+        logger.warning(f"[cloud_stt:start] Failed to get plan for {account_id}: {e}")
+        plan = "free"
+
+    if plan == "free":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "CLOUD_STT_REQUIRES_PAID_PLAN",
+                "message": "Cloud transcription requires a paid plan (Basic).",
+                "requiredPlan": "basic"
+            }
+        )
+
     # 1. Use Cost Guard to check and increment cloud session count
-    allowed, meta = await cost_guard.guard_can_consume(uid, "cloud_sessions_started", 1)
+    allowed, meta = await cost_guard.guard_can_consume(account_id, "cloud_sessions_started", 1, mode="account")
     if not allowed:
         # Calculate next month start (JST)
         from datetime import timezone, timedelta
@@ -4764,7 +5491,7 @@ async def start_cloud_stt(
         )
 
     # Get remaining seconds for response
-    report = await cost_guard.get_usage_report(uid)
+    report = await cost_guard.get_usage_report(account_id, mode="account")
     remaining_sec = report.get("remainingSeconds", 0)
 
     # 3. Issue Ticket
@@ -4824,3 +5551,727 @@ async def update_tags(session_id: str, body: TagUpdateRequest, current_user: Cur
     doc_ref.update({"tags": tags})
     await publish_session_event(session_id, "session.updated", {"fields": ["tags"]})
     return {"ok": True, "tags": tags}
+
+
+# ---------- Transcript Chunks (Read) ---------- #
+# CANONICAL READ: Use this endpoint to retrieve transcript chunks.
+# This is the primary source of truth for transcript data.
+
+@router.get("/sessions/{session_id}/transcript_chunks")
+async def get_session_transcript_chunks(
+    session_id: str,
+    # Legacy: milliseconds (backward compatible)
+    fromMs: Optional[int] = None,
+    toMs: Optional[int] = None,
+    # New: seconds (takes precedence if provided)
+    from_sec: Optional[float] = None,
+    to_sec: Optional[float] = None,
+    after: Optional[str] = None,
+    limit: int = 50,  # [PERF] Reduced from 200 to 50 to prevent iOS timeout
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    [CANONICAL READ] Paginated transcript chunk retrieval.
+
+    This is the primary endpoint for reading transcript data. Returns chunks
+    with timing, speaker, and text information.
+
+    Parameters:
+    - from_sec: Filter chunks starting at or after this timestamp (seconds, preferred)
+    - to_sec: Filter chunks ending at or before this timestamp (seconds, preferred)
+    - fromMs: Filter chunks starting at or after this timestamp (ms, legacy)
+    - toMs: Filter chunks ending at or before this timestamp (ms, legacy)
+    - after: Cursor for pagination (from previous response's nextCursor)
+    - limit: Max chunks per page (1-500, default 50)
+
+    Returns:
+    - chunks: Array of transcript chunks with both sec and ms fields
+    - totalCount / total_chunks: Total chunks matching filter
+    - hasMore / has_more: Whether more chunks exist
+    - nextCursor / next_cursor: Cursor for next page (if hasMore)
+    - transcriptVersion: Version number for cache invalidation
+
+    [SYNC] Use ifVersion in append/replace requests to detect conflicts.
+    """
+    doc_ref, doc, resolved_id = _resolve_session(session_id, current_user.uid)
+    data = doc.to_dict()
+    ensure_can_view(data, current_user, resolved_id)
+
+    # Clamp limit
+    limit = max(1, min(limit, 500))
+
+    # Convert seconds to milliseconds (seconds take precedence)
+    effective_from_ms = fromMs
+    effective_to_ms = toMs
+    if from_sec is not None:
+        effective_from_ms = int(from_sec * 1000)
+    if to_sec is not None:
+        effective_to_ms = int(to_sec * 1000)
+
+    chunks, total_count, has_more, next_cursor = get_transcript_chunks_paginated(
+        resolved_id,
+        from_ms=effective_from_ms,
+        to_ms=effective_to_ms,
+        after_cursor=after,
+        limit=limit,
+    )
+
+    # [SYNC] Include version for client cache validation
+    transcript_version = data.get("transcriptVersion", 0)
+
+    # [FIX A-2] Fallback: If no chunks but transcriptText exists, generate pseudo-chunks
+    # This fixes the issue where cloud_google writes to transcriptText but not transcript_chunks
+    # causing iOS to see server=0 and enter infinite repair loop
+    if not chunks and not after:  # Only on first page (no cursor)
+        transcript_text = data.get("transcriptText") or ""
+        if transcript_text:
+            logger.info(f"[transcript_chunks] Generating fallback chunks from transcriptText ({len(transcript_text)} chars) for {resolved_id}")
+            chunks = _generate_pseudo_chunks_from_text(transcript_text, data.get("durationSec"))
+            total_count = len(chunks)
+            has_more = False
+            next_cursor = None
+
+    # Transform chunks to include both ms and sec fields for compatibility
+    transformed_chunks = []
+    for idx, chunk in enumerate(chunks):
+        start_ms = chunk.get("startMs", 0)
+        end_ms = chunk.get("endMs", 0)
+        transformed_chunks.append({
+            "id": chunk.get("id"),
+            "index": chunk.get("sequenceIndex", idx),
+            "text": chunk.get("text", ""),
+            # Seconds (new - design spec)
+            "start_sec": start_ms / 1000 if start_ms else 0,
+            "end_sec": end_ms / 1000 if end_ms else 0,
+            # Milliseconds (legacy)
+            "startMs": start_ms,
+            "endMs": end_ms,
+            "speakerId": chunk.get("speakerId"),
+            "createdAt": chunk.get("createdAt"),
+        })
+
+    return {
+        "chunks": transformed_chunks,
+        # Both naming conventions for compatibility
+        "totalCount": total_count,
+        "total_chunks": total_count,
+        "hasMore": has_more,
+        "has_more": has_more,
+        "nextCursor": next_cursor,
+        "next_cursor": next_cursor,
+        "transcriptVersion": transcript_version,
+        # [NEW] Source indicator for debugging
+        "source": "chunks" if chunks and chunks[0].get("id", "").startswith("pseudo_") == False else "fallback_transcriptText",
+    }
+
+
+# [ALIAS] iOS compatibility - /transcript/chunks -> /transcript_chunks
+@router.get("/sessions/{session_id}/transcript/chunks", include_in_schema=False, deprecated=True)
+async def get_session_transcript_chunks_alias(
+    session_id: str,
+    fromMs: Optional[int] = None,
+    toMs: Optional[int] = None,
+    from_sec: Optional[float] = None,
+    to_sec: Optional[float] = None,
+    after: Optional[str] = None,
+    limit: int = 50,  # [PERF] Reduced from 200 to 50 to prevent iOS timeout
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    [DEPRECATED] Use GET /sessions/{session_id}/transcript_chunks instead.
+    This alias exists for iOS backward compatibility.
+    """
+    return await get_session_transcript_chunks(
+        session_id=session_id,
+        fromMs=fromMs,
+        toMs=toMs,
+        from_sec=from_sec,
+        to_sec=to_sec,
+        after=after,
+        limit=limit,
+        current_user=current_user,
+    )
+
+
+# ---------- Finalize Session ---------- #
+
+class FinalizeRequest(BaseModel):
+    generateSummary: bool = True
+    generatePlaylist: bool = True
+    generateQuiz: bool = False
+
+@router.post("/sessions/{session_id}/finalize")
+@limiter.limit(RateLimits.HEAVY)  # 10 requests/minute - triggers background jobs
+async def finalize_session(
+    request: Request,  # Required for rate limiter
+    session_id: str,
+    body: FinalizeRequest = Body(default=FinalizeRequest()),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Finalize a session after recording/sync completes.
+    Rebuilds transcriptText from chunks and enqueues requested jobs.
+    """
+    doc_ref, doc, resolved_id = _resolve_session(session_id, current_user.uid)
+    data = doc.to_dict()
+    ensure_is_owner(data, current_user, resolved_id)
+
+    # 1. Rebuild transcript from chunks
+    transcript_text = resolve_transcript_text(resolved_id, data)
+    update_data = {
+        "status": "録音済み",
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if transcript_text:
+        update_data["transcriptText"] = transcript_text
+        update_data["transcriptTextLen"] = len(transcript_text)
+        update_data["hasTranscript"] = True
+
+    doc_ref.update(update_data)
+
+    # 2. Enqueue requested jobs
+    jobs = []
+    account_id = current_user.account_id or current_user.uid
+
+    if body.generateSummary and transcript_text:
+        try:
+            allowed, info = await cost_guard.guard_can_consume(account_id, "summary_generated", 1.0)
+            if allowed:
+                job_id = enqueue_summarize_task(resolved_id, user_id=current_user.uid, usage_reserved=True)
+                jobs.append({"type": "summary", "jobId": job_id})
+            else:
+                jobs.append({"type": "summary", "status": "blocked", "reason": (info or {}).get("rule")})
+        except Exception as e:
+            logger.warning(f"[finalize] Failed to enqueue summary for {resolved_id}: {e}")
+            jobs.append({"type": "summary", "status": "error"})
+
+    if body.generatePlaylist and transcript_text:
+        try:
+            job_id = enqueue_playlist_task(resolved_id)
+            jobs.append({"type": "playlist", "jobId": job_id})
+        except Exception as e:
+            logger.warning(f"[finalize] Failed to enqueue playlist for {resolved_id}: {e}")
+            jobs.append({"type": "playlist", "status": "error"})
+
+    if body.generateQuiz and transcript_text:
+        try:
+            allowed, info = await cost_guard.guard_can_consume(account_id, "quiz_generated", 1.0)
+            if allowed:
+                job_id = enqueue_quiz_task(resolved_id, user_id=current_user.uid, usage_reserved=True)
+                jobs.append({"type": "quiz", "jobId": job_id})
+            else:
+                jobs.append({"type": "quiz", "status": "blocked", "reason": (info or {}).get("rule")})
+        except Exception as e:
+            logger.warning(f"[finalize] Failed to enqueue quiz for {resolved_id}: {e}")
+            jobs.append({"type": "quiz", "status": "error"})
+
+    return {
+        "ok": True,
+        "sessionId": resolved_id,
+        "status": "録音済み",
+        "hasTranscript": bool(transcript_text),
+        "transcriptTextLen": len(transcript_text) if transcript_text else 0,
+        "jobs": jobs,
+    }
+
+
+# ---------- SummaryV2: Evidence-based Structured Summary ---------- #
+
+@router.get("/sessions/{session_id}/artifacts/summary_v2", response_model=SummaryV2Response)
+async def get_summary_v2(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Get structured summary with evidence-based items.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    # Check derived doc
+    derived_ref = doc_ref.collection("derived").document("summary_v2")
+    derived_snap = derived_ref.get()
+
+    if not derived_snap.exists:
+        return SummaryV2Response(
+            status="pending",
+            summary=None,
+            jobId=None,
+        )
+
+    derived_data = derived_snap.to_dict() or {}
+    status = derived_data.get("status", "pending")
+
+    if status == "succeeded" or status == "completed":
+        summary_data = derived_data.get("result", {})
+        try:
+            summary = SummaryV2(**summary_data)
+        except Exception as e:
+            logger.warning(f"Failed to parse SummaryV2: {e}")
+            summary = None
+        return SummaryV2Response(
+            status="ready",
+            summary=summary,
+            jobId=derived_data.get("jobId"),
+            updatedAt=derived_data.get("updatedAt"),
+        )
+    elif status == "running":
+        return SummaryV2Response(
+            status="running",
+            jobId=derived_data.get("jobId"),
+            updatedAt=derived_data.get("updatedAt"),
+        )
+    elif status == "failed":
+        return SummaryV2Response(
+            status="failed",
+            errorReason=derived_data.get("errorReason"),
+            jobId=derived_data.get("jobId"),
+            updatedAt=derived_data.get("updatedAt"),
+        )
+    else:
+        return SummaryV2Response(
+            status=status,
+            jobId=derived_data.get("jobId"),
+        )
+
+
+@router.post("/sessions/{session_id}/artifacts/summary_v2:generate")
+async def generate_summary_v2_endpoint(
+    session_id: str,
+    body: SummaryV2GenerateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Generate structured summary with evidence.
+    Runs as background task.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_is_owner(data, current_user, session_id)
+
+    transcript_text = resolve_transcript_text(session_id, data)
+    if not transcript_text:
+        raise HTTPException(status_code=400, detail="No transcript available")
+
+    # Check if already running (unless force=True)
+    derived_ref = doc_ref.collection("derived").document("summary_v2")
+    derived_snap = derived_ref.get()
+    if derived_snap.exists and not body.force:
+        derived_data = derived_snap.to_dict() or {}
+        if derived_data.get("status") == "running":
+            return {"status": "already_running", "jobId": derived_data.get("jobId")}
+        if derived_data.get("status") in ["succeeded", "completed"]:
+            return {"status": "already_completed", "jobId": derived_data.get("jobId")}
+
+    # Create job
+    job_id = f"sumv2_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+
+    # Mark as running
+    derived_ref.set({
+        "status": "running",
+        "jobId": job_id,
+        "updatedAt": now,
+        "startedAt": now,
+    }, merge=True)
+
+    # Run in background
+    async def run_summary_v2():
+        try:
+            from app.services.summary_v2 import generate_summary_v2
+
+            summary = await generate_summary_v2(
+                session_id=session_id,
+                transcript_text=transcript_text,
+                diarized_segments=data.get("diarizedSegments"),
+                user_marks=data.get("userMarks"),
+                meeting_purpose=body.meetingPurpose or data.get("meetingPurpose"),
+                meeting_type=body.meetingType or data.get("mode"),
+                participants=body.participants or data.get("participants", []),
+            )
+
+            # Save result
+            derived_ref.set({
+                "status": "succeeded",
+                "result": summary.dict(),
+                "jobId": job_id,
+                "updatedAt": datetime.now(timezone.utc),
+            }, merge=True)
+
+            # Also save rendered markdown to session for compatibility
+            doc_ref.update({
+                "summaryV2Status": "completed",
+                "summaryV2Markdown": summary.renderedMarkdown,
+                "updatedAt": datetime.now(timezone.utc),
+            })
+
+            logger.info(f"[SummaryV2] Generated for {session_id}")
+
+            # [AUTO-TRIGGER] Extract TODOs after summary generation (idempotent, mode-aware)
+            try:
+                from app.services.todo_extractor import update_todos_from_summary
+                import hashlib
+
+                # Generate sourceKey from summary content hash for idempotency
+                summary_hash = hashlib.sha256(summary.renderedMarkdown.encode()).hexdigest()[:12]
+                source_key = f"session:{session_id}:artifact:summary_v2:{summary_hash}"
+
+                # Get session mode for appropriate TODO extraction
+                session_mode = data.get("mode", "lecture")
+
+                todo_result = await update_todos_from_summary(
+                    session_id=session_id,
+                    account_id=current_user.account_id,
+                    source_key=source_key,
+                    summary_text=summary.renderedMarkdown,
+                    transcript_text=transcript_text,
+                    mode=session_mode,
+                )
+                logger.info(f"[SummaryV2→TODO] Auto-extracted TODOs (mode={session_mode}): created={todo_result.get('created')}, candidates={todo_result.get('candidates')}")
+            except Exception as todo_err:
+                # Don't fail the whole summary if TODO extraction fails
+                logger.warning(f"[SummaryV2→TODO] Auto-extraction failed (non-blocking): {todo_err}")
+
+        except Exception as e:
+            logger.exception(f"[SummaryV2] Failed for {session_id}: {e}")
+            derived_ref.set({
+                "status": "failed",
+                "errorReason": str(e)[:500],
+                "jobId": job_id,
+                "updatedAt": datetime.now(timezone.utc),
+            }, merge=True)
+
+    background_tasks.add_task(run_summary_v2)
+
+    return {
+        "status": "started",
+        "jobId": job_id,
+        "statusUrl": f"/sessions/{session_id}/artifacts/summary_v2",
+    }
+
+
+@router.post("/sessions/{session_id}/artifacts/summary_v2:feedback", response_model=SummaryV2FeedbackResponse)
+async def submit_summary_v2_feedback(
+    session_id: str,
+    body: SummaryV2FeedbackRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Submit feedback for a summary item.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    # Save feedback
+    feedback_ref = doc_ref.collection("summary_v2_feedback").document()
+    feedback_ref.set({
+        "itemId": body.itemId,
+        "action": body.action,
+        "editedText": body.editedText,
+        "correctedEvidence": [e.dict() for e in body.correctedEvidence] if body.correctedEvidence else None,
+        "comment": body.comment,
+        "userId": current_user.uid,
+        "createdAt": datetime.now(timezone.utc),
+    })
+
+    # If action is "edit", update the item in derived doc
+    if body.action == "edit" and body.editedText:
+        derived_ref = doc_ref.collection("derived").document("summary_v2")
+        derived_snap = derived_ref.get()
+        if derived_snap.exists:
+            derived_data = derived_snap.to_dict() or {}
+            result = derived_data.get("result", {})
+            items = result.get("items", [])
+
+            for item in items:
+                if item.get("id") == body.itemId:
+                    item["text"] = body.editedText
+                    item["userEdited"] = True
+                    if body.correctedEvidence:
+                        item["evidence"] = [e.dict() for e in body.correctedEvidence]
+                    break
+
+            result["items"] = items
+            derived_ref.update({
+                "result": result,
+                "updatedAt": datetime.now(timezone.utc),
+            })
+
+    return SummaryV2FeedbackResponse(
+        ok=True,
+        itemId=body.itemId,
+        action=body.action,
+    )
+
+
+@router.get("/sessions/{session_id}/transcript_segments", response_model=TranscriptSegmentsResponse)
+async def get_transcript_segments(
+    session_id: str,
+    fromMs: Optional[int] = None,
+    toMs: Optional[int] = None,
+    limit: int = 100,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Get transcript segments for evidence display.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    segments: List[TranscriptSegment] = []
+
+    # Try diarized segments first
+    diarized = data.get("diarizedSegments") or []
+    if diarized:
+        for idx, seg in enumerate(diarized):
+            start = seg.get("startMs") or int(seg.get("startSec", 0) * 1000)
+            end = seg.get("endMs") or int(seg.get("endSec", 0) * 1000)
+
+            # Filter by time range
+            if fromMs is not None and end < fromMs:
+                continue
+            if toMs is not None and start > toMs:
+                continue
+
+            segments.append(TranscriptSegment(
+                id=seg.get("id", f"seg_{idx}"),
+                startMs=start,
+                endMs=end,
+                speakerId=seg.get("speakerId"),
+                text=seg.get("text", ""),
+            ))
+
+            if len(segments) >= limit:
+                break
+    else:
+        # Fallback: Create pseudo-segments from transcript chunks
+        chunks = list(doc_ref.collection("transcript_chunks").order_by("startMs").limit(limit * 2).stream())
+        for chunk in chunks:
+            cd = chunk.to_dict()
+            start = cd.get("startMs", 0)
+            end = cd.get("endMs", start + 5000)
+
+            if fromMs is not None and end < fromMs:
+                continue
+            if toMs is not None and start > toMs:
+                continue
+
+            segments.append(TranscriptSegment(
+                id=chunk.id,
+                startMs=start,
+                endMs=end,
+                speakerId=cd.get("speakerId"),
+                text=cd.get("text", ""),
+            ))
+
+            if len(segments) >= limit:
+                break
+
+    return TranscriptSegmentsResponse(
+        segments=segments,
+        totalCount=len(segments),
+        hasMore=len(segments) >= limit,
+    )
+
+
+@router.post("/sessions/{session_id}/user_marks")
+async def add_user_mark(
+    session_id: str,
+    body: UserMark,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Add a user mark (decision/todo/important) during recording.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_is_owner(data, current_user, session_id)
+
+    # Get existing marks
+    marks = data.get("userMarks", [])
+
+    # Add new mark
+    mark_data = {
+        "id": body.id or str(uuid.uuid4())[:8],
+        "type": body.type.value if hasattr(body.type, 'value') else body.type,
+        "atMs": body.atMs,
+        "text": body.text,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    marks.append(mark_data)
+
+    # Update session
+    doc_ref.update({
+        "userMarks": marks,
+        "updatedAt": datetime.now(timezone.utc),
+    })
+
+    return {"ok": True, "markId": mark_data["id"]}
+
+
+@router.get("/sessions/{session_id}/user_marks")
+async def get_user_marks(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Get user marks for a session.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    marks = data.get("userMarks", [])
+    return {"marks": marks}
+
+
+# =============================================================================
+# TODO Extraction Endpoint
+# =============================================================================
+
+class TodoExtractRequest(BaseModel):
+    """Request body for TODO extraction."""
+    force: bool = False  # Re-run extraction even if already done
+
+class TodoExtractResponse(BaseModel):
+    """Response for TODO extraction endpoint."""
+    status: str  # started | already_running | already_completed
+    jobId: Optional[str] = None
+    statusUrl: Optional[str] = None
+    createdCount: Optional[int] = None
+    candidateCount: Optional[int] = None
+
+@router.post("/sessions/{session_id}/todos:extract", response_model=TodoExtractResponse)
+async def extract_todos_from_session_endpoint(
+    session_id: str,
+    body: TodoExtractRequest = Body(default=TodoExtractRequest()),
+    background_tasks: BackgroundTasks = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Extract TODOs from a session using LLM.
+
+    Runs a 3-stage pipeline:
+    1. Generate: LLM extracts todos from transcript/summary
+    2. Normalize: Resolve relative dates, clean text
+    3. Reconcile: Dedupe against existing todos, create confirmed + candidates
+
+    High-confidence items are auto-confirmed, others become candidates for review.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_is_owner(data, current_user, session_id)
+
+    # Resolve account_id
+    account_id = current_user.account_id
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Account not found")
+
+    # Check extraction status
+    extract_ref = doc_ref.collection("derived").document("todos")
+    extract_snap = extract_ref.get()
+    if extract_snap.exists and not body.force:
+        extract_data = extract_snap.to_dict() or {}
+        if extract_data.get("status") == "running":
+            return TodoExtractResponse(
+                status="already_running",
+                jobId=extract_data.get("jobId"),
+            )
+        if extract_data.get("status") in ["succeeded", "completed"]:
+            return TodoExtractResponse(
+                status="already_completed",
+                jobId=extract_data.get("jobId"),
+                createdCount=extract_data.get("createdCount"),
+                candidateCount=extract_data.get("candidateCount"),
+            )
+
+    # Create job
+    job_id = f"todo_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+
+    # Mark as running
+    extract_ref.set({
+        "status": "running",
+        "jobId": job_id,
+        "updatedAt": now,
+        "startedAt": now,
+    }, merge=True)
+
+    # Run extraction
+    async def run_extraction():
+        try:
+            from app.services.todo_extractor import extract_todos_from_session
+
+            result = await extract_todos_from_session(
+                session_id=session_id,
+                account_id=account_id,
+                force=body.force,
+            )
+
+            # Update status
+            extract_ref.set({
+                "status": "succeeded",
+                "jobId": job_id,
+                "updatedAt": datetime.now(timezone.utc),
+                "createdCount": result.get("created_count", 0),
+                "candidateCount": result.get("candidate_count", 0),
+                "skippedCount": result.get("skipped_count", 0),
+            }, merge=True)
+
+            logger.info(f"[TodoExtract] Completed for {session_id}: created={result.get('created_count')}, candidates={result.get('candidate_count')}")
+
+        except Exception as e:
+            logger.exception(f"[TodoExtract] Failed for {session_id}: {e}")
+            extract_ref.set({
+                "status": "failed",
+                "errorReason": str(e)[:500],
+                "jobId": job_id,
+                "updatedAt": datetime.now(timezone.utc),
+            }, merge=True)
+
+    if background_tasks:
+        background_tasks.add_task(run_extraction)
+    else:
+        # Run synchronously if no background_tasks
+        import asyncio
+        asyncio.create_task(run_extraction())
+
+    return TodoExtractResponse(
+        status="started",
+        jobId=job_id,
+        statusUrl=f"/sessions/{session_id}/todos:status",
+    )
+
+
+@router.get("/sessions/{session_id}/todos:status")
+async def get_todo_extraction_status(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Get the status of TODO extraction for a session.
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    extract_ref = doc_ref.collection("derived").document("todos")
+    extract_snap = extract_ref.get()
+
+    if not extract_snap.exists:
+        return {"status": "not_started"}
+
+    extract_data = extract_snap.to_dict() or {}
+    return {
+        "status": extract_data.get("status", "unknown"),
+        "jobId": extract_data.get("jobId"),
+        "createdCount": extract_data.get("createdCount"),
+        "candidateCount": extract_data.get("candidateCount"),
+        "skippedCount": extract_data.get("skippedCount"),
+        "errorReason": extract_data.get("errorReason"),
+        "updatedAt": extract_data.get("updatedAt"),
+    }

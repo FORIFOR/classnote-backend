@@ -12,6 +12,7 @@ from app.services.llm import (
     generate_playlist_timeline,
 )
 from app.services.transcripts import resolve_transcript_text
+from app.services.playlist_utils import normalize_playlist_items
 from app.services.usage import usage_logger
 from app.services.ops_logger import log_job_transition, log_llm_event, log_stt_event, ErrorCode
 from app.services.cost_guard import cost_guard
@@ -227,8 +228,31 @@ async def _handle_summarize_task_core(request: Request):
             "idempotencyKey": idempotency_key,
             "jobId": job_id,
         }, merge=True)
-        
+
         logger.info(f"Successfully summarized session {session_id}")
+
+        # [TODO EXTRACTION] Update TODOs from summary (idempotent, mode-aware)
+        if summary_markdown and owner_account_id:
+            try:
+                from app.services.todo_extractor import update_todos_from_summary
+                import hashlib
+
+                # Generate sourceKey from summary content hash for idempotency
+                summary_hash = hashlib.sha256(summary_markdown.encode()).hexdigest()[:12]
+                source_key = f"session:{session_id}:artifact:summary:{summary_hash}"
+
+                todo_stats = await update_todos_from_summary(
+                    session_id=session_id,
+                    account_id=owner_account_id,
+                    source_key=source_key,
+                    summary_text=summary_markdown,
+                    transcript_text=transcript,
+                    mode=mode,  # Pass session mode for appropriate TODO extraction
+                )
+                logger.info(f"[TODO] Extracted for {session_id} (mode={mode}): created={todo_stats.get('created')}, candidates={todo_stats.get('candidates')}")
+            except Exception as todo_err:
+                # Non-blocking: don't fail summary if TODO extraction fails
+                logger.warning(f"[TODO] Extraction failed for {session_id} (non-blocking): {todo_err}")
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
@@ -645,11 +669,14 @@ async def _handle_playlist_task_core(request: Request):
         segments = data.get("diarizedSegments")
         duration = data.get("durationSec")
         playlist_json_str = await generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
-        
+
         try:
-            items = json.loads(playlist_json_str)
+            raw_items = json.loads(playlist_json_str)
         except:
-            items = []
+            raw_items = []
+
+        # [NEW] Normalize: ms/sec detection, duration clamp, validation
+        items = normalize_playlist_items(raw_items, segments=segments, duration_sec=duration)
 
         # Success
         ts = datetime.now(timezone.utc)
@@ -728,6 +755,99 @@ async def handle_generate_highlights(request: Request):
         "highlightsUpdatedAt": datetime.now(timezone.utc)
     })
     return {"status": "failed", "reason": "deprecated"}
+
+
+@router.post("/internal/tasks/summary_v2")
+async def handle_summary_v2_task(request: Request):
+    """
+    Cloud Tasks endpoint for SummaryV2 (Evidence-based Structured Summary) Generation.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    session_id = payload.get("sessionId")
+    job_id = payload.get("jobId")
+    user_id = payload.get("userId")
+    meeting_purpose = payload.get("meetingPurpose")
+    meeting_type = payload.get("meetingType")
+    participants = payload.get("participants", [])
+
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+
+    try:
+        from google.cloud import firestore
+        import os
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+
+        doc_ref = db.collection("sessions").document(session_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return {"status": "skipped", "reason": "not_found"}
+
+        data = doc.to_dict()
+        transcript = resolve_transcript_text(session_id, data)
+        if not transcript:
+            logger.error(f"[summary_v2] Empty transcript for {session_id}")
+            return {"status": "failed", "reason": "empty_transcript"}
+
+        derived_ref = doc_ref.collection("derived").document("summary_v2")
+
+        # Mark as running
+        derived_ref.set({
+            "status": "running",
+            "jobId": job_id,
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+
+        # Generate
+        from app.services.summary_v2 import generate_summary_v2
+
+        summary = await generate_summary_v2(
+            session_id=session_id,
+            transcript_text=transcript,
+            diarized_segments=data.get("diarizedSegments"),
+            user_marks=data.get("userMarks"),
+            meeting_purpose=meeting_purpose or data.get("meetingPurpose"),
+            meeting_type=meeting_type or data.get("mode"),
+            participants=participants or data.get("participants", []),
+        )
+
+        # Save result
+        derived_ref.set({
+            "status": "succeeded",
+            "result": summary.dict(),
+            "jobId": job_id,
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+
+        doc_ref.update({
+            "summaryV2Status": "completed",
+            "summaryV2Markdown": summary.renderedMarkdown,
+            "updatedAt": datetime.now(timezone.utc),
+        })
+
+        logger.info(f"[summary_v2] Generated for {session_id}")
+        return {"status": "completed"}
+
+    except Exception as e:
+        logger.exception(f"[summary_v2] Failed for {session_id}: {e}")
+        ts = datetime.now(timezone.utc)
+
+        try:
+            derived_ref.set({
+                "status": "failed",
+                "errorReason": str(e)[:500],
+                "jobId": job_id,
+                "updatedAt": ts,
+            }, merge=True)
+        except Exception as db_err:
+            logger.error(f"Failed to update derived doc: {db_err}")
+
+        return {"status": "failed", "error": str(e)}
 
 
 # [REMOVED] Duplicate deprecated playlist handler - the real implementation is at line 574

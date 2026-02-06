@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, Query, HTTPException, BackgroundTasks, Header, status
 from typing import List, Optional
 import random
 import string
@@ -11,6 +11,8 @@ from app.dependencies import get_current_user, CurrentUser
 from app.util_models import (
     PublicUser,
     MeResponse,
+    MeLiteResponse,
+    FeatureGates,
     MeUpdateRequest,
     UserProfileResponse,
     UserProfileUpdateRequest,
@@ -22,6 +24,9 @@ from app.util_models import (
     CapabilitiesResponse,
     SubscriptionVerifyRequest,
     EntitlementResponse,
+    SubscriptionClaimResponse,
+    SubscriptionClaimSubscriptionInfo,
+    CloudUsageReport,  # [FIX] 追加
 )
 from app.firebase import db
 from app.services.account_deletion import (
@@ -30,7 +35,7 @@ from app.services.account_deletion import (
     deletion_lock_id,
     deletion_schedule_at,
 )
-from app.services.cost_guard import cost_guard, FREE_LIMITS, BASIC_LIMITS, PREMIUM_LIMITS
+from app.services.cost_guard import cost_guard, FREE_LIMITS, BASIC_LIMITS
 import uuid
 
 from app.services.plans import plan_from_product_id
@@ -46,9 +51,7 @@ logger = logging.getLogger("app.users")
 # [NEW] Plan Mapping
 PRODUCT_TO_PLAN = {
     "com.classnote.app.standard.monthly": "basic",
-    "com.classnote.app.standard.yearly": "basic", # Assumption
-    "com.classnote.app.premium.monthly": "premium",
-    "com.classnote.app.premium.yearly": "premium", # Assumption
+    "com.classnote.app.standard.yearly": "basic",
 }
 
 # [NEW] Custom Error for Transaction
@@ -121,6 +124,248 @@ def downgrade_account_if_expired(account_id: str, uid: str):
             )
     except Exception as e:
         logger.error(f"JIT downgrade failed for account {account_id}: {e}")
+
+
+def _find_best_production_entitlement(account_id: str, now: datetime) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Find the best active Production entitlement for an account.
+
+    Returns:
+        tuple: (entitlement_data, entitlement_id) or (None, None) if none found
+
+    Logic:
+    1. Query all entitlements where ownerAccountId == account_id
+    2. Filter: environment == "Production" AND status in ["active", "grace", "billing_retry", "active_lifetime"]
+    3. Filter: not expired (currentPeriodEnd > now OR status == "active_lifetime")
+    4. Return the one with latest currentPeriodEnd (most recent subscription)
+    """
+    try:
+        # Query all entitlements for this account
+        ents = db.collection("entitlements")\
+            .where("ownerAccountId", "==", account_id)\
+            .stream()
+
+        best_ent = None
+        best_ent_id = None
+        best_expiry = None
+
+        for doc in ents:
+            data = doc.to_dict() or {}
+
+            # Filter 1: Production only (ignore Sandbox)
+            if data.get("environment") != "Production":
+                continue
+
+            # Filter 2: Active status
+            status = data.get("status", "unknown")
+            if status not in ["active", "grace", "billing_retry", "active_lifetime"]:
+                continue
+
+            # Filter 3: Not expired
+            current_period_end = data.get("currentPeriodEnd")
+            if current_period_end:
+                if not current_period_end.tzinfo:
+                    current_period_end = current_period_end.replace(tzinfo=timezone.utc)
+
+                # Skip if expired (unless lifetime)
+                if current_period_end < now and status != "active_lifetime":
+                    continue
+
+            # This entitlement is valid - check if it's better than current best
+            # Prefer the one with latest expiry (or any if we have none)
+            if best_ent is None:
+                best_ent = data
+                best_ent_id = doc.id
+                best_expiry = current_period_end
+            elif current_period_end and (best_expiry is None or current_period_end > best_expiry):
+                best_ent = data
+                best_ent_id = doc.id
+                best_expiry = current_period_end
+
+        return best_ent, best_ent_id
+
+    except Exception as e:
+        logger.error(f"[_find_best_production_entitlement] Failed for account {account_id}: {e}")
+        return None, None
+
+
+def _repair_account_plan(account_id: str, target_plan: str, reason: str):
+    """
+    [Background Task] Repair account.plan when entitlement verification fails.
+    This ensures account.plan stays in sync with entitlement state.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        acc_ref = db.collection("accounts").document(account_id)
+        acc_doc = acc_ref.get()
+
+        if not acc_doc.exists:
+            logger.warning(f"[_repair_account_plan] Account {account_id} not found")
+            return
+
+        current_plan = acc_doc.to_dict().get("plan", "free")
+
+        if current_plan == target_plan:
+            # Already at target, nothing to do
+            return
+
+        acc_ref.update({
+            "plan": target_plan,
+            "planRepairedAt": now,
+            "planRepairReason": reason,
+            "previousPlan": current_plan,
+            "updatedAt": now
+        })
+
+        logger.info(
+            "account_plan_repaired",
+            extra={
+                "accountId": account_id,
+                "fromPlan": current_plan,
+                "toPlan": target_plan,
+                "reason": reason
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"[_repair_account_plan] Failed for account {account_id}: {e}")
+
+
+def _repair_account_entitlement(account_id: str, entitlement_id: str, plan: str):
+    """
+    [Background Task] Repair account to point to the correct Production entitlement.
+    Called when a valid Production entitlement is found but account.appleEntitlementId
+    points to an invalid/Sandbox entitlement.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        acc_ref = db.collection("accounts").document(account_id)
+        acc_doc = acc_ref.get()
+
+        if not acc_doc.exists:
+            logger.warning(f"[_repair_account_entitlement] Account {account_id} not found")
+            return
+
+        acc_data = acc_doc.to_dict() or {}
+        old_ent_id = acc_data.get("appleEntitlementId")
+        current_plan = acc_data.get("plan", "free")
+
+        acc_ref.update({
+            "appleEntitlementId": entitlement_id,
+            "plan": plan,
+            "planRepairedAt": now,
+            "planRepairReason": "switched_to_production_entitlement",
+            "previousAppleEntitlementId": old_ent_id,
+            "previousPlan": current_plan,
+            "updatedAt": now
+        })
+
+        logger.info(
+            "account_entitlement_repaired",
+            extra={
+                "accountId": account_id,
+                "fromEntitlement": old_ent_id,
+                "toEntitlement": entitlement_id,
+                "fromPlan": current_plan,
+                "toPlan": plan,
+                "reason": "switched_to_production_entitlement"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"[_repair_account_entitlement] Failed for account {account_id}: {e}")
+
+
+def _cancel_pending_deletion(uid: str, user_profile: dict):
+    """
+    [Account Deletion] Cancel pending deletion request when user re-logs in.
+    Called as background task from /users/me.
+
+    This implements the 30-day grace period reset:
+    - User requests deletion -> 30 day timer starts
+    - User re-logs in within 30 days -> deletion cancelled
+    - User doesn't log in for 30 days -> data permanently deleted
+    """
+    now = datetime.now(timezone.utc)
+
+    try:
+        # 1. Clear deletion fields from user doc
+        user_ref = db.collection("users").document(uid)
+        user_ref.update({
+            "deletionStatus": firestore.DELETE_FIELD,
+            "deletionRequestedAt": firestore.DELETE_FIELD,
+            "deletionScheduledAt": firestore.DELETE_FIELD,
+            "deletion": firestore.DELETE_FIELD,  # Also clear new-style deletion object
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        })
+
+        # 2. Update deletion request doc to "cancelled"
+        req_ref = db.collection(REQUESTS_COLLECTION).document(uid)
+        req_doc = req_ref.get()
+        if req_doc.exists:
+            req_ref.update({
+                "status": "cancelled",
+                "cancelledAt": now,
+                "cancelReason": "re_login",
+                "updatedAt": now
+            })
+
+        # 3. Remove deletion lock (allows re-registration with same email/provider)
+        email_lower = user_profile.get("email", "").lower() if user_profile.get("email") else None
+        provider_id = user_profile.get("provider")
+        if not provider_id:
+            providers = user_profile.get("providers", [])
+            if providers:
+                provider_id = providers[0]
+
+        if email_lower and provider_id:
+            lock_id = deletion_lock_id(email_lower, provider_id)
+            db.collection(LOCKS_COLLECTION).document(lock_id).delete()
+
+        logger.info(f"[CancelDeletion] Successfully cancelled deletion for {uid}")
+
+    except Exception as e:
+        logger.error(f"[CancelDeletion] Failed to cancel deletion for {uid}: {e}")
+
+
+def _sync_username_from_account(uid: str, account_id: str):
+    """
+    [Background Task] Sync username from other account members.
+
+    This is a JIT repair that used to block /users/me response.
+    Now runs asynchronously to improve response time.
+    """
+    try:
+        acc_doc = db.collection("accounts").document(account_id).get()
+        if not acc_doc.exists:
+            return
+
+        acc_data = acc_doc.to_dict() or {}
+        member_uids = acc_data.get("memberUids", [])
+
+        for other_uid in member_uids:
+            if other_uid == uid:
+                continue
+
+            other_user = db.collection("users").document(other_uid).get()
+            if other_user.exists:
+                other_data = other_user.to_dict() or {}
+                if other_data.get("username"):
+                    # Found username in another uid - sync it
+                    db.collection("users").document(uid).set({
+                        "username": other_data["username"],
+                        "hasUsername": True,
+                        "displayName": other_data.get("displayName"),
+                        "usernameSyncedFrom": other_uid,
+                        "usernameSyncedAt": datetime.now(timezone.utc),
+                    }, merge=True)
+                    logger.info(f"[Background] Synced username from {other_uid} to {uid}")
+                    return
+
+        logger.debug(f"[Background] No username found in account {account_id} members")
+
+    except Exception as e:
+        logger.error(f"[Background] Username sync failed for {uid}: {e}")
 
 
 router = APIRouter(prefix="/users")
@@ -198,11 +443,31 @@ def _merge_uid_into_account(transaction, uid: str, target_account_id: str, sourc
     """
     [Account Unification] Merge a uid into target_account_id.
     Updates uid_links, accounts.memberUids, and optionally marks old account as merged.
+
+    [FIX] Firestore transactions require ALL reads before ANY writes.
     """
     now = datetime.now(timezone.utc)
 
-    # 1. Update uid_links to point to target account
+    # === PHASE 1: ALL READS FIRST ===
     link_ref = db.collection("uid_links").document(uid)
+    target_acc_ref = db.collection("accounts").document(target_account_id)
+    user_ref = db.collection("users").document(uid)
+
+    # Read target account
+    target_acc_snap = target_acc_ref.get(transaction=transaction)
+    target_data = target_acc_snap.to_dict() if target_acc_snap.exists else None
+
+    # Read source account (if different)
+    source_acc_ref = None
+    source_data = None
+    if source_account_id and source_account_id != target_account_id:
+        source_acc_ref = db.collection("accounts").document(source_account_id)
+        source_acc_snap = source_acc_ref.get(transaction=transaction)
+        source_data = source_acc_snap.to_dict() if source_acc_snap.exists else None
+
+    # === PHASE 2: ALL WRITES AFTER ===
+
+    # 1. Update uid_links to point to target account
     transaction.set(link_ref, {
         "uid": uid,
         "accountId": target_account_id,
@@ -212,10 +477,7 @@ def _merge_uid_into_account(transaction, uid: str, target_account_id: str, sourc
     }, merge=True)
 
     # 2. Add uid to target account's memberUids
-    target_acc_ref = db.collection("accounts").document(target_account_id)
-    target_acc_snap = target_acc_ref.get(transaction=transaction)
-    if target_acc_snap.exists:
-        target_data = target_acc_snap.to_dict() or {}
+    if target_data:
         member_uids = set(target_data.get("memberUids", []))
         member_uids.add(uid)
         transaction.update(target_acc_ref, {
@@ -233,28 +495,23 @@ def _merge_uid_into_account(transaction, uid: str, target_account_id: str, sourc
         })
 
     # 3. Remove uid from source account's memberUids (if different)
-    if source_account_id and source_account_id != target_account_id:
-        source_acc_ref = db.collection("accounts").document(source_account_id)
-        source_acc_snap = source_acc_ref.get(transaction=transaction)
-        if source_acc_snap.exists:
-            source_data = source_acc_snap.to_dict() or {}
-            source_members = [m for m in source_data.get("memberUids", []) if m != uid]
-            if len(source_members) == 0:
-                # Mark as merged if no members left
-                transaction.update(source_acc_ref, {
-                    "memberUids": [],
-                    "mergedInto": target_account_id,
-                    "mergedAt": now,
-                    "updatedAt": now
-                })
-            else:
-                transaction.update(source_acc_ref, {
-                    "memberUids": source_members,
-                    "updatedAt": now
-                })
+    if source_acc_ref and source_data:
+        source_members = [m for m in source_data.get("memberUids", []) if m != uid]
+        if len(source_members) == 0:
+            # Mark as merged if no members left
+            transaction.update(source_acc_ref, {
+                "memberUids": [],
+                "mergedInto": target_account_id,
+                "mergedAt": now,
+                "updatedAt": now
+            })
+        else:
+            transaction.update(source_acc_ref, {
+                "memberUids": source_members,
+                "updatedAt": now
+            })
 
     # 4. Update users/{uid}.accountId
-    user_ref = db.collection("users").document(uid)
     transaction.set(user_ref, {
         "accountId": target_account_id,
         "updatedAt": now
@@ -275,6 +532,8 @@ async def set_apple_token(req: AppleTokenReq, current_user: CurrentUser = Depend
     [Account Unification] If this token is already linked to a different accountId,
     this endpoint will automatically merge the current uid into that account.
     This enables cross-provider account unification (Google + LINE on same device).
+
+    [Idempotent] If token is already registered with same accountId, skips writes.
     """
     if not re.match(r"^[0-9a-fA-F-]{32,36}$", req.appAccountToken):
         raise HTTPException(status_code=400, detail="INVALID_APP_ACCOUNT_TOKEN")
@@ -282,6 +541,24 @@ async def set_apple_token(req: AppleTokenReq, current_user: CurrentUser = Depend
     token = req.appAccountToken
     uid = current_user.uid
     now = datetime.now(timezone.utc)
+
+    # Get current user data (single read)
+    user_snap = db.collection("users").document(uid).get()
+    user_data = user_snap.to_dict() if user_snap.exists else {}
+
+    # Check if user already has this token - skip all writes if unchanged
+    existing_token = user_data.get("appleAppAccountToken")
+    if existing_token == token:
+        current_account_id = user_data.get("accountId")
+        if current_account_id:
+            # [Idempotent] Token unchanged, skip all writes
+            logger.debug(f"[AppAccountToken] Idempotent skip: uid={uid}, token unchanged")
+            return AppleTokenResponse(
+                ok=True,
+                merged=False,
+                accountId=current_account_id,
+                message="Token unchanged (idempotent)"
+            )
 
     # Get current user's accountId
     link_ref = db.collection("uid_links").document(uid)
@@ -292,9 +569,7 @@ async def set_apple_token(req: AppleTokenReq, current_user: CurrentUser = Depend
 
     # If no accountId yet, check users/{uid}
     if not current_account_id:
-        user_snap = db.collection("users").document(uid).get()
-        if user_snap.exists:
-            current_account_id = user_snap.to_dict().get("accountId")
+        current_account_id = user_data.get("accountId")
 
     # Check if token is already registered
     token_ref = db.collection("apple_app_account_tokens").document(token)
@@ -349,14 +624,24 @@ async def set_apple_token(req: AppleTokenReq, current_user: CurrentUser = Depend
     token_data = token_snap.to_dict() or {}
     mapped_account_id = token_data.get("accountId")
 
-    # Update lastSeenAt
-    token_ref.update({"lastSeenAt": now})
+    # [Idempotent] Only update lastSeenAt if more than 1 hour has passed
+    last_seen = token_data.get("lastSeenAt")
+    should_update_last_seen = True
+    if last_seen:
+        if hasattr(last_seen, 'tzinfo') and last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        time_diff = (now - last_seen).total_seconds()
+        should_update_last_seen = time_diff > 3600  # 1 hour
 
-    # Save token to user doc
-    db.collection("users").document(uid).set({
-        "appleAppAccountToken": token,
-        "updatedAt": now
-    }, merge=True)
+    if should_update_last_seen:
+        token_ref.update({"lastSeenAt": now})
+
+    # [Idempotent] Only update user doc if token changed
+    if existing_token != token:
+        db.collection("users").document(uid).set({
+            "appleAppAccountToken": token,
+            "updatedAt": now
+        }, merge=True)
 
     if not mapped_account_id:
         # Token exists but no accountId - update it
@@ -403,19 +688,167 @@ async def set_apple_token(req: AppleTokenReq, current_user: CurrentUser = Depend
         raise HTTPException(status_code=500, detail=f"Account merge failed: {str(e)}")
 
 
+# =============================================================================
+# GET /users/me/lite - Lightweight endpoint for app startup
+# =============================================================================
+
+@router.get("/me/lite", response_model=MeLiteResponse)
+async def get_me_lite(
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Lightweight user profile for app startup.
+
+    Design principles:
+    - NO JIT writes (read-only, no account creation/repair)
+    - NO usage calculation (plan-based gates only)
+    - Minimal Firestore reads (max 2: users + accounts, in parallel)
+    - Target response time: <100ms
+
+    Use this endpoint for:
+    - App launch / splash screen
+    - Quick auth state verification
+    - Feature gate checks
+
+    For full profile with usage/credits, use GET /users/me
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    now = datetime.now(timezone.utc)
+
+    # [OPTIMIZATION] Read user document first to get accountId
+    # Then read account in parallel if needed
+    def read_user():
+        doc = db.collection("users").document(current_user.uid).get()
+        return doc.to_dict() if doc.exists else {}
+
+    def read_account(account_id: str):
+        if not account_id:
+            return {}
+        doc = db.collection("accounts").document(account_id).get()
+        return doc.to_dict() if doc.exists else {}
+
+    # Step 1: Read user document
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        user_data = await loop.run_in_executor(executor, read_user)
+
+        # Extract account_id early
+        account_id = user_data.get("accountId") or current_user.account_id
+
+        # Step 2: Read account document in parallel (if exists)
+        acc_data = {}
+        if account_id:
+            acc_data = await loop.run_in_executor(executor, read_account, account_id)
+
+    # Extract basic info
+    display_name = user_data.get("displayName") or current_user.display_name or "User"
+    username = user_data.get("username")
+    has_username = user_data.get("hasUsername", False)
+
+    # Process account data
+    plan = "free"
+    suspended = False
+    if acc_data:
+        raw_plan = acc_data.get("plan", "free")
+        # Normalize plan
+        if raw_plan in ("basic", "standard"):
+            plan = "basic"
+        else:
+            plan = "free"
+        suspended = acc_data.get("suspended", False)
+
+    # Step 3: Determine feature gates based on plan (no usage check)
+    # Basic plan: all features enabled
+    # Free plan: cloud features limited but still "enabled" (usage check happens at request time)
+    feature_gates = FeatureGates(
+        cloudStt=True,  # Gate at request time, not here
+        summarization=True,
+        quiz=True,
+        cloudSync=True,
+        export=True,
+        share=True,
+    )
+
+    # Step 4: Determine phone/SNS flags (simple check, no writes)
+    token_provider = current_user.provider
+    token_phone = current_user.phone_number
+    phone_in_db = user_data.get("phoneE164")
+
+    # SNS providers that count as "verified identity"
+    verified_sns_providers = {"google.com", "apple.com", "custom", "line"}
+    is_sns_verified = token_provider in verified_sns_providers
+
+    needs_phone = False
+    if not token_phone and not phone_in_db and not is_sns_verified:
+        needs_phone = True
+
+    needs_sns = False
+    if token_provider == "phone":
+        providers_in_db = set(user_data.get("providers", []))
+        if not any(p in providers_in_db for p in verified_sns_providers):
+            needs_sns = True
+
+    # Build response
+    return MeLiteResponse(
+        uid=current_user.uid,
+        accountId=account_id,
+        plan=plan,
+        displayName=display_name,
+        username=username,
+        hasUsername=has_username,
+        photoUrl=current_user.photo_url,
+        provider=token_provider,
+        providers=user_data.get("providers", []),
+        featureGates=feature_gates,
+        needsPhoneVerification=needs_phone,
+        needsSnsLogin=needs_sns,
+        suspended=suspended,
+        cacheValidUntil=now + timedelta(minutes=5),  # Client can cache for 5 min
+    )
+
+
+# =============================================================================
+# GET /users/me - Full profile with usage and credits
+# =============================================================================
+
 @router.get("/me", response_model=MeResponse)
 async def get_me(
     background_tasks: BackgroundTasks,
-    current_user: CurrentUser = Depends(get_current_user)
+    current_user: CurrentUser = Depends(get_current_user),
+    include_usage: bool = Query(default=True, description="Include usage/credits calculation (slower)")
 ):
     # [NEW] Resolve User Profile early (needed for display values in all paths)
     user_doc_ref = db.collection("users").document(current_user.uid)
     user_doc_snap = user_doc_ref.get()
     user_profile = user_doc_snap.to_dict() if user_doc_snap.exists else {}
 
+    # [CRITICAL] Cancel pending deletion on re-login (30-day grace period reset)
+    # Check both old format (deletionStatus) and new format (deletion.state)
+    deletion_status = user_profile.get("deletionStatus")
+    deletion_obj = user_profile.get("deletion", {})
+    deletion_state = deletion_obj.get("state") if isinstance(deletion_obj, dict) else None
+
+    if deletion_status == "requested" or deletion_state == "queued":
+        logger.info(f"[/users/me] Cancelling pending deletion for {current_user.uid} due to re-login (status={deletion_status}, state={deletion_state})")
+        background_tasks.add_task(_cancel_pending_deletion, current_user.uid, user_profile)
+
     final_username = user_profile.get("username")
     final_has_username = user_profile.get("hasUsername", False)
     final_display_name = user_profile.get("displayName") or current_user.display_name or "New User"
+
+    # [OPTIMIZATION] Move username sync to background to avoid blocking response
+    # This used to loop through all memberUids which could be slow
+    if not final_username and current_user.account_id:
+        # Schedule background task to sync username (non-blocking)
+        background_tasks.add_task(
+            _sync_username_from_account,
+            current_user.uid,
+            current_user.account_id
+        )
+        # For now, use display_name as fallback (username will be synced on next request)
+        logger.debug(f"[/users/me] Username sync scheduled for {current_user.uid}")
 
     # Step A: Extract Token Data safely
     now = datetime.now(timezone.utc)
@@ -630,6 +1063,10 @@ async def get_me(
             cloudSessionLimit=FREE_LIMITS["cloud_sessions_started"],  # 10
             serverSessionLimit=FREE_LIMITS["server_session"],  # 5
             phoneRequiredFor=[] if bool(token_phone) else ["subscriptionRestore", "accountMerge"],
+            # Fallback users are not suspended
+            suspended=False,
+            suspendedAt=None,
+            suspendedReason=None,
         )
 
     # Step D: Data Hydration & Consistency Check
@@ -728,50 +1165,130 @@ async def get_me(
              needs_sns = True
 
 
-    # Step F: Plan & Entitlement (Standard Owner logic)
-    raw_plan = account_data.get("plan", "free")
-    # ... JIT Expiration ...
-    if raw_plan != "free":
-        expires_at = account_data.get("planExpiresAt")
-        if expires_at:
-            if not expires_at.tzinfo: expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at < now:
-                raw_plan = "free"
-                background_tasks.add_task(downgrade_account_if_expired, account_id, current_user.uid)
+    # Step F: Plan & Entitlement
+    # [REFACTORED 2026-01] Entitlement-based plan determination
+    #
+    # Design principles:
+    # 1. Plan is determined by entitlement ownership verification, NOT just account.plan
+    # 2. SSOT: entitlements/{entId}.ownerAccountId must match current accountId
+    # 3. account.plan is a cache - always verify against entitlement for paid plans
+    # 4. Phone ownership is for anti-abuse logging only, NOT plan gating
 
-    # Ownership check for paid plan
-    final_plan = "free"
-    if raw_plan != "free" and phone_in_db:
+    raw_plan = account_data.get("plan", "free")
+    final_plan = "free"  # Default to free, upgrade only if entitlement verifies
+
+    if raw_plan == "free":
+        # No paid plan claimed, but still check for orphaned Production entitlements
+        # (User may have subscribed but account.plan wasn't updated)
+        best_ent, best_ent_id = _find_best_production_entitlement(account_id, now)
+        if best_ent:
+            ent_plan = best_ent.get("plan", "basic")
+            final_plan = ent_plan if ent_plan != "free" else "basic"
+            logger.info(f"[/users/me] Found orphaned Production entitlement {best_ent_id} for account {account_id} - upgrading to {final_plan}")
+            # Repair: Update account to point to this entitlement
+            background_tasks.add_task(_repair_account_entitlement, account_id, best_ent_id, final_plan)
+        else:
+            final_plan = "free"
+    else:
+        # Paid plan claimed - MUST verify against entitlement
+        apple_ent_id = account_data.get("appleEntitlementId")
+        linked_ent_valid = False
+
+        if apple_ent_id:
+            # First, try the linked entitlement (fast path)
+            try:
+                ent_doc = db.collection("entitlements").document(apple_ent_id).get()
+                if ent_doc.exists:
+                    ent_data = ent_doc.to_dict() or {}
+                    ent_owner = ent_data.get("ownerAccountId")
+                    ent_status = ent_data.get("status", "unknown")
+                    ent_env = ent_data.get("environment", "Production")
+                    ent_plan = ent_data.get("plan", "free")
+                    current_period_end = ent_data.get("currentPeriodEnd")
+
+                    # Check: Production environment only
+                    if ent_env != "Production":
+                        logger.info(f"[/users/me] Linked entitlement {apple_ent_id} is {ent_env} (not Production) - searching for Production entitlement")
+                    # Check: Ownership match
+                    elif ent_owner != account_id:
+                        logger.warning(f"[/users/me] Entitlement ownership mismatch: ent.owner={ent_owner}, account={account_id}")
+                    # Check: Status is valid
+                    elif ent_status not in ["active", "grace", "billing_retry", "active_lifetime"]:
+                        logger.info(f"[/users/me] Entitlement {apple_ent_id} status={ent_status} - not active")
+                    # Check: Not expired
+                    elif current_period_end:
+                        if not current_period_end.tzinfo:
+                            current_period_end = current_period_end.replace(tzinfo=timezone.utc)
+                        if current_period_end < now and ent_status not in ["active_lifetime"]:
+                            logger.info(f"[/users/me] Entitlement {apple_ent_id} expired at {current_period_end}")
+                        else:
+                            # All checks passed - linked entitlement is valid
+                            linked_ent_valid = True
+                            final_plan = ent_plan or raw_plan
+                    else:
+                        # No expiry date but status is valid - trust it (lifetime or legacy)
+                        linked_ent_valid = True
+                        final_plan = ent_plan or raw_plan
+
+            except Exception as e:
+                logger.error(f"[/users/me] Failed to verify linked entitlement {apple_ent_id}: {e}")
+
+        # If linked entitlement is invalid, search for any valid Production entitlement
+        if not linked_ent_valid:
+            best_ent, best_ent_id = _find_best_production_entitlement(account_id, now)
+
+            if best_ent:
+                ent_plan = best_ent.get("plan", "basic")
+                final_plan = ent_plan if ent_plan != "free" else "basic"
+                logger.info(f"[/users/me] Found valid Production entitlement {best_ent_id} for account {account_id} (linked was invalid)")
+
+                # Repair: Update account to point to this valid entitlement
+                if best_ent_id != apple_ent_id:
+                    background_tasks.add_task(_repair_account_entitlement, account_id, best_ent_id, final_plan)
+            else:
+                # No valid Production entitlement found - downgrade to free
+                logger.info(f"[/users/me] No valid Production entitlement found for account {account_id} - downgrading to free")
+                final_plan = "free"
+                background_tasks.add_task(_repair_account_plan, account_id, "free", "no_valid_production_entitlement")
+
+    # Normalize plan names
+    if final_plan == "standard":
+        final_plan = "basic"
+    elif final_plan not in ("free", "basic"):
+        final_plan = "free"
+
+    # [OPTIONAL] Anti-abuse logging (phone ownership mismatch - informational only)
+    if final_plan != "free" and phone_in_db:
         try:
             p_doc = db.collection("phone_numbers").document(phone_in_db).get()
-            if p_doc.exists and p_doc.to_dict().get("standardOwnerUid") == current_user.uid:
-                final_plan = raw_plan
-        except: pass
+            if p_doc.exists:
+                std_owner = p_doc.to_dict().get("standardOwnerUid")
+                if std_owner and std_owner != current_user.uid:
+                    # Log for monitoring, but DO NOT downgrade
+                    logger.info(f"[/users/me] Phone owner differs: uid={current_user.uid}, stdOwner={std_owner} (informational)")
+        except Exception:
+            pass  # Non-critical
 
-    # [FIX] Calculate credits dynamically from plan limits - usage
-    # This ensures free users always see their correct remaining quota
-    try:
-        usage_report = await cost_guard.get_usage_report(account_id, mode="account")
-    except Exception as e:
-        logger.warning(f"[/users/me] Failed to get usage report for {account_id}: {e}")
-        usage_report = {}
+    # [OPTIMIZATION] Only calculate usage if requested (saves 2 Firestore reads)
+    # Clients can use include_usage=false for faster response when usage isn't needed
+    usage_report = {}
+    if include_usage:
+        try:
+            usage_report = await cost_guard.get_usage_report(account_id, mode="account")
+        except Exception as e:
+            logger.warning(f"[/users/me] Failed to get usage report for {account_id}: {e}")
 
     # Select limits based on effective plan
-    if final_plan == "premium":
-        cloud_limit = PREMIUM_LIMITS["cloud_stt_sec"]
-        summary_limit = PREMIUM_LIMITS.get("llm_calls", 1000)
-        quiz_limit = PREMIUM_LIMITS.get("llm_calls", 1000)
-        cloud_session_limit = 999999
-    elif final_plan == "basic":
+    if final_plan == "basic":
         cloud_limit = BASIC_LIMITS["cloud_stt_sec"]
         summary_limit = BASIC_LIMITS["summary_generated"]
         quiz_limit = BASIC_LIMITS["quiz_generated"]
         cloud_session_limit = BASIC_LIMITS["cloud_sessions_started"]
     else:  # free
-        cloud_limit = FREE_LIMITS["cloud_stt_sec"]  # 1800 (30 min)
-        summary_limit = FREE_LIMITS["summary_generated"]  # 3
-        quiz_limit = FREE_LIMITS["quiz_generated"]  # 3
-        cloud_session_limit = FREE_LIMITS["cloud_sessions_started"]  # 10
+        cloud_limit = FREE_LIMITS["cloud_stt_sec"]
+        summary_limit = FREE_LIMITS["summary_generated"]
+        quiz_limit = FREE_LIMITS["quiz_generated"]
+        cloud_session_limit = FREE_LIMITS["cloud_sessions_started"]
 
     # Calculate remaining = limit - used
     cloud_used = usage_report.get("usedSeconds", 0.0)
@@ -816,13 +1333,26 @@ async def get_me(
         username=final_username,
         serverSessionCount=0,
         activeSessionCount=0,
-        serverSessionLimit=999 if final_plan == "premium" else (BASIC_LIMITS["server_session"] if final_plan == "basic" else FREE_LIMITS["server_session"]),
+        serverSessionLimit=BASIC_LIMITS["server_session"] if final_plan == "basic" else FREE_LIMITS["server_session"],
         cloudSessionCount=int(cloud_sessions_used),
         cloudSessionLimit=cloud_session_limit,
         freeCloudCreditsRemaining=int(cloud_remaining),  # [FIX] Use calculated value (int for model)
         freeSummaryCreditsRemaining=int(summary_remaining),  # [FIX] Use calculated value
         freeQuizCreditsRemaining=int(quiz_remaining),  # [FIX] Use calculated value
-        cloud=None,
+        # [FIX] cloud オブジェクトを正しく設定
+        cloud=CloudUsageReport(
+            limitSeconds=cloud_limit,
+            usedSeconds=cloud_used,
+            remainingSeconds=cloud_remaining,
+            sessionLimit=cloud_session_limit,
+            sessionsStarted=int(cloud_sessions_used),
+            canStart=cloud_remaining > 0,
+            reasonIfBlocked="cloud_minutes_limit" if cloud_remaining <= 0 else None
+        ),
+        # [FIX] iOS互換性: cloudMinutesUsed/cloudMinutesLimit
+        # [FIX] 整数で返す（SwiftのJSONDecoderが浮動小数点数を処理できない問題を回避）
+        cloudMinutesUsed=int(cloud_used // 60),  # 秒を分に変換（整数）
+        cloudMinutesLimit=int(cloud_limit // 60),  # 秒を分に変換（整数）
         securityState="normal",
         riskScore=0,
         
@@ -836,7 +1366,23 @@ async def get_me(
 
         # [NEW 2026-01] Feature-level phone gate
         # If user has no phone, these features require phone verification
-        phoneRequiredFor=[] if (has_phone_in_token or has_phone_in_db) else ["subscriptionRestore", "accountMerge"]
+        phoneRequiredFor=[] if (has_phone_in_token or has_phone_in_db) else ["subscriptionRestore", "accountMerge"],
+
+        # [NEW 2026-01] Account Suspension (BAN)
+        # Check both account-level and user-level status
+        suspended=(
+            account_data.get("status") == "disabled" or
+            user_profile.get("status") == "disabled" or
+            user_profile.get("securityState") == "banned"
+        ),
+        suspendedAt=(
+            account_data.get("disabledAt") or user_profile.get("disabledAt")
+        ),
+        suspendedReason=(
+            account_data.get("disabledReason") or
+            user_profile.get("disabledReason") or
+            user_profile.get("securityNote")
+        )
     )
 
 @router.get("/me/entitlement", response_model=EntitlementResponse)
@@ -986,7 +1532,7 @@ def _is_active(transaction_info: dict) -> bool:
     return int(expires_date_ms) > now_ms
 
 
-@router.post("/me/subscription/apple:claim", response_model=EntitlementResponse)
+@router.post("/me/subscription/apple:claim", response_model=SubscriptionClaimResponse)
 async def claim_apple_subscription(
     req: SubscriptionVerifyRequest,
     current_user: CurrentUser = Depends(get_current_user),
@@ -1003,40 +1549,52 @@ async def claim_apple_subscription(
             detail="signedTransactionInfo is required.",
         )
 
-    # 1. JWS Verification
+    # 1. JWS Verification (use verify_jws_detailed to distinguish error types)
     from app.services.apple import apple_service
     from starlette.concurrency import run_in_threadpool
 
-    try:
-        transaction_info = await run_in_threadpool(apple_service.verify_jws, req.signedTransactionInfo)
-        if not transaction_info:
-            raise HTTPException(status_code=400, detail="Invalid signedTransactionInfo")
-    except Exception as e:
-        logger.error(f"JWS verification failed: {e}")
-        raise HTTPException(status_code=400, detail=f"JWS verification failed: {e}")
+    transaction_info, error_info = await run_in_threadpool(
+        apple_service.verify_jws_detailed, req.signedTransactionInfo
+    )
+
+    if error_info:
+        error_type = error_info.get("error_type", "")
+        error_message = error_info.get("error_message", "Unknown error")
+        logger.error(f"JWS verification failed: {error_type} - {error_message}")
+
+        # Verifier not initialized = service unavailable (retryable)
+        if error_type == "verifier_not_initialized":
+            raise HTTPException(
+                status_code=503,
+                detail="SERVICE_TEMPORARILY_UNAVAILABLE",
+                headers={"Retry-After": "60"}
+            )
+        # All other errors are client errors (not retryable)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "INVALID_JWS", "message": f"Invalid signedTransactionInfo: {error_message}"}}
+        )
 
     # 2. Extract Key Fields
     otid = transaction_info.get("originalTransactionId")
     product_id = transaction_info.get("productId")
     if not otid or not product_id:
-        raise HTTPException(status_code=400, detail="Missing originalTransactionId or productId")
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "MISSING_TRANSACTION_FIELDS", "message": "Missing originalTransactionId or productId"}}
+        )
 
     # 2.5 appAccountToken Verification (Anti-Hijack)
+    # Note: Token mismatch is logged as warning, not rejected.
+    # Real protection comes from entitlement ownership check in the transaction.
+    # This allows legitimate users to claim their subscription after reinstall/token regeneration.
     tx_app_token = transaction_info.get("appAccountToken")
     user_doc = db.collection("users").document(current_user.uid).get()
     expected_token = (user_doc.to_dict() or {}).get("appleAppAccountToken")
-    
-    if tx_app_token:
-        # Enforce if token is present in receipt (StoreKit 2)
-        if not expected_token:
-             # Transaction has token, but user profile doesn't? 
-             # Error (400) telling client to register token.
-             raise HTTPException(status_code=400, detail="APPLE_APP_ACCOUNT_TOKEN_NOT_REGISTERED")
-             
-        if tx_app_token != expected_token:
-            # Token mismatch -> Potential hijacking attempt or different user
-            logger.warning(f"AppAccountToken mismatch for user {current_user.uid}. Expected {expected_token}, got {tx_app_token}")
-            raise HTTPException(status_code=403, detail="APP_ACCOUNT_TOKEN_MISMATCH")
+
+    if tx_app_token and expected_token and tx_app_token != expected_token:
+        # Log warning but don't reject - ownership check will catch hijacking
+        logger.warning(f"AppAccountToken mismatch for user {current_user.uid}. Expected {expected_token}, got {tx_app_token}. Proceeding with ownership check.")
 
     # 3. Transactional Claim
     try:
@@ -1048,7 +1606,8 @@ async def claim_apple_subscription(
             entitlement_ref = db.collection("entitlements").document(entitlement_id)
             user_ref = db.collection("users").document(current_user.uid)
             
-            entitlement_doc = transaction.get(entitlement_ref)
+            entitlement_docs = list(transaction.get_all([entitlement_ref]))
+            entitlement_doc = entitlement_docs[0] if entitlement_docs else None
             expires_ms = transaction_info.get("expiresDate")
             current_period_end = parse_ms_to_dt(expires_ms)
             active = is_active_from_expires_ms(expires_ms)
@@ -1062,25 +1621,31 @@ async def claim_apple_subscription(
             
             # 1. Get User Link to find Account
             link_ref = db.collection("uid_links").document(current_user.uid)
-            link_doc = transaction.get(link_ref)
-            if not link_doc.exists:
-                # [SECURITY] Block claim if UID is not yet formalised with a Phone Link.
+            link_docs = list(transaction.get_all([link_ref]))
+            link_doc = link_docs[0] if link_docs else None
+            if not link_doc or not link_doc.exists:
+                # [SECURITY] Block claim if UID is not yet formalised with an Account Link.
                 # This ensures standardOwnerUid locking is enforced from the first purchase.
-                raise HTTPException(
-                    status_code=403, 
-                    detail="PHONE_LINK_REQUIRED_TO_CLAIM_SUBSCRIPTION"
-                )
+                raise EntitlementConflictError("ACCOUNT_LINK_REQUIRED_TO_CLAIM_SUBSCRIPTION")
             else:
                 account_id = link_doc.to_dict().get("accountId")
+                if not account_id:
+                    raise EntitlementConflictError("ACCOUNT_ID_MISSING_IN_LINK")
+
                 acc_ref = db.collection("accounts").document(account_id)
-                acc_doc = transaction.get(acc_ref)
+                acc_docs = list(transaction.get_all([acc_ref]))
+                acc_doc = acc_docs[0] if acc_docs else None
+                if not acc_doc or not acc_doc.exists:
+                    raise EntitlementConflictError("ACCOUNT_NOT_FOUND")
+                
                 phone = acc_doc.to_dict().get("phoneE164")
                 
                 if phone:
                     phone_ref = db.collection("phone_numbers").document(phone)
-                    phone_doc = transaction.get(phone_ref)
-                    
-                    if not phone_doc.exists:
+                    phone_docs = list(transaction.get_all([phone_ref]))
+                    phone_doc = phone_docs[0] if phone_docs else None
+
+                    if not phone_doc or not phone_doc.exists:
                         # Should exist if linked, but auto-create if missing
                         transaction.set(phone_ref, {"standardOwnerUid": current_user.uid, "updatedAt": now})
                     else:
@@ -1089,8 +1654,6 @@ async def claim_apple_subscription(
                         
                         if std_owner and std_owner != current_user.uid:
                             # CONFLICT: Another user already owns Standard for this phone
-                            # We must deny the claim OR (if policy allows) overwrite?
-                            # User says: "already entered -> 409"
                             raise EntitlementConflictError(f"Standard plan is already owned by another account on phone {phone}")
                         
                         if not std_owner:
@@ -1098,11 +1661,12 @@ async def claim_apple_subscription(
                             transaction.update(phone_ref, {"standardOwnerUid": current_user.uid, "updatedAt": now})
 
             # --- New Entitlement (First Claim) ---
-            if not entitlement_doc.exists:
+            if not entitlement_doc or not entitlement_doc.exists:
                 entitlement_data = {
                     "provider": "apple",
                     "providerEntitlementId": otid,
-                    "ownerUserId": current_user.uid,
+                    "ownerAccountId": account_id,  # Primary owner identifier
+                    "ownerUserId": current_user.uid,  # Keep for backward compatibility
                     "productId": product_id,
                     "environment": transaction_info.get("environment"),
                     "status": status,
@@ -1113,62 +1677,170 @@ async def claim_apple_subscription(
                     "updatedAt": now,
                 }
                 transaction.set(entitlement_ref, entitlement_data)
-                
+
                 # Update User Reference (Link to entitlement)
                 transaction.update(user_ref, {
                     "appleEntitlementId": entitlement_id,
+                    "planUpdatedAt": now,
+                })
+
+                # Also update Account with subscription info
+                transaction.update(acc_ref, {
+                    "appleEntitlementId": entitlement_id,
+                    "plan": plan,
                     "planUpdatedAt": now,
                 })
                 return entitlement_data
 
             # --- Existing Entitlement (Refresh) ---
             existing = entitlement_doc.to_dict()
+            owner_account_id = existing.get("ownerAccountId")
             owner_uid = existing.get("ownerUserId")
-            
-            if owner_uid != current_user.uid:
-                # CONFLICT: Owned by another user
+
+            # Check by accountId first (preferred), fallback to uid for legacy
+            if owner_account_id:
+                if owner_account_id != account_id:
+                    logger.warning(f"Entitlement conflict: {entitlement_id} owned by account {owner_account_id}, requested by {account_id}")
+                    raise EntitlementConflictError("ENTITLEMENT_OWNED_BY_ANOTHER_ACCOUNT")
+            elif owner_uid and owner_uid != current_user.uid:
+                # Legacy check for old entitlements without ownerAccountId
                 logger.warning(f"Entitlement conflict: {entitlement_id} owned by {owner_uid}, requested by {current_user.uid}")
-                raise HTTPException(status_code=409, detail="ENTITLEMENT_OWNED_BY_ANOTHER_ACCOUNT")
+                raise EntitlementConflictError("ENTITLEMENT_OWNED_BY_ANOTHER_ACCOUNT")
             
             # Update Existing
             update_data = {
                 "updatedAt": now,
                 "status": status,
                 "plan": plan,
-                "productId": product_id, 
+                "productId": product_id,
                 "currentPeriodEnd": current_period_end,
             }
+            # Backfill ownerAccountId if missing (legacy migration)
+            if not owner_account_id:
+                update_data["ownerAccountId"] = account_id
+
             transaction.update(entitlement_ref, update_data)
             transaction.update(user_ref, {"planUpdatedAt": now})
-            
+
+            # Also update Account
+            transaction.update(acc_ref, {
+                "plan": plan,
+                "planUpdatedAt": now,
+            })
+
             return {**existing, **update_data}
 
         # Run Transaction
         transaction = db.transaction()
         final_data = claim_in_transaction(transaction)
-        
-        is_active = final_data.get("status") == "active"
+
+        is_active = final_data.get("status") in ["active", "active_lifetime"]
         expires_ms = None
         if final_data.get("currentPeriodEnd"):
              expires_ms = int(final_data["currentPeriodEnd"].timestamp() * 1000)
 
-        return EntitlementResponse(
-            entitled=is_active,
+        # Build response matching iOS SubscriptionSyncResponse structure
+        subscription_info = SubscriptionClaimSubscriptionInfo(
             plan=final_data.get("plan", "free") if is_active else "free",
+            productId=product_id,
+            originalTransactionId=otid,
             expiresAt=expires_ms,
+            environment=transaction_info.get("environment"),
+            source="apple",
         )
 
+        return SubscriptionClaimResponse(
+            status="verified",
+            accountId=final_data.get("ownerAccountId"),
+            subscription=subscription_info,
+            retryAfter=None,
+            message="Subscription claimed successfully",
+            transactionId=transaction_info.get("transactionId"),
+        )
+
+    except EntitlementConflictError as e:
+        detail = str(e)
+        error_code = detail.replace(" ", "_").upper()
+        status_code = 403 if "ACCOUNT_LINK_REQUIRED" in detail else 409
+        # Return structured error for iOS parsing
+        raise HTTPException(
+            status_code=status_code,
+            detail={"error": {"code": error_code, "message": detail}}
+        )
     except HTTPException:
         raise
     except Exception as e:
         logger.exception(f"Subscription claim failed for user {current_user.uid}: {e}")
-        status_code = 500
-        if "ENTITLEMENT_OWNED_BY_ANOTHER_ACCOUNT" in str(e): 
-             status_code = 409
-        if isinstance(e, EntitlementConflictError):
-             status_code = 409
-        raise HTTPException(status_code=status_code, detail=f"Failed to process subscription claim: {type(e).__name__} {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process subscription claim: {type(e).__name__} {str(e)}")
 
+
+class AccountStatusResponse(BaseModel):
+    uid: str
+    accountId: Optional[str] = None
+    status: str  # "active" or "disabled"
+    message: Optional[str] = None
+    disabledAt: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@router.get("/me/status", response_model=AccountStatusResponse)
+async def get_my_status(
+    authorization: Optional[str] = Header(None)
+):
+    """
+    自分のアカウント状態を確認する。
+    ※ このエンドポイントは停止中でも呼び出し可能（get_current_userを使わない）
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Extract token
+    if authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    else:
+        token = authorization
+
+    # Verify token without checking disabled status
+    from app.dependencies import _resolve_user_from_token
+    user = _resolve_user_from_token(token)
+
+    # Check account status
+    acc_doc = db.collection("accounts").document(user.account_id).get()
+    acc_data = acc_doc.to_dict() if acc_doc.exists else {}
+
+    user_doc = db.collection("users").document(user.uid).get()
+    user_data = user_doc.to_dict() if user_doc.exists else {}
+
+    # Determine status
+    acc_status = acc_data.get("status", "active")
+    user_status = user_data.get("status", "active")
+    security_state = user_data.get("securityState")
+
+    if acc_status == "disabled" or user_status == "disabled" or security_state == "banned":
+        disabled_at = acc_data.get("disabledAt") or user_data.get("disabledAt")
+        reason = acc_data.get("disabledReason") or user_data.get("disabledReason") or user_data.get("securityNote")
+
+        return AccountStatusResponse(
+            uid=user.uid,
+            accountId=user.account_id,
+            status="disabled",
+            message="このアカウントは利用停止中です。",
+            disabledAt=disabled_at.isoformat() if disabled_at else None,
+            reason=reason
+        )
+
+    return AccountStatusResponse(
+        uid=user.uid,
+        accountId=user.account_id,
+        status="active",
+        message=None,
+        disabledAt=None,
+        reason=None
+    )
 
 
 @router.get("/me/capabilities", response_model=CapabilitiesResponse)
@@ -1177,27 +1849,16 @@ async def get_my_capabilities(current_user: CurrentUser = Depends(get_current_us
     プランに応じた機能フラグ・制限情報を返す。
     クライアントはこれを信じてUIを制御する。
     """
-    # Get consolidated usage report
-    report = await cost_guard.get_usage_report(current_user.uid)
+    # [FIX] Use account_id instead of uid - cost_guard.get_usage_report() uses mode="account" by default
+    # which looks up accounts/{id}, so we need to pass the actual account_id, not uid
+    report = await cost_guard.get_usage_report(current_user.account_id, mode="account")
     plan = report.get("plan", "free")
     
     limit_min = int(report.get("limitSeconds", 0) / 60)
     used_recording_min = int(report.get("usedSeconds", 0) / 60)
         
     # Plan Definitions (Backend Source of Truth)
-    if plan == "premium":
-        caps = CapabilitiesResponse(
-            plan="pro", # iOS compat: premium is "pro" in UI mapping
-            canRealtimeTranslate=True,
-            sttPostEngine="whisper_large_v3",
-            monthlyRecordingLimitMin=limit_min,
-            remainingRecordingMin=max(0, limit_min - used_recording_min),
-            canRegenerateTranscript=True,
-            maxSessions=PREMIUM_LIMITS["server_session"],
-            maxSummaries=PREMIUM_LIMITS["llm_calls"],
-            maxQuizzes=PREMIUM_LIMITS["llm_calls"]
-        )
-    elif plan == "basic":
+    if plan == "basic":
         caps = CapabilitiesResponse(
             plan="basic",
             canRealtimeTranslate=False,
@@ -1238,22 +1899,32 @@ async def get_my_usage_alias(
 ):
     """
     iOS互換エイリアス: /users/me/usage → /usage/me/summary
+    [FIX] Now merges with CostGuard data for accurate counts
     """
     from datetime import date, timedelta
     from app.services.usage import usage_logger
+    from app.services.cost_guard import cost_guard
     from app.usage_models import UsageSummaryResponse
-    
+
     if not to_date:
         to_date = date.today().isoformat()
     if not from_date:
         from_date = (date.today() - timedelta(days=30)).isoformat()
-    
+
     summary = await usage_logger.get_user_usage_summary(
         user_id=current_user.uid,
         from_date=from_date,
         to_date=to_date
     )
-    
+
+    # [FIX] Merge with CostGuard data for accurate cloud recording and AI feature counts
+    report = await cost_guard.get_usage_report(current_user.account_id, mode="account")
+
+    summary["summary_invocations"] = max(summary.get("summary_invocations", 0), report.get("summaryGenerated", 0))
+    summary["quiz_invocations"] = max(summary.get("quiz_invocations", 0), report.get("quizGenerated", 0))
+    summary["total_recording_cloud_sec"] = max(summary.get("total_recording_cloud_sec", 0.0), report.get("usedSeconds", 0.0))
+    summary["total_recording_sec"] = summary.get("total_recording_ondevice_sec", 0.0) + summary["total_recording_cloud_sec"]
+
     return UsageSummaryResponse(**summary)
 
 
@@ -1398,11 +2069,21 @@ async def create_or_refresh_share_code(current_user: CurrentUser = Depends(get_c
     raise HTTPException(status_code=500, detail="Failed to generate unique share code")
 
 
-@router.post("/share_lookup", response_model=ShareLookupResponse)
+@router.post("/share_lookup", response_model=ShareLookupResponse, deprecated=True)
 async def share_lookup(body: ShareLookupRequest):
+    """
+    [DEPRECATED] Use GET /share-code/{code} instead.
+
+    Look up a user by their share code.
+    """
+    from fastapi.responses import JSONResponse
+
     code = (body.code or "").strip()
     if not code:
-        return ShareLookupResponse(found=False)
+        return JSONResponse(
+            content={"found": False},
+            headers={"Deprecation": "true", "Link": "</share-code/{code}>; rel=\"successor-version\""}
+        )
 
     qs = (
         db.collection("users")
@@ -1413,22 +2094,38 @@ async def share_lookup(body: ShareLookupRequest):
     )
     docs = list(qs)
     if not docs:
-        return ShareLookupResponse(found=False)
+        return JSONResponse(
+            content={"found": False},
+            headers={"Deprecation": "true", "Link": "</share-code/{code}>; rel=\"successor-version\""}
+        )
 
     doc = docs[0]
     data = doc.to_dict() or {}
     if data.get("isShareable", data.get("allowSearch", True)) is False:
-        return ShareLookupResponse(found=False)
+        return JSONResponse(
+            content={"found": False},
+            headers={"Deprecation": "true", "Link": "</share-code/{code}>; rel=\"successor-version\""}
+        )
 
-    return ShareLookupResponse(
-        found=True,
-        targetUserId=doc.id,
-        displayName=data.get("displayName"),
+    return JSONResponse(
+        content={
+            "found": True,
+            "targetUserId": doc.id,
+            "displayName": data.get("displayName"),
+        },
+        headers={"Deprecation": "true", "Link": "</share-code/{code}>; rel=\"successor-version\""}
     )
 
 
-@router.get("/search_by_share_code", response_model=ShareLookupResponse)
+@router.get("/search_by_share_code", response_model=ShareLookupResponse, deprecated=True)
 async def search_by_share_code(code: str, current_user: CurrentUser = Depends(get_current_user)):
+    """
+    [DEPRECATED] Use GET /share-code/{code} instead.
+
+    Look up a user by their share code.
+    """
+    from fastapi.responses import JSONResponse
+
     code = (code or "").strip()
     if len(code) != 6:
         raise HTTPException(status_code=400, detail="share code must be 6 characters")
@@ -1449,18 +2146,28 @@ async def search_by_share_code(code: str, current_user: CurrentUser = Depends(ge
     if data.get("isShareable", data.get("allowSearch", True)) is False:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return ShareLookupResponse(
-        found=True,
-        targetUserId=doc.id,
-        displayName=data.get("displayName"),
+    return JSONResponse(
+        content={
+            "found": True,
+            "targetUserId": doc.id,
+            "displayName": data.get("displayName"),
+        },
+        headers={"Deprecation": "true", "Link": "</share-code/{code}>; rel=\"successor-version\""}
     )
 
 
-@router.delete("/me", status_code=204)
+@router.delete("/me", status_code=204, deprecated=True)
 async def delete_me(current_user: CurrentUser = Depends(get_current_user)):
     """
-    [ASYNC] Request account deletion.
-    Records a deletion request and schedules hard delete after a grace period.
+    [DEPRECATED] Use POST /users/me:delete + GET /users/me:delete/status instead.
+
+    This endpoint schedules account deletion with a 30-day grace period.
+    The recommended flow is:
+    1. POST /users/me:delete - Request deletion (returns jobId)
+    2. GET /users/me:delete/status - Poll until state="done"
+
+    This DELETE endpoint is kept for backward compatibility but may be
+    removed in a future version.
     """
     try:
         now = datetime.now(timezone.utc)
@@ -1587,63 +2294,260 @@ async def post_consent(
 # Account Deletion (Apple App Store Compliance)
 # ============================================================
 
+class ActiveSubscriptionInfo(BaseModel):
+    """Information about an active subscription that will NOT be cancelled."""
+    provider: str  # "apple" | "google" | "stripe"
+    productId: Optional[str] = None
+    plan: Optional[str] = None
+    expiresAt: Optional[datetime] = None
+    cancellationUrl: Optional[str] = None  # Deep link to settings
+
+
+class DeletePreflightResponse(BaseModel):
+    """Pre-deletion check response."""
+    ok: bool
+    canDelete: bool = True
+    hasActiveSubscription: bool = False
+    activeSubscriptions: List[ActiveSubscriptionInfo] = []
+    warnings: List[str] = []
+    instructions: Optional[str] = None
+
+
 class DeleteRequestResponse(BaseModel):
     ok: bool
-    state: str  # "none" | "queued" | "running" | "done" | "failed"
+    state: str  # "none" | "queued" | "running" | "done" | "failed" | "blocked"
     jobId: Optional[str] = None
     error: Optional[str] = None
+    # [NEW] Subscription warnings
+    hasActiveSubscription: bool = False
+    subscriptionWarning: Optional[str] = None
+
+
+class DeleteRequest(BaseModel):
+    """Request body for account deletion."""
+    acknowledgeActiveSubscription: bool = False  # Must be true if user has active subscription
+
+
+def _check_active_subscriptions(uid: str, account_id: Optional[str] = None) -> List[ActiveSubscriptionInfo]:
+    """
+    Check if user has any active (paid) subscriptions.
+    Returns list of active subscriptions that will NOT be automatically cancelled.
+    """
+    active_subs: List[ActiveSubscriptionInfo] = []
+    now = datetime.now(timezone.utc)
+
+    # 1. Check entitlements collection (primary source of truth)
+    try:
+        # By user ID
+        ent_query = db.collection("entitlements").where("ownerUserId", "==", uid).where("status", "==", "active")
+        for edoc in ent_query.stream():
+            ent_data = edoc.to_dict()
+            expires_at = ent_data.get("currentPeriodEnd")
+            # Only include if not expired
+            if expires_at and expires_at > now:
+                provider = ent_data.get("provider", "unknown")
+                active_subs.append(ActiveSubscriptionInfo(
+                    provider=provider,
+                    productId=ent_data.get("productId"),
+                    plan=ent_data.get("plan"),
+                    expiresAt=expires_at,
+                    cancellationUrl="https://apps.apple.com/account/subscriptions" if provider == "apple" else None
+                ))
+
+        # By account ID (if different entitlements)
+        if account_id:
+            ent_query2 = db.collection("entitlements").where("ownerAccountId", "==", account_id).where("status", "==", "active")
+            for edoc in ent_query2.stream():
+                ent_data = edoc.to_dict()
+                # Skip if already added (by userId)
+                if ent_data.get("ownerUserId") == uid:
+                    continue
+                expires_at = ent_data.get("currentPeriodEnd")
+                if expires_at and expires_at > now:
+                    provider = ent_data.get("provider", "unknown")
+                    active_subs.append(ActiveSubscriptionInfo(
+                        provider=provider,
+                        productId=ent_data.get("productId"),
+                        plan=ent_data.get("plan"),
+                        expiresAt=expires_at,
+                        cancellationUrl="https://apps.apple.com/account/subscriptions" if provider == "apple" else None
+                    ))
+    except Exception as e:
+        logger.warning(f"[DeletePreflight] Failed to check entitlements: {e}")
+
+    # 2. Check user profile for appleEntitlementId (backup check)
+    try:
+        user_doc = db.collection("users").document(uid).get()
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            apple_ent_id = user_data.get("appleEntitlementId")
+            if apple_ent_id and not any(s.provider == "apple" for s in active_subs):
+                # Has Apple entitlement ID but not found in entitlements - check directly
+                ent_doc = db.collection("entitlements").document(apple_ent_id).get()
+                if ent_doc.exists:
+                    ent_data = ent_doc.to_dict()
+                    if ent_data.get("status") == "active":
+                        expires_at = ent_data.get("currentPeriodEnd")
+                        if expires_at and expires_at > now:
+                            active_subs.append(ActiveSubscriptionInfo(
+                                provider="apple",
+                                productId=ent_data.get("productId"),
+                                plan=ent_data.get("plan"),
+                                expiresAt=expires_at,
+                                cancellationUrl="https://apps.apple.com/account/subscriptions"
+                            ))
+    except Exception as e:
+        logger.warning(f"[DeletePreflight] Failed to check user profile: {e}")
+
+    return active_subs
+
+
+@router.get("/me:delete/preflight", response_model=DeletePreflightResponse)
+async def preflight_account_deletion(current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Pre-flight check before account deletion.
+    Returns information about active subscriptions and warnings.
+
+    iOS client should call this BEFORE showing the delete confirmation dialog
+    to warn users about subscriptions that won't be cancelled.
+    """
+    uid = current_user.uid
+
+    # Get account ID
+    account_id = None
+    try:
+        link_doc = db.collection("uid_links").document(uid).get()
+        if link_doc.exists:
+            account_id = link_doc.to_dict().get("accountId")
+    except Exception:
+        pass
+
+    # Check for active subscriptions
+    active_subs = _check_active_subscriptions(uid, account_id)
+    has_active = len(active_subs) > 0
+
+    warnings = []
+    instructions = None
+
+    if has_active:
+        warnings.append("アカウントを削除しても、App Store のサブスクリプションは自動的にキャンセルされません。")
+        warnings.append("削除前に、設定アプリからサブスクリプションをキャンセルしてください。")
+        instructions = (
+            "サブスクリプションのキャンセル方法:\n"
+            "1. 設定アプリを開く\n"
+            "2. [あなたの名前] > サブスクリプション をタップ\n"
+            "3. ClassNote を選択\n"
+            "4. [サブスクリプションをキャンセル] をタップ"
+        )
+
+    return DeletePreflightResponse(
+        ok=True,
+        canDelete=True,  # Always allow deletion, but with warnings
+        hasActiveSubscription=has_active,
+        activeSubscriptions=active_subs,
+        warnings=warnings,
+        instructions=instructions
+    )
 
 
 @router.post("/me:delete", response_model=DeleteRequestResponse)
-async def request_account_deletion(current_user: CurrentUser = Depends(get_current_user)):
+async def request_account_deletion(
+    req: Optional[DeleteRequest] = None,
+    current_user: CurrentUser = Depends(get_current_user)
+):
     """
     Initiates account deletion (async).
     The actual deletion is performed by a Cloud Tasks worker.
     Client should poll GET /me:delete/status until state == "done".
+
+    If user has active subscriptions:
+    - Response includes hasActiveSubscription=True and subscriptionWarning
+    - Client must re-call with acknowledgeActiveSubscription=True to proceed
     """
     from app.task_queue import enqueue_nuke_user_task
-    
+
     uid = current_user.uid
     user_ref = db.collection("users").document(uid)
-    
+
     # 1. Check existing deletion state (idempotency)
     user_snap = user_ref.get()
     if not user_snap.exists:
         # User doc already deleted
         return DeleteRequestResponse(ok=True, state="done")
-    
+
     user_data = user_snap.to_dict()
     deletion = user_data.get("deletion", {})
     state = deletion.get("state", "none")
-    
+
     if state in ("queued", "running"):
         # Already in progress
         return DeleteRequestResponse(ok=True, state=state, jobId=deletion.get("jobId"))
-    
+
     if state == "done":
         return DeleteRequestResponse(ok=True, state="done")
-    
-    # 2. Create deletion job
+
+    # 2. [NEW] Check for active subscriptions
+    account_id = user_data.get("accountId")
+    if not account_id:
+        try:
+            link_doc = db.collection("uid_links").document(uid).get()
+            if link_doc.exists:
+                account_id = link_doc.to_dict().get("accountId")
+        except Exception:
+            pass
+
+    active_subs = _check_active_subscriptions(uid, account_id)
+    has_active_subscription = len(active_subs) > 0
+
+    # If has active subscription and not acknowledged, block deletion
+    acknowledge = req.acknowledgeActiveSubscription if req else False
+    if has_active_subscription and not acknowledge:
+        logger.info(f"[AccountDeletion] Blocked deletion for {uid} - has active subscription, not acknowledged")
+        return DeleteRequestResponse(
+            ok=False,
+            state="blocked",
+            hasActiveSubscription=True,
+            subscriptionWarning=(
+                "アクティブなサブスクリプションがあります。"
+                "アカウントを削除しても、App Store からの課金は自動的に停止されません。"
+                "続行するには acknowledgeActiveSubscription: true を指定してください。"
+            )
+        )
+
+    # 3. Create deletion job
     now = datetime.now(timezone.utc)
     job_id = f"del_{uid}_{int(now.timestamp())}"
-    
-    user_ref.set({
-        "deletion": {
-            "state": "queued",
-            "requestedAt": now,
-            "jobId": job_id
-        }
-    }, merge=True)
-    
-    # 3. Enqueue to Cloud Tasks
+
+    # Record subscription acknowledgment for audit
+    deletion_data = {
+        "state": "queued",
+        "requestedAt": now,
+        "jobId": job_id
+    }
+    if has_active_subscription:
+        deletion_data["hadActiveSubscription"] = True
+        deletion_data["acknowledgedAt"] = now
+        deletion_data["activeSubscriptionProducts"] = [s.productId for s in active_subs if s.productId]
+
+    user_ref.set({"deletion": deletion_data}, merge=True)
+
+    # 4. Enqueue to Cloud Tasks
     try:
         enqueue_nuke_user_task(uid)
-        logger.info(f"Account deletion queued for {uid}, jobId={job_id}")
+        logger.info(f"Account deletion queued for {uid}, jobId={job_id}, hadActiveSub={has_active_subscription}")
     except Exception as e:
         logger.error(f"Failed to enqueue deletion task for {uid}: {e}")
         # Keep state as "queued" - worker can retry via cron or manual trigger
-    
-    return DeleteRequestResponse(ok=True, state="queued", jobId=job_id)
+
+    response = DeleteRequestResponse(ok=True, state="queued", jobId=job_id)
+    if has_active_subscription:
+        response.hasActiveSubscription = True
+        response.subscriptionWarning = (
+            "アカウント削除を開始しました。"
+            "App Store のサブスクリプションは自動的にキャンセルされません。"
+            "設定アプリからサブスクリプションをキャンセルしてください。"
+        )
+    return response
 
 
 @router.get("/me:delete/status", response_model=DeleteRequestResponse)
@@ -1655,15 +2559,134 @@ async def get_deletion_status(current_user: CurrentUser = Depends(get_current_us
     uid = current_user.uid
     user_ref = db.collection("users").document(uid)
     snap = user_ref.get()
-    
+
     if not snap.exists:
         # User doc already deleted = done
         return DeleteRequestResponse(ok=True, state="done")
-    
+
     deletion = snap.to_dict().get("deletion", {})
     return DeleteRequestResponse(
         ok=True,
         state=deletion.get("state", "none"),
         jobId=deletion.get("jobId"),
         error=deletion.get("error")
+    )
+
+
+# ---------- Phone Link (Alias for /phone/link) ---------- #
+
+class PhoneLinkRequest(BaseModel):
+    phoneE164: Optional[str] = None
+
+
+class PhoneLinkResponse(BaseModel):
+    ok: bool
+    accountId: str
+    message: str
+
+
+def _get_account_id_for_uid(uid: str) -> Optional[str]:
+    """Helper to get account ID from uid_links or users collection."""
+    link_doc = db.collection("uid_links").document(uid).get()
+    if link_doc.exists:
+        return link_doc.to_dict().get("accountId")
+    user_doc = db.collection("users").document(uid).get()
+    if user_doc.exists:
+        return user_doc.to_dict().get("accountId")
+    return None
+
+
+@router.post("/me/phone:link", response_model=PhoneLinkResponse)
+async def link_phone_to_account(
+    req: PhoneLinkRequest = None,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Link the current user's verified phone number to an account.
+
+    The phone number is taken from the Firebase ID token (must be verified).
+    This endpoint creates or links to an account based on the phone number.
+    """
+    uid = current_user.uid
+    token_phone = current_user.phone_number
+
+    if not token_phone:
+        raise HTTPException(400, "Your session does not have a verified phone number")
+
+    # If phoneE164 provided, validate it matches token
+    if req and req.phoneE164 and req.phoneE164.strip() != token_phone:
+        raise HTTPException(403, "Phone number does not match your session")
+
+    phone = token_phone
+    now = datetime.now(timezone.utc)
+    current_account_id = _get_account_id_for_uid(uid)
+
+    @firestore.transactional
+    def link_and_merge(transaction):
+        phone_ref = db.collection("phone_numbers").document(phone)
+        phone_doc = phone_ref.get(transaction=transaction)
+
+        target_account_id = current_account_id
+
+        if not phone_doc.exists:
+            # New phone - create account if needed
+            if not target_account_id:
+                new_acc_ref = db.collection("accounts").document()
+                target_account_id = new_acc_ref.id
+                transaction.set(new_acc_ref, {
+                    "phoneE164": phone,
+                    "phoneVerified": True,
+                    "primaryUid": uid,
+                    "memberUids": [uid],
+                    "plan": "free",
+                    "createdAt": now,
+                    "updatedAt": now
+                })
+                transaction.set(db.collection("uid_links").document(uid), {
+                    "uid": uid,
+                    "accountId": target_account_id,
+                    "linkedAt": now
+                })
+
+            transaction.set(phone_ref, {
+                "accountId": target_account_id,
+                "verified": True,
+                "standardOwnerUid": uid,
+                "createdAt": now,
+                "updatedAt": now
+            })
+        else:
+            phone_data = phone_doc.to_dict()
+            target_account_id = phone_data.get("accountId")
+
+            # Update uid_links to point to phone's account
+            transaction.set(db.collection("uid_links").document(uid), {
+                "uid": uid,
+                "accountId": target_account_id,
+                "linkedAt": now,
+                "mergedFrom": current_account_id if current_account_id != target_account_id else None,
+                "mergeReason": "phone_link"
+            }, merge=True)
+
+        # Update user
+        transaction.set(db.collection("users").document(uid), {
+            "phoneE164": phone,
+            "phoneVerified": True,
+            "accountId": target_account_id,
+            "updatedAt": now
+        }, merge=True)
+
+        return target_account_id
+
+    try:
+        transaction = db.transaction()
+        final_account_id = link_and_merge(transaction)
+    except Exception as e:
+        logger.error(f"[users/me/phone:link] Failed: {e}")
+        raise HTTPException(500, f"Failed to link phone: {str(e)}")
+
+    return PhoneLinkResponse(
+        ok=True,
+        accountId=final_account_id,
+        message="Phone linked successfully"
     )

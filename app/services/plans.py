@@ -6,25 +6,18 @@ PRODUCT_TO_PLAN = {
     # --- Apple ---
     "cnx.standard.monthly": "basic",
     "cnx.standard.yearly": "basic",
-    "cnx.premium.monthly": "premium",
-    "cnx.premium.yearly": "premium",
-    
+
     # Legacy/Previous IDs if any
     "com.classnote.app.standard.monthly": "basic",
     "com.classnote.app.standard.yearly": "basic",
-    "com.classnote.app.premium.monthly": "premium",
-    "com.classnote.app.premium.yearly": "premium",
 
     # --- Stripe (Future) ---
     "price_basic_monthly": "basic",
-    "price_premium_monthly": "premium",
 }
 
 PLAN_RANK = {
-    "free": 0, 
-    "basic": 1, 
-    "premium": 2, 
-    "pro": 2  # Alias for premium
+    "free": 0,
+    "basic": 1,
 }
 
 def plan_from_product_id(product_id: str | None) -> str:
@@ -34,8 +27,6 @@ def plan_from_product_id(product_id: str | None) -> str:
     if not plan:
         # Fallback heuristic if specific ID not found but follows pattern
         lowered = product_id.lower()
-        if "premium" in lowered or "pro" in lowered:
-            return "premium"
         if "standard" in lowered or "basic" in lowered:
             return "basic"
         return "free"

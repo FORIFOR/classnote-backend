@@ -55,6 +55,9 @@ class EventType(str, Enum):
     PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
     ABUSE_DETECTED = "ABUSE_DETECTED"
 
+    # 管理者アクション
+    ADMIN_ACTION = "ADMIN_ACTION"
+
 
 class ErrorCode(str, Enum):
     # 500系

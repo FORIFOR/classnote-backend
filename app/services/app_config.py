@@ -24,6 +24,7 @@ logger = logging.getLogger("app.config")
 class MaintenanceInfo(BaseModel):
     """Maintenance mode configuration"""
     enabled: bool = False
+    mode: Optional[str] = None  # None | "full" | "drain" - drain allows reads but blocks new cloud operations
     title: Optional[str] = None
     message: Optional[str] = None
     message_ja: Optional[str] = None
@@ -276,4 +277,74 @@ def get_maintenance_error_response(feature: str = None) -> dict:
         "error": "SERVICE_UNAVAILABLE",
         "code": "SERVICE_UNAVAILABLE",
         "message": "サービスは現在利用できません",
+    }
+
+
+# ============================================================================
+# Drain Mode (for safe deployments)
+# ============================================================================
+
+def is_drain_mode() -> bool:
+    """
+    Check if drain mode is active.
+    Drain mode blocks new cloud operations (STT, summary, quiz, upload)
+    but allows existing operations to complete and read-only operations.
+    """
+    try:
+        config = get_app_config()
+        return (
+            config.maintenance.enabled and
+            config.maintenance.mode == "drain"
+        )
+    except Exception as e:
+        logger.error(f"[AppConfig] Error checking drain mode: {e}")
+        return False
+
+
+def set_drain_mode(enabled: bool, message: Optional[str] = None) -> AppConfigResponse:
+    """
+    Enable or disable drain mode for safe deployment.
+
+    When enabled:
+    - New cloud operations are blocked (STT start, summary start, etc.)
+    - Existing operations can complete
+    - Read-only operations are allowed
+    - Returns 503 with Retry-After for blocked operations
+
+    When disabled:
+    - Normal operation resumes
+    """
+    if enabled:
+        maintenance = MaintenanceInfo(
+            enabled=True,
+            mode="drain",
+            title="デプロイ準備中",
+            message=message or "新しいクラウド処理を一時停止しています。既存の処理は継続されます。",
+            message_ja="新しいクラウド処理を一時停止しています。既存の処理は継続されます。",
+            message_en="New cloud operations are paused. Existing operations will continue.",
+            allowLimitedMode=True,  # Allow reads and existing jobs
+        )
+    else:
+        maintenance = MaintenanceInfo(
+            enabled=False,
+            mode=None,
+            allowLimitedMode=True,
+        )
+
+    result = update_app_config(AppConfigUpdate(maintenance=maintenance))
+    logger.info(f"[AppConfig] Drain mode {'enabled' if enabled else 'disabled'}")
+    return result
+
+
+def get_drain_error_response() -> dict:
+    """
+    Get standardized error response for drain mode.
+    Includes Retry-After hint for clients.
+    """
+    return {
+        "error": "DRAIN_MODE",
+        "code": "DRAIN_MODE",
+        "message": "デプロイ準備中のため、新しいクラウド処理を開始できません。しばらくお待ちください。",
+        "message_en": "New cloud operations are temporarily paused for deployment. Please try again shortly.",
+        "retryAfter": 60,  # Suggest retry in 60 seconds
     }

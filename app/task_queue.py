@@ -11,6 +11,7 @@ from app.firebase import db
 from app.services import llm
 from app.services.usage import usage_logger
 from app.services.transcripts import resolve_transcript_text
+from app.services.playlist_utils import normalize_playlist_items
 
 def enqueue_cleanup_sessions_task(user_id: str, background_tasks: BackgroundTasks = None):
     """
@@ -243,6 +244,121 @@ def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: s
     tasks_client.create_task(parent=parent, task=task)
     logger.info(f"Enqueued playlist task for session {session_id}")
 
+
+def enqueue_summary_v2_task(
+    session_id: str,
+    user_id: str | None = None,
+    job_id: str | None = None,
+    meeting_purpose: str | None = None,
+    meeting_type: str | None = None,
+    participants: list | None = None,
+):
+    """
+    SummaryV2（根拠付き構造化サマリー）生成タスクをキューに入れる。
+    """
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "userId": user_id,
+        "meetingPurpose": meeting_purpose,
+        "meetingType": meeting_type,
+        "participants": participants or [],
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running summary_v2 task locally for session: {session_id}")
+        asyncio.create_task(_run_local_summary_v2(session_id, job_id=job_id, **payload))
+        return job_id
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/summary_v2"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 600},  # 10 mins
+    }
+
+    tasks_client.create_task(parent=parent, task=task)
+    logger.info(f"Enqueued summary_v2 task for session {session_id}")
+    return job_id
+
+
+async def _run_local_summary_v2(
+    session_id: str,
+    job_id: str | None = None,
+    meeting_purpose: str | None = None,
+    meeting_type: str | None = None,
+    participants: list | None = None,
+    **kwargs,
+):
+    """Local fallback for SummaryV2 generation."""
+    from app.services.summary_v2 import generate_summary_v2
+    from datetime import datetime, timezone
+
+    doc_ref = db.collection("sessions").document(session_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        logger.error(f"[local summary_v2] Session {session_id} not found")
+        return
+
+    data = doc.to_dict()
+    transcript = resolve_transcript_text(session_id, data)
+    if not transcript:
+        logger.error(f"[local summary_v2] No transcript for {session_id}")
+        return
+
+    derived_ref = doc_ref.collection("derived").document("summary_v2")
+
+    try:
+        # Mark as running
+        derived_ref.set({
+            "status": "running",
+            "jobId": job_id,
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+
+        # Generate
+        summary = await generate_summary_v2(
+            session_id=session_id,
+            transcript_text=transcript,
+            diarized_segments=data.get("diarizedSegments"),
+            user_marks=data.get("userMarks"),
+            meeting_purpose=meeting_purpose or data.get("meetingPurpose"),
+            meeting_type=meeting_type or data.get("mode"),
+            participants=participants or data.get("participants", []),
+        )
+
+        # Save result
+        derived_ref.set({
+            "status": "succeeded",
+            "result": summary.dict(),
+            "jobId": job_id,
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+
+        doc_ref.update({
+            "summaryV2Status": "completed",
+            "summaryV2Markdown": summary.renderedMarkdown,
+            "updatedAt": datetime.now(timezone.utc),
+        })
+
+        logger.info(f"[local summary_v2] Generated for {session_id}")
+
+    except Exception as e:
+        logger.exception(f"[local summary_v2] Failed for {session_id}: {e}")
+        derived_ref.set({
+            "status": "failed",
+            "errorReason": str(e)[:500],
+            "jobId": job_id,
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+
+
 # ---------- Local fallback workers ---------- #
 
 def _update_root_job_status(
@@ -375,22 +491,43 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             event_type="success"
         )
     except Exception as e:
+        error_str = str(e)
+
+        # Handle "session deleted during job" gracefully
+        if "No document to update" in error_str or "NOT_FOUND" in error_str:
+            logger.info(f"[local summarize] Session {session_id} was deleted during job execution, marking as cancelled")
+            _update_root_job_status(job_id, "cancelled", stage="cancelled", error_reason="Session deleted during processing")
+            return
+
         logger.exception(f"[local summarize] failed: {e}")
-        doc_ref.update({
-            "summaryStatus": "failed",
-            "summaryError": str(e),
-            "summaryUpdatedAt": datetime.utcnow(),
-            "status": "録音済み",
-        })
-        _update_root_job_status(job_id, "failed", stage="failed", error_reason=str(e))
-        # Log error
-        await usage_logger.log(
-            user_id=data.get("userId", "unknown"),
-            session_id=session_id,
-            feature="summary",
-            event_type="error",
-            payload={"error_code": type(e).__name__}
-        )
+
+        # Try to update session status, but ignore if session was deleted
+        try:
+            doc_ref.update({
+                "summaryStatus": "failed",
+                "summaryError": error_str,
+                "summaryUpdatedAt": datetime.utcnow(),
+                "status": "録音済み",
+            })
+        except Exception as update_error:
+            if "No document to update" in str(update_error):
+                logger.info(f"[local summarize] Session {session_id} was deleted, skipping error status update")
+            else:
+                logger.warning(f"[local summarize] Failed to update error status: {update_error}")
+
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason=error_str)
+
+        # Log error (use session_id as user_id fallback if data not available)
+        try:
+            await usage_logger.log(
+                user_id=data.get("userId", "unknown") if 'data' in dir() else "unknown",
+                session_id=session_id,
+                feature="summary",
+                event_type="error",
+                payload={"error_code": type(e).__name__}
+            )
+        except Exception:
+            pass  # Don't fail on logging error
 
 
 async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None):
@@ -447,13 +584,31 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
         result_url = f"/sessions/{session_id}/artifacts/quiz"
         _update_root_job_status(job_id, "succeeded", stage="completed", progress=1.0, result_url=result_url)
     except Exception as e:
+        error_str = str(e)
+
+        # Handle "session deleted during job" gracefully
+        if "No document to update" in error_str or "NOT_FOUND" in error_str:
+            logger.info(f"[local quiz] Session {session_id} was deleted during job execution, marking as cancelled")
+            _update_root_job_status(job_id, "cancelled", stage="cancelled", error_reason="Session deleted during processing")
+            return
+
         logger.exception(f"[local quiz] failed: {e}")
-        doc_ref.update({
-            "quizStatus": "failed",
-            "quizError": str(e),
-            "quizUpdatedAt": datetime.utcnow(),
-        })
-        _update_root_job_status(job_id, "failed", stage="failed", error_reason=str(e))
+
+        # Try to update session status, but ignore if session was deleted
+        try:
+            doc_ref.update({
+                "quizStatus": "failed",
+                "quizError": error_str,
+                "quizUpdatedAt": datetime.utcnow(),
+            })
+        except Exception as update_error:
+            if "No document to update" in str(update_error):
+                logger.info(f"[local quiz] Session {session_id} was deleted, skipping error status update")
+            else:
+                logger.warning(f"[local quiz] Failed to update error status: {update_error}")
+
+        _update_root_job_status(job_id, "failed", stage="failed", error_reason=error_str)
+
 
 async def _run_local_playlist(session_id: str, job_id: str | None = None):
     doc_ref = db.collection("sessions").document(session_id)
@@ -478,12 +633,15 @@ async def _run_local_playlist(session_id: str, job_id: str | None = None):
         segments = data.get("diarizedSegments")
         duration = data.get("durationSec")
         playlist_json_str = await llm.generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
-        
+
         try:
-            items = json.loads(playlist_json_str)
+            raw_items = json.loads(playlist_json_str)
         except:
-            items = []
-            
+            raw_items = []
+
+        # [NEW] Normalize: ms/sec detection, duration clamp, validation
+        items = normalize_playlist_items(raw_items, segments=segments, duration_sec=duration)
+
         # Update result (Legacy playlist field + New Artifact)
         ts = datetime.utcnow()
         doc_ref.update({

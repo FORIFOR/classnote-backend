@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, ConfigDict
 from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 
@@ -842,7 +842,14 @@ class SessionResponse(BaseModel):
     endedAt: Optional[datetime] = None
     durationSec: Optional[float] = None
     hasTranscript: bool = False # Helper for client efficiency
-    
+
+    # [NEW] Audio metadata for iOS download sync (no extra API call needed)
+    hasAudio: bool = False
+    audioSizeBytes: Optional[int] = None
+    audioSha256: Optional[str] = None
+    audioUpdatedAt: Optional[datetime] = None
+    audioContentType: Optional[str] = None
+
     # [Security] Cloud Ticket System
     cloudTicket: Optional[str] = None
     cloudAllowedUntil: Optional[datetime] = None
@@ -903,6 +910,7 @@ class ReactionsSummary(BaseModel):
 
 class SessionDetailResponse(SessionResponse):
     transcriptText: Optional[str] = None
+    transcriptTextLen: int = 0  # [FIX] Full transcript length (transcriptText may be truncated to 500 chars)
     transcriptChunkCount: int = 0  # [NEW] For sync status / chunked loading
     notes: Optional[str] = None
     assets: Optional[AssetResolveResponse] = None # For full asset paths
@@ -974,6 +982,12 @@ class SignedCompressedAudioResponse(BaseModel):
     audioUrl: str
     expiresAt: datetime
     compressionMetadata: Optional[AudioMeta] = None
+    # [NEW] Top-level metadata for iOS download sync
+    sizeBytes: Optional[int] = None       # File size for pre-download validation
+    sha256: Optional[str] = None          # Content hash for integrity verification
+    durationSec: Optional[float] = None   # Audio duration (canonical source for playlist)
+    contentType: Optional[str] = None     # MIME type (audio/mp4, audio/ogg, etc.)
+    updatedAt: Optional[datetime] = None  # Last modification time for staleness check
 
 
 
@@ -1018,6 +1032,10 @@ class PlaylistArtifactResponse(BaseModel):
     modelInfo: Optional[dict] = None
     idempotencyKey: Optional[str] = None
     version: Optional[int] = None
+    # [NEW] Audio duration for client-side verification and ratio correction
+    durationSec: Optional[float] = None
+    # [NEW] Timebase indicator (always "audio_seconds" for now)
+    timebase: str = "audio_seconds"
 
 # --- Playlist / Device Sync Models ---
 
@@ -1169,3 +1187,313 @@ class IosEntitlement(BaseModel):
     appAccountToken: Optional[str] = None
     createdAt: datetime
     updatedAt: datetime
+
+
+# --- SummaryV2 Models (Evidence-based Structured Summary) ---
+
+class EvidenceSupport(str, Enum):
+    """Support level for a summary item's evidence."""
+    FULL = "full"        # Clearly stated in transcript
+    PARTIAL = "partial"  # Implied or partially mentioned
+    NONE = "none"        # No evidence found (needs verification)
+
+
+class SummaryV2ItemType(str, Enum):
+    """Types of summary items."""
+    DECISION = "decision"
+    ACTION = "action"
+    OPEN_QUESTION = "open_question"
+    RISK = "risk"
+    NOTE = "note"
+
+
+class SummaryV2ItemStatus(str, Enum):
+    """Status for action items."""
+    TODO = "todo"
+    DOING = "doing"
+    DONE = "done"
+    UNKNOWN = "unknown"
+
+
+class EvidenceRef(BaseModel):
+    """Reference to transcript evidence for a summary item."""
+    startMs: int
+    endMs: int
+    segmentIds: List[str] = []
+    text: Optional[str] = None  # Excerpt from transcript
+
+
+class SummaryV2Item(BaseModel):
+    """A single item in the structured summary with evidence."""
+    id: str
+    type: SummaryV2ItemType
+    text: str
+    owner: Optional[str] = None       # Person responsible (for actions)
+    dueDate: Optional[str] = None     # Due date (for actions)
+    status: SummaryV2ItemStatus = SummaryV2ItemStatus.UNKNOWN
+    evidence: List[EvidenceRef] = []
+    support: EvidenceSupport = EvidenceSupport.NONE
+    confidence: float = 0.0           # 0.0 - 1.0
+
+
+class SummaryV2Quality(BaseModel):
+    """Quality metrics for the summary."""
+    unsupportedCount: int = 0
+    partialCount: int = 0
+    fullCount: int = 0
+    avgConfidence: float = 0.0
+
+
+class SummaryV2(BaseModel):
+    """Structured summary with evidence-based items."""
+    version: int = 1
+    generatedAt: Optional[datetime] = None
+    meetingPurpose: Optional[str] = None
+    meetingType: Optional[str] = None
+    participants: List[str] = []
+    items: List[SummaryV2Item] = []
+    renderedMarkdown: Optional[str] = None
+    quality: Optional[SummaryV2Quality] = None
+
+
+class SummaryV2Response(BaseModel):
+    """Response for GET /artifacts/summary_v2."""
+    status: str  # "ready", "running", "pending", "failed"
+    summary: Optional[SummaryV2] = None
+    jobId: Optional[str] = None
+    updatedAt: Optional[datetime] = None
+    errorReason: Optional[str] = None
+
+
+class SummaryV2GenerateRequest(BaseModel):
+    """Request for POST /artifacts/summary_v2:generate."""
+    meetingPurpose: Optional[str] = None
+    meetingType: Optional[str] = None
+    participants: List[str] = []
+    force: bool = False
+
+
+class SummaryV2FeedbackRequest(BaseModel):
+    """Request for POST /artifacts/summary_v2:feedback."""
+    itemId: str
+    action: Literal["accept", "edit", "reject"]
+    editedText: Optional[str] = None
+    correctedEvidence: Optional[List[EvidenceRef]] = None
+    comment: Optional[str] = None
+
+
+class SummaryV2FeedbackResponse(BaseModel):
+    """Response for feedback submission."""
+    ok: bool
+    itemId: str
+    action: str
+
+
+class UserMarkType(str, Enum):
+    """Types of user marks during recording."""
+    DECISION = "decision"
+    TODO = "todo"
+    IMPORTANT = "important"
+
+
+class UserMark(BaseModel):
+    """A mark placed by user during recording."""
+    id: str
+    type: UserMarkType
+    atMs: int
+    text: Optional[str] = None
+    createdAt: Optional[datetime] = None
+
+
+class TranscriptSegment(BaseModel):
+    """A segment of transcript with timing."""
+    id: str
+    startMs: int
+    endMs: int
+    speakerId: Optional[str] = None
+    text: str
+
+
+class TranscriptSegmentsResponse(BaseModel):
+    """Response for GET /transcript_segments."""
+    segments: List[TranscriptSegment]
+    totalCount: int
+    hasMore: bool = False
+
+
+# =============================================================================
+# TODO Feature Models
+# =============================================================================
+
+class TodoStatus(str, Enum):
+    """Status of a TODO item."""
+    OPEN = "open"
+    DONE = "done"
+    ARCHIVED = "archived"
+
+
+class TodoPriority(str, Enum):
+    """Priority level of a TODO item."""
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+class TodoCandidateStatus(str, Enum):
+    """Status of a TODO candidate."""
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class TodoSourceType(str, Enum):
+    """Source type of TODO extraction."""
+    MINUTES = "minutes"       # Extracted from summary/minutes
+    TRANSCRIPT = "transcript"  # Extracted from raw transcript
+    MANUAL = "manual"         # Created manually by user
+
+
+class TodoEvidence(BaseModel):
+    """Evidence linking TODO to source content."""
+    quote: Optional[str] = None     # Relevant quote from source
+    time_sec: Optional[float] = Field(default=None, serialization_alias="time_sec")  # Timestamp in audio
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoSource(BaseModel):
+    """Source information for a TODO item."""
+    session_id: str = Field(serialization_alias="session_id")
+    session_title: str = Field(serialization_alias="session_title")
+    created_from: TodoSourceType = Field(default=TodoSourceType.MINUTES, serialization_alias="created_from")
+    evidence: Optional[TodoEvidence] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoOrigin(BaseModel):
+    """Extraction origin metadata for a TODO item."""
+    extractor_version: str = Field(default="todo_v1", serialization_alias="extractor_version")
+    confidence: float = 0.5           # 0-1 confidence score
+    auto_created: bool = Field(default=False, serialization_alias="auto_created")
+    user_edited: bool = Field(default=False, serialization_alias="user_edited")
+    user_moved: bool = Field(default=False, serialization_alias="user_moved")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoDedupe(BaseModel):
+    """Deduplication metadata for a TODO item."""
+    semantic_key: Optional[str] = Field(default=None, serialization_alias="semantic_key")
+    rejected_by_user: bool = Field(default=False, serialization_alias="rejected_by_user")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# --- Request/Response Models ---
+
+class TodoCreateRequest(BaseModel):
+    """Request to create a new TODO manually."""
+    title: str
+    notes: Optional[str] = None
+    due_date: Optional[str] = Field(default=None, alias="dueDate")  # Accept camelCase from client
+    priority: TodoPriority = TodoPriority.NORMAL
+    session_id: Optional[str] = Field(default=None, alias="sessionId")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoUpdateRequest(BaseModel):
+    """Request to update a TODO item."""
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    due_date: Optional[str] = Field(default=None, alias="dueDate")
+    priority: Optional[TodoPriority] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoMoveRequest(BaseModel):
+    """Request to move a TODO to a different date."""
+    due_date: str = Field(alias="dueDate")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoResponse(BaseModel):
+    """Response model for a single TODO item."""
+    id: str
+    account_id: str = Field(serialization_alias="account_id")
+    title: str
+    notes: Optional[str] = None
+    due_date: Optional[str] = Field(default=None, serialization_alias="due_date")
+    status: TodoStatus = TodoStatus.OPEN
+    priority: TodoPriority = TodoPriority.NORMAL
+    source: Optional[TodoSource] = None
+    origin: Optional[TodoOrigin] = None
+    created_at: datetime = Field(serialization_alias="created_at")
+    updated_at: datetime = Field(serialization_alias="updated_at")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoListResponse(BaseModel):
+    """Response for listing TODOs."""
+    todos: List[TodoResponse]
+    total: int = Field(serialization_alias="total")  # iOS expects "total", not "total_count"
+    has_more: bool = Field(default=False, serialization_alias="has_more")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoCandidateResponse(BaseModel):
+    """Response model for a TODO candidate."""
+    id: str
+    account_id: str = Field(serialization_alias="account_id")
+    session_id: str = Field(serialization_alias="session_id")
+    session_title: str = Field(serialization_alias="session_title")
+    title: str
+    due_date_proposed: Optional[str] = Field(default=None, serialization_alias="due_date_proposed")
+    confidence: float
+    reason: Optional[str] = None
+    evidence: Optional[TodoEvidence] = None
+    status: TodoCandidateStatus = TodoCandidateStatus.PENDING
+    created_at: datetime = Field(serialization_alias="created_at")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoCandidateListResponse(BaseModel):
+    """Response for listing TODO candidates."""
+    candidates: List[TodoCandidateResponse]
+    total: int = Field(serialization_alias="total")  # iOS expects "total"
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoExtractRequest(BaseModel):
+    """Request to extract TODOs from a session."""
+    force: bool = False  # Force re-extraction even if already done
+
+
+class TodoExtractResponse(BaseModel):
+    """Response from TODO extraction."""
+    autoCreated: int      # Number of auto-confirmed TODOs
+    candidates: int       # Number of candidates for review
+    skipped: int = 0      # Number skipped (duplicates, rejected)
+    sessionId: str
+
+
+class TodoAcceptRequest(BaseModel):
+    """Request to accept a TODO candidate."""
+    due_date: Optional[str] = Field(default=None, alias="dueDate")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TodoStatsResponse(BaseModel):
+    """Response for TODO statistics."""
+    openCount: int
+    doneCount: int
+    overdueCount: int
+    candidateCount: int

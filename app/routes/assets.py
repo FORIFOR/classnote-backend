@@ -104,9 +104,9 @@ def _get_asset_item_from_derived(session_id: str, type_key: str, data: dict, der
         elif session_status == JobStatus.PENDING:
             status = AssetStatus.PENDING
     
-    # Return NOT_STARTED instead of None to prevent client from deleting local data
+    # Return PENDING instead of None to prevent client from deleting local data
     if status == AssetStatus.MISSING:
-        return AssetItem(status=AssetStatus.NOT_STARTED)
+        return AssetItem(status=AssetStatus.PENDING)
 
     # Determine Content Type (approximation for manifest)
     if type_key == "audio":
@@ -208,9 +208,9 @@ async def get_session_assets(session_id: str, current_user: CurrentUser = Depend
         # Recording or processing in progress
         manifest.transcript = AssetItem(status=AssetStatus.PROCESSING)
     else:
-        # No transcript yet - return NOT_STARTED instead of null
+        # No transcript yet - return PENDING instead of null
         # This prevents client from treating null as "server has no data, delete local"
-        manifest.transcript = AssetItem(status=AssetStatus.NOT_STARTED)
+        manifest.transcript = AssetItem(status=AssetStatus.PENDING)
     
     # 3. Summary
     manifest.summary = _get_asset_item_from_derived(session_id, "summary", data, derived_map)
@@ -363,13 +363,13 @@ async def ensure_asset_generation(
     if current_status in (AssetStatus.READY, AssetStatus.PROCESSING):
         return {"status": "skipped", "current": current_status}
         
-    # Trigger Logic
+    # Trigger Logic - Use idempotency keys to prevent duplicate consumption on retries
     if asset_type == "summary":
-        enqueue_summarize_task(session_id, user_id=current_user.uid)
+        enqueue_summarize_task(session_id, user_id=current_user.uid, idempotency_key=f"ensure_summary:{session_id}")
     elif asset_type == "quiz":
-        enqueue_quiz_task(session_id, user_id=current_user.uid)
+        enqueue_quiz_task(session_id, user_id=current_user.uid, idempotency_key=f"ensure_quiz:{session_id}")
     elif asset_type == "playlist":
-        enqueue_playlist_task(session_id, user_id=current_user.uid)
+        enqueue_playlist_task(session_id, user_id=current_user.uid, idempotency_key=f"ensure_playlist:{session_id}")
     else:
         raise HTTPException(400, f"Unsupported asset type for ensure: {asset_type}")
         

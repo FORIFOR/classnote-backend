@@ -14,8 +14,8 @@ JST = timezone(timedelta(hours=9))
 
 # --- PLAN LIMITS (DEFINITIVE vNext) ---
 FREE_LIMITS = {
-    "cloud_stt_sec": 1800.0,       # 30 mins
-    "cloud_sessions_started": 10,
+    "cloud_stt_sec": 0,            # [POLICY] Free plan cannot use cloud transcription
+    "cloud_sessions_started": 0,   # [POLICY] Free plan cannot use cloud transcription
     "summary_generated": 3,
     "quiz_generated": 3,
     "server_session": 5,           # Max server sessions
@@ -23,22 +23,15 @@ FREE_LIMITS = {
 }
 
 
-# [FIX] Added Basic/Standard plan limits
+# Basic/Standard plan limits
 BASIC_LIMITS = {
-    "cloud_stt_sec": 7200.0,       # 120 mins (same as Premium)
+    "cloud_stt_sec": 7200.0,       # 120 mins (2 hours)
     "cloud_sessions_started": 100, # No practical limit (bounded by STT duration)
     "summary_generated": 100,      # AI Summary: 100/month
     "quiz_generated": 100,         # AI Quiz: 100/month
     "server_session": 300,         # Max server sessions (soft limit with cleanup)
-    "sessions_created": 100        # Monthly session creation limit
-}
-
-
-
-PREMIUM_LIMITS = {
-    "cloud_stt_sec": 7200.0,       # 120 mins per session (no monthly cap)
-    "llm_calls": 1000,             # Combined (Summary/Quiz/QA)
-    "server_session": 300          # Soft limit with auto cleanup
+    "sessions_created": 100,       # Monthly session creation limit
+    "llm_calls": 200,              # Combined (Summary/Quiz/QA)
 }
 
 def _safe_dict(snap) -> dict:
@@ -50,9 +43,7 @@ def _safe_dict(snap) -> dict:
 
 def _normalize_plan(plan: str) -> str:
     """Normalize plan name to canonical form."""
-    if plan in ("pro", "premium"):
-        return "premium"
-    elif plan in ("basic", "standard"):
+    if plan in ("basic", "standard"):
         return "basic"
     return "free"
 
@@ -80,7 +71,6 @@ def _resolve_plan_from_data(u_data: dict, user_id: str = None) -> str:
 def _get_plan_limits(plan: str, feature: str) -> int | float | None:
     """Get limit for a feature based on plan."""
     limits_map = {
-        "premium": PREMIUM_LIMITS,
         "basic": BASIC_LIMITS,
         "free": FREE_LIMITS,
     }
@@ -107,7 +97,7 @@ class CostGuardService:
         [TRIPLE LOCK] Transactional Guard.
         Checks if the entity (account or user) can consume 'amount' of 'feature'.
         If allowed, INCREMENTS (RESERVES) usage immediately.
-        
+
         Args:
             id_val: accountId (or uid if mode="user")
             feature: Feature key
@@ -119,7 +109,7 @@ class CostGuardService:
         entity_ref = db.collection(collection).document(id_val)
         doc_ref = self._get_monthly_doc_ref(id_val, mode=mode)
         month_str = self._get_month_key()
-        
+
         # If external transaction provided, use it directly (Sync)
         if transaction:
             return self._check_and_reserve_logic(transaction, entity_ref, doc_ref, id_val, feature, amount, month_str)
@@ -171,10 +161,7 @@ class CostGuardService:
         m_data = _safe_dict(m_snap)
 
         # 1. Cloud Seconds - select limit based on plan
-        if plan == "premium":
-            limit_sec = PREMIUM_LIMITS["cloud_stt_sec"]
-            session_limit = 999999
-        elif plan == "basic":
+        if plan == "basic":
             limit_sec = BASIC_LIMITS["cloud_stt_sec"]
             session_limit = BASIC_LIMITS["cloud_sessions_started"]
         else:
@@ -188,15 +175,14 @@ class CostGuardService:
         can_start = True
         reason = None
 
-        # Apply limits for non-premium plans
-        if plan != "premium":
-            if used_sec >= limit_sec:
-                can_start = False
-                reason = "cloud_minutes_limit"
-            if sessions_started >= session_limit:
-                can_start = False
-                reason = "cloud_session_limit"
-        
+        # Apply limits for all plans
+        if used_sec >= limit_sec:
+            can_start = False
+            reason = "cloud_minutes_limit"
+        if sessions_started >= session_limit:
+            can_start = False
+            reason = "cloud_session_limit"
+
         return {
             "plan": plan,
             "limitSeconds": limit_sec,
@@ -236,50 +222,28 @@ class CostGuardService:
 
         # Special: server_session (on User doc, not monthly)
         if feature == "server_session":
-            if plan == "premium":
-                limit = PREMIUM_LIMITS["server_session"]
-            elif plan == "basic":
+            if plan == "basic":
                 limit = BASIC_LIMITS["server_session"]
             else:
                 limit = FREE_LIMITS["server_session"]
             current = int(u_data.get("serverSessionCount", 0))
 
             if current + amount > limit:
-                # For Premium, allow but trigger cleanup outside (soft limit)
-                if plan == "premium":
-                    pass
-                else:
-                    logger.warning(f"[CostGuard] BLOCKED {user_id} ({plan}) server_session: {current}+{amount} > {limit}")
-                    return False, {
-                        "limit": limit,
-                        "used": current,
-                        "plan": plan,
-                        "rule": "server_session_limit",
-                        "uid": user_id
-                    }
-            
+                logger.warning(f"[CostGuard] BLOCKED {user_id} ({plan}) server_session: {current}+{amount} > {limit}")
+                return False, {
+                    "limit": limit,
+                    "used": current,
+                    "plan": plan,
+                    "rule": "server_session_limit",
+                    "uid": user_id
+                }
+
             # [FIX] Use set(merge=True) instead of update() to handle non-existent docs
             transaction.set(u_ref, {"serverSessionCount": firestore.Increment(amount)}, merge=True)
             return True, None
 
-
         # Select limits based on plan
-        if plan == "premium":
-            if feature == "cloud_stt_sec":
-                limit = PREMIUM_LIMITS["cloud_stt_sec"]
-                current = float(m_data.get("cloud_stt_sec", 0.0))
-            elif feature in ["summary_generated", "quiz_generated", "llm_calls"]:
-                limit = PREMIUM_LIMITS["llm_calls"]
-                current = int(m_data.get("llm_calls", 0))
-            elif feature == "cloud_sessions_started":
-                limit = 999999  # No session count limit for premium
-                current = int(m_data.get("cloud_sessions_started", 0))
-            elif feature == "sessions_created":
-                limit = 999999  # No monthly session creation limit for premium
-                current = int(m_data.get("sessions_created", 0))
-
-        elif plan == "basic":
-            # [FIX] Added Basic plan handling
+        if plan == "basic":
             if feature == "cloud_stt_sec":
                 limit = BASIC_LIMITS["cloud_stt_sec"]
                 current = float(m_data.get("cloud_stt_sec", 0.0))
@@ -342,20 +306,14 @@ class CostGuardService:
 
         # 4. Reserve Quota
         updates = {"updated_at": datetime.now(timezone.utc)}
-        
-        # Mapping for update
-        target_field = feature
-        if plan == "premium" and feature in ["summary_generated", "quiz_generated"]:
-            target_field = "llm_calls"
-        
-        updates[target_field] = firestore.Increment(amount)
+        updates[feature] = firestore.Increment(amount)
 
         # Execute Update
         if not m_snap.exists:
             transaction.set(m_ref, updates, merge=True)
         else:
             transaction.update(m_ref, updates)
-        
+
         return True, None
 
 # Singleton

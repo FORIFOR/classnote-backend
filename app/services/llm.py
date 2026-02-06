@@ -1,15 +1,62 @@
 import os
 import asyncio
 import json
+import time
 from typing import List, Optional, Any
+
+from app.services.profiling import get_profiler, Phase, PROFILING_ENABLED
 
 # Lazy import for vertexai to prevent build/startup crashes if credentials/deps are missing
 # import vertexai
 # from vertexai.generative_models import GenerativeModel, GenerationConfig
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-VERTEX_REGION = os.environ.get("VERTEX_REGION", "asia-northeast1")
-# デフォルトは地域で利用可能性の高い新しい ID を優先し、後方互換で -flash もフォールバック
+
+async def _timed_llm_call(model, prompt, generation_config, label: str = "llm"):
+    """
+    Wrapper to time LLM calls and record to profiler.
+    Zero overhead when profiling is disabled.
+    """
+    if not PROFILING_ENABLED:
+        response = await model.generate_content_async(prompt, generation_config=generation_config)
+        return response
+
+    profiler = get_profiler()
+    if not profiler:
+        response = await model.generate_content_async(prompt, generation_config=generation_config)
+        return response
+
+    start = time.perf_counter()
+    try:
+        response = await model.generate_content_async(prompt, generation_config=generation_config)
+        return response
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        # Estimate tokens from prompt length (rough: 1 token ≈ 4 chars for mixed content)
+        prompt_tokens = len(prompt) // 4 if isinstance(prompt, str) else 0
+        profiler.record_phase(Phase.LLM_REQUEST, duration_ms, label=label, prompt_tokens=prompt_tokens)
+
+# [FIX] Use ADC (Application Default Credentials) to get project_id reliably
+# This works in Cloud Run without requiring env vars
+def _get_project_id() -> str:
+    """Get project ID from env vars or ADC."""
+    from_env = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+    if from_env:
+        return from_env
+    try:
+        import google.auth
+        _, project = google.auth.default()
+        return project
+    except Exception:
+        return None
+
+PROJECT_ID = _get_project_id()
+
+# [FIX] Gemini 2.0 Flash/Flash-Lite is NOT available in asia-northeast1
+# Supported regions: us-central1, europe-west1, etc.
+# Use "us-central1" as default (verified working)
+VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION") or os.environ.get("VERTEX_REGION", "us-central1")
+
+# デフォルトは地域で利用可能性の高い新しい ID を優先
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.0-flash-lite")
 
 import re
@@ -20,6 +67,8 @@ logger = logging.getLogger(__name__)
 # Constants for transcript validation
 MIN_TRANSCRIPT_LENGTH = 10  # [FIX] Lowered to 10 as requested
 MAX_TRANSCRIPT_LENGTH = 100000  # Maximum to prevent excessive token usage
+CHUNK_SIZE = 80000  # Chunk size for long transcripts (with overlap margin)
+CHUNK_OVERLAP = 2000  # Overlap between chunks to preserve context
 SUMMARY_JSON_VERSION = 1
 
 
@@ -107,14 +156,36 @@ def _ensure_model():
     global _vertex_initialized, _model
     if _vertex_initialized and _model:
         return
-    
+
     # Lazy import
     import vertexai
+    import google.auth
     from vertexai.generative_models import GenerativeModel
 
-    if not PROJECT_ID:
-        raise RuntimeError("GOOGLE_CLOUD_PROJECT/GCP_PROJECT is not set for Vertex AI")
-    vertexai.init(project=PROJECT_ID, location=VERTEX_REGION)
+    # [FIX] Use ADC to get project_id and credentials reliably
+    # This works in Cloud Run without requiring env vars
+    project_id = PROJECT_ID
+    creds = None
+
+    if not project_id:
+        try:
+            creds, project_id = google.auth.default()
+            logger.info(f"[LLM] Using ADC project: {project_id}")
+        except Exception as e:
+            logger.error(f"[LLM] Failed to get credentials: {e}")
+            raise RuntimeError("Failed to get project_id from env or ADC for Vertex AI")
+
+    if not project_id:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT/GCP_PROJECT is not set and ADC failed for Vertex AI")
+
+    # [FIX] Use VERTEX_LOCATION (defaults to "global" for Gemini 2.0 availability)
+    location = VERTEX_LOCATION
+    logger.info(f"[LLM] Initializing Vertex AI: project={project_id}, location={location}")
+
+    if creds:
+        vertexai.init(project=project_id, location=location, credentials=creds)
+    else:
+        vertexai.init(project=project_id, location=location)
 
     # モデル名のフォールバックリスト（環境変数が優先）
     # 2.0 系のみを使用
@@ -126,8 +197,10 @@ def _ensure_model():
         try:
             _model = GenerativeModel(name)
             _vertex_initialized = True
+            logger.info(f"[LLM] Model initialized: {name}")
             return
         except Exception as e:
+            logger.warning(f"[LLM] Failed to init model {name}: {e}")
             last_err = e
             continue
     # ここまで来たら初期化失敗
@@ -142,12 +215,14 @@ async def summarize_transcript(text: str, mode: str = "lecture") -> str:
     from vertexai.generative_models import GenerationConfig
 
     prompt = _build_summary_prompt(text, mode)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.6,
             max_output_tokens=2048,
         ),
+        label="summarize",
     )
     return (resp.text or "").strip()
 
@@ -168,12 +243,14 @@ async def generate_quiz(text: str, mode: str = "lecture", count: int = 5) -> str
     _ensure_model()
     from vertexai.generative_models import GenerationConfig
     prompt = _build_quiz_prompt(text, mode, count)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.5,
             max_output_tokens=2048,
         ),
+        label="quiz",
     )
     return (resp.text or "").strip()
 
@@ -192,12 +269,14 @@ async def generate_explanation(text: str, mode: str = "lecture") -> str:
     _ensure_model()
     from vertexai.generative_models import GenerationConfig
     prompt = _build_explanation_prompt(text, mode)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.4,
             max_output_tokens=2048,
         ),
+        label="explanation",
     )
     return (resp.text or "").strip()
 
@@ -221,13 +300,15 @@ async def generate_playlist_timeline(
     _ensure_model()
     from vertexai.generative_models import GenerationConfig
     prompt = _build_playlist_prompt(text, segments=segments, duration_sec=duration_sec)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.5,
             max_output_tokens=1024,
             response_mime_type="application/json",
         ),
+        label="playlist",
     )
     # Gemini json mode returns text as JSON string
     return (resp.text or "").strip()
@@ -247,13 +328,15 @@ async def answer_question(text: str, question: str, mode: str = "lecture") -> di
     _ensure_model()
     from vertexai.generative_models import GenerationConfig
     prompt = _build_qa_prompt(text, question, mode)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.3,
             max_output_tokens=1024,
             response_mime_type="application/json",
         ),
+        label="qa",
     )
     # Use retry-aware JSON parsing
     result = _parse_json_with_retry(resp.text or "{}")
@@ -275,12 +358,14 @@ async def translate_text(text: str, target_lang: str) -> str:
 === テキスト ===
 {text}
 """
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.3,
             max_output_tokens=2048,
         ),
+        label="translate",
     )
     return (resp.text or "").strip()
 
@@ -292,13 +377,15 @@ async def generate_highlights_and_tags(text: str, segments: Optional[List[dict]]
     _ensure_model()
     from vertexai.generative_models import GenerationConfig
     prompt = _build_highlights_prompt(text, segments)
-    resp = await _model.generate_content_async(
+    resp = await _timed_llm_call(
+        _model,
         prompt,
-        generation_config=GenerationConfig(
+        GenerationConfig(
             temperature=0.5,
             max_output_tokens=2048,
             response_mime_type="application/json",
         ),
+        label="highlights",
     )
     try:
         data = json.loads(resp.text or "{}")
@@ -685,6 +772,231 @@ def _build_lecture_summary_prompt(
 """
 
 
+def _split_text_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    """
+    長いテキストを重複ありのチャンクに分割する。
+    文の途中で切れないよう、句点・改行で区切る。
+    """
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+
+        # 句点、改行、または句読点で区切りを探す
+        best_break = end
+        for sep in ["。\n", "。", ".\n", ".", "\n\n", "\n", "、", ","]:
+            # 区切り位置を後方から探す
+            pos = text.rfind(sep, start + chunk_size - 5000, end)
+            if pos > start:
+                best_break = pos + len(sep)
+                break
+
+        chunks.append(text[start:best_break])
+        # オーバーラップを考慮して次の開始位置を決定
+        start = max(start + 1, best_break - overlap)
+
+    return chunks
+
+
+def _merge_summary_jsons(summaries: List[dict], mode: str) -> dict:
+    """
+    複数のチャンク要約を1つに統合する。
+    """
+    if not summaries:
+        return {}
+    if len(summaries) == 1:
+        return summaries[0]
+
+    merged = {
+        "type": mode,
+        "highlights": [],
+        "overview": "",
+    }
+
+    # 全チャンクからハイライトを収集（重複排除）
+    seen_highlights = set()
+    all_highlights = []
+    for s in summaries:
+        for h in _coerce_list(s.get("highlights")):
+            text = h.get("text", "") if isinstance(h, dict) else ""
+            if text and text not in seen_highlights:
+                seen_highlights.add(text)
+                all_highlights.append(h)
+    merged["highlights"] = all_highlights[:7]  # 最大7件
+
+    # オーバービューを結合
+    overviews = [s.get("overview", "") for s in summaries if s.get("overview")]
+    merged["overview"] = "\n\n".join(overviews)[:2000]  # 最大2000文字
+
+    if mode == "lecture":
+        # 用語を統合（重複排除）
+        seen_terms = set()
+        all_terms = []
+        for s in summaries:
+            for t in _coerce_list(s.get("terms")):
+                term = t.get("term", "") if isinstance(t, dict) else ""
+                if term and term not in seen_terms:
+                    seen_terms.add(term)
+                    all_terms.append(t)
+        merged["terms"] = all_terms[:10]
+
+        # セクションを順番に結合
+        all_sections = []
+        for i, s in enumerate(summaries):
+            for sec in _coerce_list(s.get("sections")):
+                if isinstance(sec, dict):
+                    # チャンク番号をタイトルに追加（任意）
+                    all_sections.append(sec)
+        merged["sections"] = all_sections[:8]
+
+        # その他のフィールド
+        merged["theme"] = summaries[0].get("theme", {"text": "", "needConfirm": True})
+        merged["formulasOrProcedures"] = []
+        for s in summaries:
+            merged["formulasOrProcedures"].extend(_coerce_list(s.get("formulasOrProcedures")))
+        merged["formulasOrProcedures"] = merged["formulasOrProcedures"][:6]
+
+        merged["exercises"] = {"examples": [], "homework": [], "examScope": []}
+        for s in summaries:
+            ex = s.get("exercises", {})
+            if isinstance(ex, dict):
+                merged["exercises"]["examples"].extend(_coerce_list(ex.get("examples")))
+                merged["exercises"]["homework"].extend(_coerce_list(ex.get("homework")))
+                merged["exercises"]["examScope"].extend(_coerce_list(ex.get("examScope")))
+
+        merged["studyGuide"] = summaries[0].get("studyGuide", {
+            "recommendedOrder": ["highlights", "terms", "sections"],
+            "memoryHooks": []
+        })
+        merged["uiHints"] = summaries[0].get("uiHints", {
+            "topFocus": ["highlights", "terms"],
+            "tone": "study",
+            "suggestedBadges": ["要確認"]
+        })
+
+        # キーワード統合
+        seen_kw = set()
+        all_keywords = []
+        for s in summaries:
+            for kw in _coerce_list(s.get("keywords")):
+                text = kw.get("text", "") if isinstance(kw, dict) else ""
+                if text and text not in seen_kw:
+                    seen_kw.add(text)
+                    all_keywords.append(kw)
+        merged["keywords"] = all_keywords[:6]
+
+    else:  # meeting mode
+        # 決定事項を統合
+        merged["decisions"] = []
+        for s in summaries:
+            merged["decisions"].extend(_coerce_list(s.get("decisions")))
+
+        # TODOを統合
+        merged["todos"] = []
+        for s in summaries:
+            merged["todos"].extend(_coerce_list(s.get("todos")))
+
+        # 未決事項を統合
+        merged["openQuestions"] = []
+        for s in summaries:
+            merged["openQuestions"].extend(_coerce_list(s.get("openQuestions")))
+
+        # 議論ポイントを統合
+        merged["discussionPoints"] = []
+        for s in summaries:
+            merged["discussionPoints"].extend(_coerce_list(s.get("discussionPoints")))
+
+        # キーワード統合
+        seen_kw = set()
+        all_keywords = []
+        for s in summaries:
+            for kw in _coerce_list(s.get("keywords")):
+                text = kw.get("text", "") if isinstance(kw, dict) else ""
+                if text and text not in seen_kw:
+                    seen_kw.add(text)
+                    all_keywords.append(kw)
+        merged["keywords"] = all_keywords[:6]
+
+        # 参加者を統合（重複排除）
+        seen_participants = set()
+        all_participants = []
+        for s in summaries:
+            for p in _coerce_list(s.get("participants")):
+                name = p.get("name", "") if isinstance(p, dict) else ""
+                if name and name not in seen_participants:
+                    seen_participants.add(name)
+                    all_participants.append(p)
+        merged["participants"] = all_participants
+
+        merged["timeline"] = []
+        for s in summaries:
+            merged["timeline"].extend(_coerce_list(s.get("timeline")))
+
+        merged["uiHints"] = summaries[0].get("uiHints", {
+            "topFocus": ["decisions", "todos"],
+            "tone": "business",
+            "suggestedBadges": ["要確認"]
+        })
+
+    return merged
+
+
+async def _summarize_single_chunk(
+    text: str,
+    mode: str,
+    chunk_index: int,
+    total_chunks: int,
+) -> dict:
+    """
+    単一チャンクを要約する内部関数。
+    """
+    from vertexai.generative_models import GenerationConfig
+
+    # チャンク情報をプロンプトに追加
+    chunk_note = ""
+    if total_chunks > 1:
+        chunk_note = f"\n\n【注意】これは全{total_chunks}パートのうち、パート{chunk_index + 1}です。このパートの内容のみを要約してください。"
+
+    prompt = _build_summary_tags_prompt(text, mode) + chunk_note
+
+    max_attempts = 2
+    summary_json: dict = {}
+
+    for attempt in range(max_attempts):
+        resp = await _timed_llm_call(
+            _model,
+            prompt,
+            GenerationConfig(
+                temperature=0.6,
+                max_output_tokens=4096,
+                response_mime_type="application/json",
+            ),
+            label=f"summary_chunk_{chunk_index}",
+        )
+
+        data = _parse_json_with_retry(resp.text or "{}")
+        summary_payload = data.get("summary") if isinstance(data, dict) else None
+        summary_raw = summary_payload if isinstance(summary_payload, dict) else data
+        summary_json = _normalize_summary_json(summary_raw, mode)
+        ok, reason = _validate_summary_json(summary_json, mode, source_len=len(text))
+        if ok:
+            # タグも返す
+            tags_raw = data.get("tags") if isinstance(data, dict) else []
+            return {"summary": summary_json, "tags": tags_raw if isinstance(tags_raw, list) else []}
+        summary_json = {}
+
+    # フォールバック
+    return {"summary": _build_summary_json_fallback(mode, reason=f"チャンク{chunk_index + 1}の要約に失敗"), "tags": []}
+
+
 def _normalize_tags(raw_tags: List[Any], keywords: List[Any], mode: str) -> List[str]:
     """タグを正規化し、不足時は補完する"""
     tags: List[str] = []
@@ -748,11 +1060,11 @@ async def generate_summary_and_tags(
 ) -> dict:
     """
     要約・タグ・再生リストを1回の Gemini 呼び出しで生成する。
+    長い文字起こしの場合はチャンク分割して並列処理する。
     """
     # Transcript length validation
     if len(text) < MIN_TRANSCRIPT_LENGTH:
         logger.warning(f"Transcript too short for summary: {len(text)} chars")
-        # [FIX] Return specific "No input" message
         summary_json = _build_summary_json_fallback(mode, reason="入力がありません")
         return {
             "summaryJson": summary_json,
@@ -762,30 +1074,107 @@ async def generate_summary_and_tags(
             "tags": ["要確認"],
         }
 
-    if len(text) > MAX_TRANSCRIPT_LENGTH:
-        logger.warning(f"Transcript truncated: {len(text)} -> {MAX_TRANSCRIPT_LENGTH} chars")
-        text = text[:MAX_TRANSCRIPT_LENGTH]
-
     _ensure_model()
+
+    # チャンク分割が必要かチェック
+    if len(text) > CHUNK_SIZE:
+        logger.info(f"Long transcript detected: {len(text)} chars, using chunked summarization")
+        return await _generate_summary_chunked(text, mode)
+
+    # 通常の要約処理（短いテキスト）
+    return await _generate_summary_single(text, mode)
+
+
+async def _generate_summary_chunked(text: str, mode: str) -> dict:
+    """
+    長い文字起こしをチャンク分割して並列要約し、統合する。
+    """
+    chunks = _split_text_into_chunks(text)
+    total_chunks = len(chunks)
+    logger.info(f"Split into {total_chunks} chunks for summarization")
+
+    # 並列でチャンクを要約
+    tasks = [
+        _summarize_single_chunk(chunk, mode, i, total_chunks)
+        for i, chunk in enumerate(chunks)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 成功した結果を収集
+    summaries = []
+    all_tags = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Chunk {i} summarization failed: {result}")
+            continue
+        if isinstance(result, dict):
+            summaries.append(result.get("summary", {}))
+            all_tags.extend(result.get("tags", []))
+
+    if not summaries:
+        raise ValueError("All chunk summarizations failed")
+
+    # 要約を統合
+    merged_summary = _merge_summary_jsons(summaries, mode)
+    merged_summary = _normalize_summary_json(merged_summary, mode)
+
+    # タグを正規化
+    keyword_candidates: List[str] = []
+    for item in _coerce_list(merged_summary.get("keywords")):
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            keyword_candidates.append(item["text"])
+    for item in _coerce_list(merged_summary.get("terms")):
+        if isinstance(item, dict) and isinstance(item.get("term"), str):
+            keyword_candidates.append(item["term"])
+
+    if all_tags:
+        tags = _normalize_tags(all_tags, keyword_candidates, mode)
+    else:
+        tags = _extract_tags_from_summary_json(merged_summary, mode)
+        if not tags:
+            tags = _normalize_tags([], keyword_candidates, mode)
+
+    if mode == "lecture" and not _coerce_list(merged_summary.get("keywords")) and tags:
+        merged_summary["keywords"] = [{"text": tag} for tag in tags]
+
+    summary_markdown = _summary_json_to_markdown_v2(merged_summary)
+
+    logger.info(f"Chunked summarization complete: {total_chunks} chunks merged")
+
+    return {
+        "summaryJson": merged_summary,
+        "summaryType": merged_summary.get("type"),
+        "summaryJsonVersion": SUMMARY_JSON_VERSION,
+        "summaryMarkdown": summary_markdown,
+        "tags": tags,
+    }
+
+
+async def _generate_summary_single(text: str, mode: str) -> dict:
+    """
+    単一テキストの要約処理（通常の短いテキスト用）。
+    """
     from vertexai.generative_models import GenerationConfig
-    
+
     prompt = _build_summary_tags_prompt(text, mode)
 
     max_attempts = 2
     last_error = "summary_json_invalid"
     summary_json: dict = {}
+    data: dict = {}
 
     for attempt in range(max_attempts):
-        resp = await _model.generate_content_async(
+        resp = await _timed_llm_call(
+            _model,
             prompt,
-            generation_config=GenerationConfig(
+            GenerationConfig(
                 temperature=0.6,
                 max_output_tokens=4096,
                 response_mime_type="application/json",
             ),
+            label="summary",
         )
 
-        # Use retry-aware JSON parsing
         data = _parse_json_with_retry(resp.text or "{}")
         summary_payload = data.get("summary") if isinstance(data, dict) else None
         summary_raw = summary_payload if isinstance(summary_payload, dict) else data

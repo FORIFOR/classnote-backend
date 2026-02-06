@@ -27,7 +27,7 @@ def get_current_admin_user(credentials: HTTPAuthorizationCredentials = Depends(s
         uid = decoded_token.get("uid")
         
         # [DEV] Whitelist fallback for owner
-        ADMIN_WHITELIST = ["eCgQGszHJZS3vHlLQ7jBorCQAK72", "16PRzcKCQrSsqR2d8UnnIjnssh02"]
+        ADMIN_WHITELIST = ["eCgQGszHJZS3vHlLQ7jBorCQAK72", "16PRzcKCQrSsqR2d8UnnIjnssh02", "tLy5z7eWb3bQAezw9EmvQvM6HbR2"]
         is_in_whitelist = uid in ADMIN_WHITELIST
         
         # DEBUG LOG

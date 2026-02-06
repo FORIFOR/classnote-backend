@@ -21,6 +21,14 @@ class CanonicalizeResponse(BaseModel):
     accountId: str
     firebaseCustomToken: str | None = None
     message: str
+    # [NEW] Include meLite-equivalent data so iOS doesn't need to call /users/me again
+    plan: str = "free"
+    displayName: str | None = None
+    username: str | None = None
+    hasUsername: bool = False
+    photoUrl: str | None = None
+    provider: str | None = None
+    providers: list[str] = []
 
 import httpx
 
@@ -239,6 +247,7 @@ async def canonicalize_user(
         })
         db.collection("users").document(uid).set({
             "accountId": target_account_id,
+            "lastLoginAt": now,
             "updatedAt": now
         }, merge=True)
 
@@ -246,7 +255,14 @@ async def canonicalize_user(
             canonicalized=True,
             accountId=target_account_id,
             firebaseCustomToken=None,
-            message="New account created and linked."
+            message="New account created and linked.",
+            plan="free",
+            displayName=user_data.get("displayName") or current_user.display_name,
+            username=user_data.get("username"),
+            hasUsername=user_data.get("hasUsername", False),
+            photoUrl=user_data.get("photoUrl") or current_user.photo_url,
+            provider=current_user.provider,
+            providers=user_data.get("providers", [current_user.provider] if current_user.provider else []),
         )
 
     # Check if merge is needed
@@ -259,11 +275,28 @@ async def canonicalize_user(
             logger.error(f"[/auth/canonicalize] Merge failed: {e}")
             raise HTTPException(status_code=500, detail=f"Account merge failed: {str(e)}")
 
+        # [NEW] Record last login time
+        db.collection("users").document(uid).set({
+            "lastLoginAt": now,
+            "updatedAt": now
+        }, merge=True)
+
+        # Fetch account data for response
+        acc_doc = db.collection("accounts").document(target_account_id).get()
+        acc_data = acc_doc.to_dict() if acc_doc.exists else {}
+
         return CanonicalizeResponse(
             canonicalized=True,
             accountId=target_account_id,
             firebaseCustomToken=None,
-            message=f"Account unified via {resolution_method}. Previous: {current_account_id}"
+            message=f"Account unified via {resolution_method}. Previous: {current_account_id}",
+            plan=acc_data.get("plan", "free"),
+            displayName=user_data.get("displayName") or current_user.display_name,
+            username=user_data.get("username"),
+            hasUsername=user_data.get("hasUsername", False),
+            photoUrl=user_data.get("photoUrl") or current_user.photo_url,
+            provider=current_user.provider,
+            providers=acc_data.get("providers", [current_user.provider] if current_user.provider else []),
         )
 
     # No merge needed - just ensure link exists
@@ -276,20 +309,51 @@ async def canonicalize_user(
         })
         db.collection("users").document(uid).set({
             "accountId": target_account_id,
+            "lastLoginAt": now,
             "updatedAt": now
         }, merge=True)
+
+        # Fetch account data for response
+        acc_doc = db.collection("accounts").document(target_account_id).get()
+        acc_data = acc_doc.to_dict() if acc_doc.exists else {}
+
         return CanonicalizeResponse(
             canonicalized=True,
             accountId=target_account_id,
             firebaseCustomToken=None,
-            message=f"Account linked via {resolution_method}."
+            message=f"Account linked via {resolution_method}.",
+            plan=acc_data.get("plan", "free"),
+            displayName=user_data.get("displayName") or current_user.display_name,
+            username=user_data.get("username"),
+            hasUsername=user_data.get("hasUsername", False),
+            photoUrl=user_data.get("photoUrl") or current_user.photo_url,
+            provider=current_user.provider,
+            providers=acc_data.get("providers", [current_user.provider] if current_user.provider else []),
         )
 
     # Already canonical
     logger.info(f"[/auth/canonicalize] uid={uid} already linked to {target_account_id}")
+
+    # [NEW] Record last login time
+    db.collection("users").document(uid).set({
+        "lastLoginAt": now,
+        "updatedAt": now
+    }, merge=True)
+
+    # Fetch account data for response
+    acc_doc = db.collection("accounts").document(target_account_id).get()
+    acc_data = acc_doc.to_dict() if acc_doc.exists else {}
+
     return CanonicalizeResponse(
         canonicalized=False,
         accountId=target_account_id,
         firebaseCustomToken=None,
-        message="Already using canonical identity."
+        message="Already using canonical identity.",
+        plan=acc_data.get("plan", "free"),
+        displayName=user_data.get("displayName") or current_user.display_name,
+        username=user_data.get("username"),
+        hasUsername=user_data.get("hasUsername", False),
+        photoUrl=user_data.get("photoUrl") or current_user.photo_url,
+        provider=current_user.provider,
+        providers=acc_data.get("providers", [current_user.provider] if current_user.provider else []),
     )
