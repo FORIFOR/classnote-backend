@@ -1,18 +1,41 @@
-"""AI Chat API — session-aware conversational AI."""
+"""AI Chat API — session-first conversational AI with TODO awareness.
 
+Every turn: session first → general fallback → next turn session first again.
+Conversation state persists active session across turns (client-side).
+"""
+
+import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.dependencies import get_current_user, CurrentUser
 from app.firebase import db
-from app.services.scope_resolver import resolve_scope
-from app.services.context_builder import build_session_context, build_turn_prompt, build_todo_context
-from app.services.gemini_chat import call_gemini_chat, call_gemini_general_chat
+from app.services.scope_resolver import (
+    resolve_referent,
+    resolve_todo_aware,
+    can_answer_from_session,
+    needs_fresh_grounding,
+    is_todo_intent,
+    has_session_intent,
+    extract_topic,
+)
+from app.services.context_builder import build_session_context, build_turn_prompt, build_stream_prompt, build_todo_context
+from app.services.gemini_chat import (
+    call_gemini_chat,
+    call_gemini_general_chat,
+    call_gemini_general_with_search,
+    CHAT_MODEL_NAME,
+    GENERAL_MODEL_NAME,
+)
+from app.services.gemini_stream import stream_gemini_chat, stream_gemini_with_search
+from app.services.ai_credits import ai_credits, estimate_cost
+from app.services.ops_logger import log_ai_chat
 
 logger = logging.getLogger("app.routes.chat")
 router = APIRouter(prefix="/v1/chat", tags=["AI Chat"])
@@ -30,12 +53,13 @@ class HistoryItem(BaseModel):
 class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
     message: str
-    mode: Optional[str] = None  # "session" | "general" — determines model routing
+    mode: Optional[str] = None  # legacy — ignored
     current_session_id: Optional[str] = None
     recent_session_ids: Optional[List[str]] = None
-    ui_scope: str = "global_ai"  # "global_ai" | "session_detail" | "global_all"
+    ui_scope: str = "global_ai"
     history: List[HistoryItem] = []
     conversation_summary: Optional[str] = None
+    conversation_state: Optional[Dict[str, Any]] = None
 
 
 class UsedSession(BaseModel):
@@ -51,14 +75,20 @@ class Citation(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    mode: Literal["session_grounded", "session_plus_general", "general_only"]
+    mode: Literal["session_grounded", "session_plus_general", "general_static", "general_fresh"]
     used_sessions: List[UsedSession]
     citations: List[Citation]
     confidence: float
     needs_general_knowledge: bool
     follow_up_suggestion: Optional[str] = None
     conversation_summary_next: Optional[str] = None
-    used_search: bool = False  # Whether the response used web search grounding
+    used_search: bool = False
+    used_model: Optional[str] = None
+    display_scope: Optional[str] = None
+    conversation_state: Optional[Dict[str, Any]] = None
+    # AI Credit info
+    credit_cost: int = 0
+    credits_remaining: Optional[int] = None
 
 
 class SuggestionResponse(BaseModel):
@@ -66,7 +96,172 @@ class SuggestionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_session_context(session_id: str, message: str, user, *, skip_access_check: bool = False) -> Optional[dict]:
+    """Load a single session's context with access check."""
+    try:
+        doc = db.collection("sessions").document(session_id).get()
+        if not doc.exists:
+            logger.warning(f"[Chat] Session not found: {session_id}")
+            return None
+
+        data = doc.to_dict()
+        data["id"] = doc.id
+
+        if not skip_access_check:
+            owner_uid = data.get("ownerUid") or data.get("userId")
+            owner_account = data.get("ownerAccountId")
+            shared_accounts = data.get("sharedWithAccountIds") or []
+            shared_uids = data.get("sharedUserIds") or data.get("sharedWithUserIds") or []
+
+            user_account = getattr(user, "account_id", None)
+            has_access = (
+                owner_uid == user.uid
+                or (owner_account and user_account and owner_account == user_account)
+                or (user_account and user_account in shared_accounts)
+                or user.uid in shared_uids
+            )
+            if not has_access:
+                logger.warning(
+                    f"[Chat] Access denied: uid={user.uid} account={user_account} "
+                    f"session={session_id} owner_uid={owner_uid} owner_account={owner_account}"
+                )
+                return None
+
+        ctx = build_session_context(data, message)
+        logger.info(
+            f"[Chat] Session loaded: {session_id} title=\"{ctx.get('title', '')[:50]}\" "
+            f"summary={len(ctx.get('summary', ''))} transcript={len(ctx.get('transcript_excerpt', ''))}"
+        )
+        return ctx
+    except Exception as e:
+        logger.error(f"[Chat] Failed to load session {session_id}: {e}")
+        return None
+
+
+def _load_session_contexts(session_ids: List[str], user, message: str, *, skip_access_check: bool = False) -> list:
+    """Load multiple sessions with access control."""
+    contexts = []
+    for sid in session_ids:
+        ctx = _load_session_context(sid, message, user, skip_access_check=skip_access_check)
+        if ctx:
+            contexts.append(ctx)
+    logger.info(f"[Chat] Loaded {len(contexts)}/{len(session_ids)} session contexts (skip_acl={skip_access_check})")
+    return contexts
+
+
+def _fetch_user_todos(user, limit: int = 30) -> list:
+    """Fetch user's open TODOs from Firestore."""
+    try:
+        account_id = getattr(user, "account_id", None) or user.uid
+        todo_q = (
+            db.collection("todos")
+            .where("accountId", "==", account_id)
+            .where("status", "in", ["open", "overdue"])
+            .limit(limit)
+        )
+        todo_docs = list(todo_q.stream())
+        todos = []
+        for td in todo_docs:
+            todo_data = td.to_dict()
+            todo_data["id"] = td.id
+            todos.append(todo_data)
+
+        priority_order = {"high": 0, "mid": 1, "low": 2}
+        todos.sort(key=lambda t: (
+            priority_order.get(t.get("priority", "mid"), 1),
+            t.get("dueDate") or "9999-99-99",
+        ))
+        logger.info(f"[Chat] Fetched {len(todos)} TODOs for {account_id}")
+        return todos
+    except Exception as e:
+        logger.warning(f"[Chat] TODO fetch failed: {e}", exc_info=True)
+        return []
+
+
+def _auto_resolve_sessions(user, message: str, limit: int = 5) -> list:
+    """Fetch recent session IDs for cold-start queries."""
+    try:
+        _epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+        try:
+            q = (
+                db.collection("sessions")
+                .where("ownerUid", "==", user.uid)
+                .order_by("createdAt", direction="DESCENDING")
+                .limit(30)
+            )
+            docs = list(q.stream())
+        except Exception:
+            q = db.collection("sessions").where("ownerUid", "==", user.uid).limit(200)
+            docs = list(q.stream())
+            docs.sort(
+                key=lambda d: d.to_dict().get("createdAt") or d.to_dict().get("startedAt") or _epoch,
+                reverse=True,
+            )
+            docs = docs[:30]
+
+        seen_ids = {d.id for d in docs}
+        if hasattr(user, "account_id") and user.account_id and user.account_id != user.uid:
+            try:
+                acct_q = (
+                    db.collection("sessions")
+                    .where("ownerAccountId", "==", user.account_id)
+                    .order_by("createdAt", direction="DESCENDING")
+                    .limit(30)
+                )
+                for d in acct_q.stream():
+                    if d.id not in seen_ids:
+                        docs.append(d)
+            except Exception:
+                acct_q = db.collection("sessions").where("ownerAccountId", "==", user.account_id).limit(30)
+                for d in acct_q.stream():
+                    if d.id not in seen_ids:
+                        docs.append(d)
+
+        docs.sort(
+            key=lambda d: d.to_dict().get("createdAt") or d.to_dict().get("startedAt") or _epoch,
+            reverse=True,
+        )
+
+        # Mode-aware filtering
+        mode_hints = {
+            "meeting": ["会議", "打ち合わせ", "ミーティング"],
+            "lecture": ["講義", "授業", "レクチャー"],
+        }
+        preferred_mode = None
+        for m, keywords in mode_hints.items():
+            if any(k in message for k in keywords):
+                preferred_mode = m
+                break
+
+        if preferred_mode:
+            preferred = [d for d in docs if d.to_dict().get("mode") == preferred_mode]
+            others = [d for d in docs if d.to_dict().get("mode") != preferred_mode]
+            selected = preferred[:limit]
+            remaining = limit - len(selected)
+            if remaining > 0:
+                selected += others[:remaining]
+        else:
+            selected = docs[:limit]
+
+        session_ids = [d.id for d in selected]
+        titles = [d.to_dict().get("title", "?")[:40] for d in selected]
+        logger.info(
+            f"[Chat] Auto-resolved {len(session_ids)} sessions "
+            f"(total_docs={len(docs)} preferred_mode={preferred_mode}) "
+            f"titles={titles}"
+        )
+        return session_ids
+    except Exception as e:
+        logger.warning(f"[Chat] Auto-resolve failed: {e}", exc_info=True)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Main endpoint: session-first routing
 # ---------------------------------------------------------------------------
 
 @router.post("/send", response_model=ChatResponse)
@@ -74,331 +269,687 @@ async def send_chat(
     req: ChatRequest,
     user: CurrentUser = Depends(get_current_user),
 ):
-    """Send a chat message and get an AI response."""
+    """Send a chat message — session-first every turn."""
     message = req.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message is empty")
     if len(message) > 2000:
         raise HTTPException(status_code=400, detail="Message too long (max 2000 chars)")
 
-    has_summary = bool(req.conversation_summary)
-    history_len = len(req.history)
-    is_general_mode = req.mode == "general"
+    t0 = time.monotonic()
+
+    # ── 1. Restore conversation state ──
+    state = dict(req.conversation_state or {})
+
+    # If UI provides current_session_id, always override (user changed session)
+    if req.current_session_id:
+        state["active_session_id"] = req.current_session_id
+
     logger.info(
-        f"[Chat/send] START uid={user.uid} session={req.current_session_id} "
-        f"scope={req.ui_scope} client_mode={req.mode} msg_len={len(message)} history={history_len} "
-        f"has_summary={has_summary} chat_id={req.chat_id}"
+        f"[Chat/send] START uid={user.uid} scope={req.ui_scope} "
+        f"msg_len={len(message)} state={state}"
     )
     logger.info(f"[Chat/send] Q: \"{message[:500]}\"")
 
-    t0 = time.monotonic()
+    # ── 2. Resolve referent (その会議, このTODO, etc.) ──
+    referent = resolve_referent(message, state)
 
-    # ── General chat mode: use gemini-2.5-flash-lite, minimal session context ──
-    if is_general_mode:
-        logger.info("[Chat/send] General mode → using gemini-2.5-flash-lite")
+    # ── 3. TODO handling ──
+    todos_raw = []
+    todo_context_str = None
+    todo_ref = None
+    want_todo = is_todo_intent(message)
 
-        # Optionally fetch TODO context
-        todo_context_str = None
-        if any(k in message for k in ["todo", "TODO", "タスク", "やること"]):
-            try:
-                account_id = getattr(user, "account_id", None) or user.uid
-                todo_q = (
-                    db.collection("todos")
-                    .where("accountId", "==", account_id)
-                    .where("status", "in", ["open", "overdue"])
-                    .limit(30)
-                )
-                todo_docs = list(todo_q.stream())
-                todos = []
-                for td in todo_docs:
-                    todo_data = td.to_dict()
-                    todo_data["id"] = td.id
-                    todos.append(todo_data)
-                priority_order = {"high": 0, "mid": 1, "low": 2}
-                todos.sort(key=lambda t: (
-                    priority_order.get(t.get("priority", "mid"), 1),
-                    t.get("dueDate") or "9999-99-99",
-                ))
-                todo_context_str = build_todo_context(todos)
-                logger.info(f"[Chat/send] General mode: fetched {len(todos)} TODOs")
-            except Exception as e:
-                logger.warning(f"[Chat/send] General mode TODO fetch failed: {e}")
+    if want_todo or state.get("active_todo_id"):
+        todos_raw = _fetch_user_todos(user)
+        if want_todo:
+            todo_context_str = build_todo_context(todos_raw)
 
-        # Build prompt for general chat
-        turn_prompt = build_turn_prompt(
-            message=message,
-            mode="general_only",
-            contexts=[],
-            history=[h.model_dump() for h in req.history],
-            conversation_summary=req.conversation_summary,
-            todo_context=todo_context_str,
-        )
-        logger.info(f"[Chat/send] General prompt built: {len(turn_prompt)} chars")
+    # Try TODO-aware resolution (match message to a specific TODO's source session)
+    if todos_raw:
+        todo_ref = resolve_todo_aware(message, state, todos_raw)
 
-        t_gemini_start = time.monotonic()
-        try:
-            result = call_gemini_general_chat(turn_prompt)
-        except Exception as e:
-            logger.error(f"[Chat/send] General Gemini failed: {e}")
-            raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
+    # ── 4. Determine active_session_id (priority: TODO > referent > state) ──
+    active_session_id = None
 
-        t_end = time.monotonic()
-        logger.info(
-            f"[Chat/send] DONE (general) uid={user.uid} total={((t_end - t0)*1000):.0f}ms "
-            f"gemini={((t_end - t_gemini_start)*1000):.0f}ms answer_len={len(result.get('answer', ''))}"
-        )
-        logger.info(f"[Chat/send] A: \"{result.get('answer', '')}\"")
+    if todo_ref and todo_ref.get("session_id"):
+        active_session_id = todo_ref["session_id"]
+        state["active_todo_id"] = todo_ref.get("todo_id")
+        state["active_session_id"] = active_session_id
+        state["active_session_title"] = todo_ref.get("session_title")
+        logger.info(f"[Chat/send] Active session from TODO: {active_session_id}")
+    elif referent and referent.get("entity_type") == "session":
+        active_session_id = referent["entity_id"]
+        logger.info(f"[Chat/send] Active session from referent: {active_session_id}")
+    else:
+        active_session_id = state.get("active_session_id")
+        if active_session_id:
+            logger.info(f"[Chat/send] Active session from state: {active_session_id}")
 
-        return ChatResponse(
-            answer=result.get("answer", ""),
-            mode="general_only",
-            used_sessions=[UsedSession(**s) for s in result.get("used_sessions", [])],
-            citations=[Citation(**c) for c in result.get("citations", [])],
-            confidence=result.get("confidence", 0.0),
-            needs_general_knowledge=True,
-            follow_up_suggestion=result.get("follow_up_suggestion"),
-            conversation_summary_next=result.get("conversation_summary_next"),
-            used_search=False,
-        )
-
-    # ── Session mode: existing logic with gemini-2.0-flash-lite ──
-
-    # 1. Resolve scope
-    scope = resolve_scope(message, req.current_session_id, req.ui_scope)
-    mode = scope["mode"]
-    session_ids = scope["session_ids"]
-    auto_resolve = scope.get("auto_resolve", False)
-    t_scope = time.monotonic()
-    logger.info(f"[Chat/send] Scope resolved: mode={mode} session_ids={session_ids} auto_resolve={auto_resolve} ({(t_scope - t0)*1000:.0f}ms)")
-
-    # 1b. Auto-resolve: fetch recent sessions when no session specified but data-dependent query
-    if auto_resolve and not session_ids:
-        try:
-            _epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
-
-            # Try ordered query first (requires composite index: ownerUid + createdAt DESC)
-            try:
-                uid_q = (
-                    db.collection("sessions")
-                    .where("ownerUid", "==", user.uid)
-                    .order_by("createdAt", direction="DESCENDING")
-                    .limit(30)
-                )
-                docs = list(uid_q.stream())
-                logger.info(f"[Chat/send] Auto-resolve: ordered query returned {len(docs)} docs")
-            except Exception as idx_err:
-                # Fallback: no index — fetch more docs and sort client-side
-                logger.warning(f"[Chat/send] Auto-resolve ordered query failed (index?): {idx_err}")
-                uid_q = db.collection("sessions").where("ownerUid", "==", user.uid).limit(200)
-                docs = list(uid_q.stream())
-                docs.sort(
-                    key=lambda d: d.to_dict().get("createdAt") or d.to_dict().get("startedAt") or _epoch,
-                    reverse=True,
-                )
-                docs = docs[:30]
-                logger.info(f"[Chat/send] Auto-resolve: fallback query returned {len(docs)} docs (sorted client-side)")
-
-            seen_ids = {d.id for d in docs}
-
-            # Also try ownerAccountId if available (handles account migration)
-            if hasattr(user, "account_id") and user.account_id and user.account_id != user.uid:
-                try:
-                    acct_q = (
-                        db.collection("sessions")
-                        .where("ownerAccountId", "==", user.account_id)
-                        .order_by("createdAt", direction="DESCENDING")
-                        .limit(30)
-                    )
-                    for d in acct_q.stream():
-                        if d.id not in seen_ids:
-                            docs.append(d)
-                except Exception:
-                    acct_q = db.collection("sessions").where("ownerAccountId", "==", user.account_id).limit(30)
-                    for d in acct_q.stream():
-                        if d.id not in seen_ids:
-                            docs.append(d)
-
-            # Final sort by createdAt descending
-            docs.sort(
-                key=lambda d: d.to_dict().get("createdAt") or d.to_dict().get("startedAt") or _epoch,
-                reverse=True,
-            )
-
-            # Mode-aware filtering: prefer sessions matching the query intent
-            # e.g. "最近の会議" → prefer mode="meeting", "最近の講義" → prefer mode="lecture"
-            mode_hints = {
-                "meeting": ["会議", "打ち合わせ", "ミーティング"],
-                "lecture": ["講義", "授業", "レクチャー"],
-            }
-            preferred_mode = None
-            for m, keywords in mode_hints.items():
-                if any(k in message for k in keywords):
-                    preferred_mode = m
-                    break
-
-            if preferred_mode:
-                preferred = [d for d in docs if d.to_dict().get("mode") == preferred_mode]
-                others = [d for d in docs if d.to_dict().get("mode") != preferred_mode]
-                # Take up to 5 from preferred mode, fill remainder with others
-                selected = preferred[:5]
-                remaining = 5 - len(selected)
-                if remaining > 0:
-                    selected += others[:remaining]
-                logger.info(
-                    f"[Chat/send] Mode filter: preferred={preferred_mode} "
-                    f"matched={len(preferred)} selected={len(selected)}"
-                )
-            else:
-                selected = docs[:5]
-
-            session_ids = [d.id for d in selected]
-            top_titles = [(d.id[:8], (d.to_dict().get("title") or "?")[:30], d.to_dict().get("mode", "?")) for d in selected]
-            logger.info(f"[Chat/send] Auto-resolved {len(session_ids)} recent sessions (scanned {len(docs)}): {top_titles}")
-        except Exception as e:
-            logger.warning(f"[Chat/send] Auto-resolve failed: {e}", exc_info=True)
-
-    # 2. Load session data
-    contexts = []
-    for sid in session_ids:
-        try:
-            doc = db.collection("sessions").document(sid).get()
-            if doc.exists:
-                data = doc.to_dict()
-                data["id"] = doc.id
-                # Verify access: user must be owner or shared member
-                owner_uid = data.get("ownerUid") or data.get("userId")
-                owner_account = data.get("ownerAccountId")
-                shared_accounts = data.get("sharedWithAccountIds") or []
-                shared_uids = data.get("sharedUserIds") or data.get("sharedWithUserIds") or []
-
-                has_access = (
-                    owner_uid == user.uid
-                    or owner_account == user.account_id
-                    or user.account_id in shared_accounts
-                    or user.uid in shared_uids
-                )
-                if not has_access:
-                    logger.warning(f"[Chat/send] Access denied: uid={user.uid} session={sid} owner={owner_uid}")
-                    continue
-
-                ctx = build_session_context(data, message)
-                ctx_summary_len = len(ctx.get("summary", ""))
-                ctx_transcript_len = len(ctx.get("transcript_excerpt", ""))
-                logger.info(
-                    f"[Chat/send] Context loaded: session={sid} title=\"{ctx.get('title', '')[:50]}\" "
-                    f"summary_len={ctx_summary_len} transcript_len={ctx_transcript_len}"
-                )
-                contexts.append(ctx)
-            else:
-                logger.warning(f"[Chat/send] Session not found in Firestore: {sid}")
-        except Exception as e:
-            logger.error(f"[Chat/send] Failed to load session {sid}: {e}")
+    # ── 5. Load active session context ──
+    session_context = None
+    if active_session_id:
+        session_context = _load_session_context(active_session_id, message, user)
 
     t_ctx = time.monotonic()
-    logger.info(f"[Chat/send] Contexts loaded: {len(contexts)}/{len(session_ids)} ({(t_ctx - t_scope)*1000:.0f}ms)")
-
-    # If session was requested but not found, fall back to general
-    if session_ids and not contexts:
-        logger.info(f"[Chat/send] Fallback: session requested but no context → general_only")
-        mode = "general_only"
-
-    # 2b. Fetch user's TODO list if requested
-    todo_context_str = None
-    if scope.get("todo_list"):
-        try:
-            account_id = getattr(user, "account_id", None) or user.uid
-            todo_q = (
-                db.collection("todos")
-                .where("accountId", "==", account_id)
-                .where("status", "in", ["open", "overdue"])
-                .limit(30)
-            )
-            todo_docs = list(todo_q.stream())
-            todos = []
-            for td in todo_docs:
-                todo_data = td.to_dict()
-                todo_data["id"] = td.id
-                todos.append(todo_data)
-            # Sort by priority (high > mid > low) then by dueDate
-            priority_order = {"high": 0, "mid": 1, "low": 2}
-            todos.sort(key=lambda t: (
-                priority_order.get(t.get("priority", "mid"), 1),
-                t.get("dueDate") or "9999-99-99",
-            ))
-            todo_context_str = build_todo_context(todos)
-            logger.info(f"[Chat/send] Fetched {len(todos)} open TODOs for user {account_id}")
-        except Exception as e:
-            logger.warning(f"[Chat/send] TODO fetch failed: {e}", exc_info=True)
-
-    # 3. Build prompt (with conversation summary for continuity)
-    turn_prompt = build_turn_prompt(
-        message=message,
-        mode=mode,
-        contexts=contexts,
-        history=[h.model_dump() for h in req.history],
-        conversation_summary=req.conversation_summary,
-        todo_context=todo_context_str,
+    logger.info(
+        f"[Chat/send] Context phase: {(t_ctx - t0)*1000:.0f}ms "
+        f"session_loaded={session_context is not None}"
     )
-    logger.info(f"[Chat/send] Prompt built: {len(turn_prompt)} chars")
-    logger.info(f"[Chat/send] === PROMPT START ===\n{turn_prompt}\n=== PROMPT END ===")
 
-    # 4. Call Gemini
+    # ── 5.5. Pre-check AI credits (min cost = 1) ──
+    account_id = user.account_id
+    pre_allowed, pre_info = ai_credits.can_consume(account_id, 1)
+    if not pre_allowed:
+        reason = pre_info.get("reason", "credit_limit")
+        logger.warning(f"[Chat/send] Credit pre-check blocked: {reason} account={account_id}")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": reason,
+                "credits_remaining": pre_info.get("remaining", 0),
+                "daily_used": pre_info.get("dailyUsed", 0),
+                "daily_soft_cap": pre_info.get("dailySoftCap", 20),
+            },
+        )
+
+    # ── 6. Check session answerability (session-first!) ──
+    session_answerable = False
+    suggested_mode = "general_static"
+
+    if session_context:
+        # If UI explicitly selected this session, force session_grounded
+        if req.ui_scope == "session_detail" and req.current_session_id:
+            session_answerable = True
+            suggested_mode = "session_grounded"
+            logger.info("[Chat/send] UI session_detail → forced session_grounded")
+        # If referent explicitly points to session, force answerable
+        elif referent and referent.get("entity_type") == "session":
+            session_answerable = True
+            suggested_mode = "session_grounded"
+            logger.info("[Chat/send] Referent → forced session_grounded")
+        else:
+            session_answerable, suggested_mode = can_answer_from_session(
+                message, session_context, state
+            )
+
+    # ── 7. Route — session first, general fallback ──
     t_gemini_start = time.monotonic()
+    result = None
+    mode = suggested_mode
+    model_label = ""
+
     try:
-        result = call_gemini_chat(turn_prompt)
+        if session_answerable and session_context:
+            # ─── A. Session-first: answer from session ───
+            contexts = [session_context]
+            mode = suggested_mode
+
+            turn_prompt = build_turn_prompt(
+                message=message,
+                mode=mode,
+                contexts=contexts,
+                history=[h.model_dump() for h in req.history],
+                conversation_summary=req.conversation_summary,
+                todo_context=todo_context_str,
+            )
+            logger.info(f"[Chat/send] Prompt: {len(turn_prompt)} chars")
+
+            if mode == "session_grounded":
+                model_label = CHAT_MODEL_NAME
+                logger.info("[Chat/send] → session_grounded (session model)")
+                result = call_gemini_chat(turn_prompt)
+            else:
+                model_label = GENERAL_MODEL_NAME
+                logger.info("[Chat/send] → session_plus_general (general model + session ctx)")
+                result = call_gemini_general_chat(turn_prompt)
+
+            # Update state: session was used
+            state["active_session_id"] = active_session_id
+            state["active_session_title"] = session_context.get("title")
+            state["last_referenced_entity_type"] = "session"
+            state["last_referenced_entity_id"] = active_session_id
+            state["last_answer_mode"] = mode
+
+        elif not active_session_id and has_session_intent(message):
+            # ─── B. Cold start: auto-resolve sessions ───
+            logger.info(f"[Chat/send] Session intent detected, auto-resolving for uid={user.uid} account={user.account_id}")
+            session_ids = _auto_resolve_sessions(user, message)
+            contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+
+            if contexts:
+                mode = "session_plus_general"
+                model_label = GENERAL_MODEL_NAME
+                turn_prompt = build_turn_prompt(
+                    message=message,
+                    mode=mode,
+                    contexts=contexts,
+                    history=[h.model_dump() for h in req.history],
+                    conversation_summary=req.conversation_summary,
+                    todo_context=todo_context_str,
+                )
+                logger.info(f"[Chat/send] → auto-resolve: {len(contexts)} sessions")
+            else:
+                logger.warning(f"[Chat/send] Auto-resolve found 0 contexts (session_ids={session_ids})")
+                result = call_gemini_general_chat(turn_prompt)
+
+                # Set first session as active
+                state["active_session_id"] = contexts[0].get("session_id")
+                state["active_session_title"] = contexts[0].get("title")
+                state["last_referenced_entity_type"] = "session"
+                state["last_referenced_entity_id"] = contexts[0].get("session_id")
+                state["last_answer_mode"] = mode
+
+        # ─── C/D. General fallback (only if not answered above) ───
+        if result is None:
+            if needs_fresh_grounding(message):
+                # ─── C. General + search grounding ───
+                mode = "general_fresh"
+                model_label = GENERAL_MODEL_NAME
+                logger.info("[Chat/send] → general_fresh (search grounding)")
+                result = call_gemini_general_with_search(
+                    message,
+                    history=[h.model_dump() for h in req.history],
+                    conversation_summary=req.conversation_summary,
+                )
+                state["last_answer_mode"] = "general_fresh"
+                # Keep active_session_id — next turn returns to session first
+            else:
+                # ─── D. General static ───
+                mode = "general_static"
+                model_label = GENERAL_MODEL_NAME
+                logger.info("[Chat/send] → general_static")
+                turn_prompt = build_turn_prompt(
+                    message=message,
+                    mode=mode,
+                    contexts=[],
+                    history=[h.model_dump() for h in req.history],
+                    conversation_summary=req.conversation_summary,
+                    todo_context=todo_context_str,
+                )
+                result = call_gemini_general_chat(turn_prompt)
+                state["last_answer_mode"] = "general_static"
+                # Keep active_session_id — next turn returns to session first
+
     except Exception as e:
         t_fail = time.monotonic()
-        logger.error(f"[Chat/send] Gemini failed after {(t_fail - t_gemini_start)*1000:.0f}ms: {e}")
+        fail_ms = int((t_fail - t_gemini_start) * 1000)
+        logger.error(f"[Chat/send] Gemini failed after {fail_ms}ms: {e}")
+        try:
+            log_ai_chat(
+                uid=user.uid,
+                mode=mode,
+                model=model_label,
+                credit_cost=0,
+                credits_remaining=0,
+                latency_ms=fail_ms,
+                session_ids=[active_session_id] if active_session_id else None,
+                endpoint="chat/send",
+                error_message=str(e)[:200],
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
 
     t_end = time.monotonic()
-    total_ms = (t_end - t0) * 1000
-    gemini_ms = (t_end - t_gemini_start) * 1000
-    answer_len = len(result.get("answer", ""))
-    answer_text = result.get("answer", "")
+
+    # ── 7.5. Consume AI credits ──
+    credit_cost = estimate_cost(mode)
+    credits_remaining = None
+
+    allowed, credit_info = ai_credits.can_consume(account_id, credit_cost)
+    if not allowed:
+        reason = credit_info.get("reason", "credit_limit")
+        remaining = credit_info.get("remaining", 0)
+        logger.warning(f"[Chat/send] Credit blocked: {reason} account={account_id} cost={credit_cost} remaining={remaining}")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": reason,
+                "credit_cost": credit_cost,
+                "credits_remaining": remaining,
+                "daily_used": credit_info.get("dailyUsed", 0),
+                "daily_soft_cap": credit_info.get("dailySoftCap", 20),
+            },
+        )
+
+    consume_ok, consume_info = ai_credits.consume(account_id, credit_cost, mode)
+    if consume_ok:
+        credits_remaining = consume_info.get("remaining", 0)
+        logger.info(f"[Chat/send] Credits consumed: cost={credit_cost} remaining={credits_remaining} mode={mode}")
+    else:
+        # Race condition — passed pre-check but failed consume
+        logger.warning(f"[Chat/send] Credit consume race: {consume_info}")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": consume_info.get("reason", "credit_limit"),
+                "credit_cost": credit_cost,
+                "credits_remaining": consume_info.get("remaining", 0),
+            },
+        )
+
+    # ── 8. Update topic in state ──
+    state["last_topic"] = extract_topic(message)
+    if want_todo and todo_context_str:
+        state["last_referenced_entity_type"] = "todo"
+
+    # ── 9. Build display_scope ──
+    used_sessions_list = result.get("used_sessions", [])
+
+    if todo_context_str and used_sessions_list:
+        display_scope = "TODOの出典セッションを参照して回答"
+    elif todo_context_str:
+        display_scope = "TODOリストを参照して回答"
+    elif mode == "session_grounded" and used_sessions_list:
+        display_scope = None  # UI shows session names
+    elif mode == "session_plus_general":
+        display_scope = "セッションを参考に回答"
+    elif mode == "general_fresh":
+        display_scope = "公開情報を確認して回答"
+    elif mode == "general_static":
+        display_scope = "一般知識に基づいて回答"
+    else:
+        display_scope = None
+
+    answer = result.get("answer", "")
+    latency_ms = int((t_end - t0) * 1000)
     logger.info(
-        f"[Chat/send] DONE uid={user.uid} total={total_ms:.0f}ms gemini={gemini_ms:.0f}ms "
-        f"mode={result.get('mode', mode)} confidence={result.get('confidence', 0)} "
-        f"answer_len={answer_len} used_sessions={len(result.get('used_sessions', []))} "
-        f"citations={len(result.get('citations', []))}"
+        f"[Chat/send] DONE uid={user.uid} model={model_label} mode={mode} "
+        f"total={latency_ms}ms gemini={(t_end - t_gemini_start)*1000:.0f}ms "
+        f"answer_len={len(answer)}"
     )
-    logger.info(f"[Chat/send] A: \"{answer_text}\"")
-    logger.info(
-        f"[Chat/send] Full response: used_sessions={result.get('used_sessions', [])} "
-        f"follow_up={result.get('follow_up_suggestion', '')} "
-        f"summary_next={result.get('conversation_summary_next', '')}"
-    )
+    logger.info(f"[Chat/send] A: \"{answer[:300]}\"")
+    logger.info(f"[Chat/send] Updated state: {state}")
+
+    # ── Structured ops log ──
+    try:
+        log_ai_chat(
+            uid=user.uid,
+            mode=mode,
+            model=model_label,
+            credit_cost=credit_cost,
+            credits_remaining=credits_remaining or 0,
+            latency_ms=latency_ms,
+            session_ids=[active_session_id] if active_session_id else None,
+            used_search=(mode == "general_fresh"),
+            scope_score=None,  # not easily available here without refactor
+            fallback_reason=(
+                "no_session" if not session_context
+                else "low_score" if not session_answerable
+                else None
+            ),
+            input_tokens=result.get("_input_tokens"),
+            output_tokens=result.get("_output_tokens"),
+            answer_len=len(answer),
+            endpoint="chat/send",
+        )
+    except Exception as e:
+        logger.warning(f"[Chat/send] OpsLog failed: {e}")
 
     return ChatResponse(
-        answer=result.get("answer", ""),
-        mode=result.get("mode", mode),
-        used_sessions=[
-            UsedSession(**s) for s in result.get("used_sessions", [])
-        ],
-        citations=[
-            Citation(**c) for c in result.get("citations", [])
-        ],
+        answer=answer,
+        mode=mode,
+        used_sessions=[UsedSession(**s) for s in used_sessions_list],
+        citations=[Citation(**c) for c in result.get("citations", [])],
         confidence=result.get("confidence", 0.0),
         needs_general_knowledge=result.get("needs_general_knowledge", mode != "session_grounded"),
         follow_up_suggestion=result.get("follow_up_suggestion"),
         conversation_summary_next=result.get("conversation_summary_next"),
-        used_search=False,
+        used_search=result.get("used_search", mode == "general_fresh"),
+        used_model=model_label,
+        display_scope=display_scope,
+        conversation_state=state,
+        credit_cost=credit_cost,
+        credits_remaining=credits_remaining,
     )
 
+
+# ---------------------------------------------------------------------------
+# AI Credits
+# ---------------------------------------------------------------------------
+
+class CreditReport(BaseModel):
+    plan: str
+    monthly_limit: int
+    topup_credits: int
+    used: int
+    remaining: int
+    daily_used: int
+    daily_soft_cap: int
+
+
+@router.get("/credits", response_model=CreditReport)
+async def get_credits(
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Get AI credit status for the current user."""
+    report = ai_credits.get_credit_report(user.account_id)
+    return CreditReport(
+        plan=report["plan"],
+        monthly_limit=report["monthlyLimit"],
+        topup_credits=report["topupCredits"],
+        used=report["used"],
+        remaining=report["remaining"],
+        daily_used=report["dailyUsed"],
+        daily_soft_cap=report["dailySoftCap"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming endpoint (SSE)
+# ---------------------------------------------------------------------------
+
+def _sse(event_type: str, data: dict) -> str:
+    """Format a single SSE event line."""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.post("/stream")
+async def chat_stream(
+    req: ChatRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Stream a chat response using SSE — session-first every turn.
+
+    Events:
+      meta   — mode, model, used_sessions, display_scope, credit info
+      token  — text fragment
+      done   — full_text, conversation_state, follow_up_suggestion
+      error  — message
+    """
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is empty")
+    if len(message) > 2000:
+        raise HTTPException(status_code=400, detail="Message too long (max 2000 chars)")
+
+    t0 = time.monotonic()
+    account_id = user.account_id
+
+    # ── 1. Restore conversation state ──
+    state = dict(req.conversation_state or {})
+    if req.current_session_id:
+        state["active_session_id"] = req.current_session_id
+
+    logger.info(f"[Chat/stream] START uid={user.uid} scope={req.ui_scope} msg_len={len(message)}")
+
+    # ── 2. Pre-check AI credits ──
+    pre_allowed, pre_info = ai_credits.can_consume(account_id, 1)
+    if not pre_allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": pre_info.get("reason", "credit_limit"),
+                "credits_remaining": pre_info.get("remaining", 0),
+            },
+        )
+
+    # ── 3. Resolve referent / TODO / active session ──
+    referent = resolve_referent(message, state)
+
+    todos_raw = []
+    todo_context_str = None
+    todo_ref = None
+    want_todo = is_todo_intent(message)
+
+    if want_todo or state.get("active_todo_id"):
+        todos_raw = _fetch_user_todos(user)
+        if want_todo:
+            todo_context_str = build_todo_context(todos_raw)
+
+    if todos_raw:
+        todo_ref = resolve_todo_aware(message, state, todos_raw)
+
+    # ── 4. Determine active_session_id ──
+    active_session_id = None
+
+    if todo_ref and todo_ref.get("session_id"):
+        active_session_id = todo_ref["session_id"]
+        state["active_todo_id"] = todo_ref.get("todo_id")
+        state["active_session_id"] = active_session_id
+        state["active_session_title"] = todo_ref.get("session_title")
+    elif referent and referent.get("entity_type") == "session":
+        active_session_id = referent["entity_id"]
+    else:
+        active_session_id = state.get("active_session_id")
+
+    # ── 5. Load session context ──
+    session_context = None
+    if active_session_id:
+        session_context = _load_session_context(active_session_id, message, user)
+
+    # ── 6. Session answerability ──
+    session_answerable = False
+    suggested_mode = "general_static"
+
+    if session_context:
+        if req.ui_scope == "session_detail" and req.current_session_id:
+            session_answerable = True
+            suggested_mode = "session_grounded"
+        elif referent and referent.get("entity_type") == "session":
+            session_answerable = True
+            suggested_mode = "session_grounded"
+        else:
+            session_answerable, suggested_mode = can_answer_from_session(
+                message, session_context, state
+            )
+
+    # ── 7. Determine route ──
+    mode = suggested_mode
+    model_label = ""
+    contexts = []
+    use_search = False
+
+    if session_answerable and session_context:
+        contexts = [session_context]
+        mode = suggested_mode
+        model_label = CHAT_MODEL_NAME if mode == "session_grounded" else GENERAL_MODEL_NAME
+    elif not active_session_id and has_session_intent(message):
+        logger.info(f"[Chat/stream] Session intent detected, auto-resolving for uid={user.uid} account={user.account_id}")
+        session_ids = _auto_resolve_sessions(user, message)
+        contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+        if contexts:
+            mode = "session_plus_general"
+            model_label = GENERAL_MODEL_NAME
+        else:
+            logger.warning(f"[Chat/stream] Auto-resolve found 0 contexts (session_ids={session_ids})")
+    # Will be set below if still unresolved
+
+    if not contexts and not (session_answerable and session_context):
+        if needs_fresh_grounding(message):
+            mode = "general_fresh"
+            model_label = GENERAL_MODEL_NAME
+            use_search = True
+        else:
+            mode = "general_static"
+            model_label = GENERAL_MODEL_NAME
+
+    if not model_label:
+        model_label = GENERAL_MODEL_NAME
+
+    # ── 8. Credit check + consume ──
+    credit_cost = estimate_cost(mode)
+    allowed, credit_info = ai_credits.can_consume(account_id, credit_cost)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": credit_info.get("reason", "credit_limit"),
+                "credit_cost": credit_cost,
+                "credits_remaining": credit_info.get("remaining", 0),
+            },
+        )
+
+    consume_ok, consume_info = ai_credits.consume(account_id, credit_cost, mode)
+    if not consume_ok:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": consume_info.get("reason", "credit_limit"),
+                "credit_cost": credit_cost,
+                "credits_remaining": consume_info.get("remaining", 0),
+            },
+        )
+    credits_remaining = consume_info.get("remaining", 0)
+
+    # ── 9. Build display scope ──
+    used_sessions_list = [{"session_id": c["session_id"], "title": c["title"]} for c in contexts]
+
+    if todo_context_str and used_sessions_list:
+        display_scope = "TODOの出典セッションを参照して回答"
+    elif todo_context_str:
+        display_scope = "TODOリストを参照して回答"
+    elif mode == "session_grounded" and used_sessions_list:
+        display_scope = None
+    elif mode == "session_plus_general":
+        display_scope = "セッションを参考に回答"
+    elif mode == "general_fresh":
+        display_scope = "公開情報を確認して回答"
+    elif mode == "general_static":
+        display_scope = "一般知識に基づいて回答"
+    else:
+        display_scope = None
+
+    # ── 10. Build prompt ──
+    history_dicts = [h.model_dump() for h in req.history]
+    turn_prompt = build_stream_prompt(
+        message=message,
+        mode=mode,
+        contexts=contexts,
+        history=history_dicts,
+        conversation_summary=req.conversation_summary,
+        todo_context=todo_context_str,
+    )
+
+    logger.info(
+        f"[Chat/stream] Route: mode={mode} model={model_label} search={use_search} "
+        f"sessions={len(contexts)} credit_cost={credit_cost}"
+    )
+
+    # ── 11. Stream response ──
+    def event_stream():
+        # Meta event (first)
+        yield _sse("meta", {
+            "mode": mode,
+            "model": model_label,
+            "used_search": use_search,
+            "used_sessions": used_sessions_list,
+            "display_scope": display_scope,
+            "credit_cost": credit_cost,
+            "credits_remaining": credits_remaining,
+        })
+
+        full_text = ""
+        try:
+            if use_search:
+                gen = stream_gemini_with_search(turn_prompt)
+            else:
+                gen = stream_gemini_chat(turn_prompt, model_name=model_label)
+
+            for piece in gen:
+                full_text += piece
+                yield _sse("token", {"text": piece})
+
+        except Exception as e:
+            logger.error(f"[Chat/stream] Gemini error: {e}", exc_info=True)
+            # Refund credit on failure
+            ai_credits.refund(account_id, credit_cost, mode)
+            try:
+                log_ai_chat(
+                    uid=user.uid,
+                    mode=mode,
+                    model=model_label,
+                    credit_cost=0,
+                    credits_remaining=credits_remaining,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    session_ids=[c["session_id"] for c in contexts] if contexts else None,
+                    used_search=use_search,
+                    endpoint="chat/stream",
+                    error_message=str(e)[:200],
+                )
+            except Exception:
+                pass
+            yield _sse("error", {"message": "AI service temporarily unavailable"})
+            return
+
+        # Update conversation state
+        if contexts:
+            state["active_session_id"] = contexts[0].get("session_id")
+            state["active_session_title"] = contexts[0].get("title")
+            state["last_referenced_entity_type"] = "session"
+            state["last_referenced_entity_id"] = contexts[0].get("session_id")
+        state["last_answer_mode"] = mode
+        state["last_topic"] = extract_topic(message)
+        if want_todo and todo_context_str:
+            state["last_referenced_entity_type"] = "todo"
+
+        t_end = time.monotonic()
+        stream_latency_ms = int((t_end - t0) * 1000)
+        logger.info(
+            f"[Chat/stream] DONE uid={user.uid} mode={mode} model={model_label} "
+            f"total={stream_latency_ms}ms answer_len={len(full_text)}"
+        )
+
+        # Structured ops log
+        try:
+            log_ai_chat(
+                uid=user.uid,
+                mode=mode,
+                model=model_label,
+                credit_cost=credit_cost,
+                credits_remaining=credits_remaining,
+                latency_ms=stream_latency_ms,
+                session_ids=[c["session_id"] for c in contexts] if contexts else None,
+                used_search=use_search,
+                fallback_reason=(
+                    "no_session" if not session_context
+                    else "low_score" if not session_answerable
+                    else None
+                ),
+                answer_len=len(full_text),
+                endpoint="chat/stream",
+            )
+        except Exception as e:
+            logger.warning(f"[Chat/stream] OpsLog failed: {e}")
+
+        # Generate conversation summary for next turn continuity
+        summary_next = f"ユーザー: {message[:100]}。回答: {full_text[:200]}"
+
+        # Done event (last)
+        yield _sse("done", {
+            "full_text": full_text,
+            "conversation_state": state,
+            "conversation_summary_next": summary_next,
+            "credits_remaining": credits_remaining,
+        })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Suggestions
+# ---------------------------------------------------------------------------
 
 @router.get("/suggestions", response_model=SuggestionResponse)
 async def get_suggestions(
     session_id: Optional[str] = None,
     user: CurrentUser = Depends(get_current_user),
 ):
-    """Get suggestion chips for the chat input."""
     if session_id:
         return SuggestionResponse(chips=[
             "この会議の要点を教えて",
             "決定事項を抽出して",
             "TODOを整理して",
             "内容を簡単に説明して",
-            "一般的に補足して",
         ])
     else:
         return SuggestionResponse(chips=[
@@ -409,7 +960,7 @@ async def get_suggestions(
 
 
 # ---------------------------------------------------------------------------
-# Candidate Resolution Models
+# Candidate Resolution
 # ---------------------------------------------------------------------------
 
 class CandidateRequest(BaseModel):
@@ -426,42 +977,29 @@ class CandidateSession(BaseModel):
 
 class CandidateResponse(BaseModel):
     candidates: List[CandidateSession]
-    status: str = "ok"  # "ok" | "searching" | "no_match"
+    status: str = "ok"
 
-
-# ---------------------------------------------------------------------------
-# Candidate Resolution Endpoint
-# ---------------------------------------------------------------------------
 
 @router.post("/candidates", response_model=CandidateResponse)
 async def resolve_candidates(
     req: CandidateRequest,
     user: CurrentUser = Depends(get_current_user),
 ):
-    """Resolve candidate sessions for a chat query.
-    Lightweight search — no AI, just Firestore query + keyword scoring."""
+    """Resolve candidate sessions for a chat query."""
     query = req.query.strip()
     if not query:
-        logger.debug("[Chat/candidates] Empty query, returning no_match")
         return CandidateResponse(candidates=[], status="no_match")
 
     t0 = time.monotonic()
-    logger.info(
-        f"[Chat/candidates] START uid={user.uid} query=\"{query[:80]}\" "
-        f"current_session={req.current_session_id} limit={req.limit}"
-    )
 
     try:
-        # Fetch recent sessions (owner only for speed)
         sessions_ref = db.collection("sessions")
         try:
             q = sessions_ref.where("ownerUid", "==", user.uid)
             q = q.order_by("createdAt", direction="DESCENDING")
             q = q.limit(50)
             docs = list(q.stream())
-        except Exception as idx_err:
-            # Fallback: index may not exist yet — query without order_by
-            logger.warning(f"[Chat/candidates] Index query failed, using fallback: {idx_err}")
+        except Exception:
             q = sessions_ref.where("ownerUid", "==", user.uid).limit(100)
             _epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
             docs = sorted(
@@ -474,83 +1012,43 @@ async def resolve_candidates(
         query_tokens = set(query_lower.replace("?", "").replace("？", "").split())
 
         scored = []
-        doc_count = 0
         for doc in docs:
-            doc_count += 1
             data = doc.to_dict()
             sid = doc.id
             title = data.get("title") or "無題"
             summary = data.get("summaryMarkdown") or data.get("topicSummary") or ""
             tags = data.get("tags") or []
-            mode = data.get("mode", "lecture")
-            started_at = data.get("startedAt")
 
-            # Score: title match (heavy), summary match, tag match
             score = 0.0
             title_lower = title.lower()
 
-            # Exact substring match in title
             if query_lower in title_lower:
                 score += 10.0
-
-            # Token matches in title
             for t in query_tokens:
                 if len(t) >= 2 and t in title_lower:
                     score += 3.0
-
-            # Token matches in summary
             summary_lower = summary.lower()
             for t in query_tokens:
                 if len(t) >= 2 and t in summary_lower:
                     score += 1.0
-
-            # Tag matches
             for tag in tags:
                 if query_lower in tag.lower():
                     score += 5.0
-                for t in query_tokens:
-                    if len(t) >= 2 and t in tag.lower():
-                        score += 2.0
 
-            # Date hint matching (e.g., "3/11", "昨日")
-            if started_at:
-                started_str = str(started_at)
-                for t in query_tokens:
-                    if t in started_str:
-                        score += 4.0
-
-            # Boost if this is the current session
-            if req.current_session_id and sid == req.current_session_id:
-                score += 5.0
-
-            # Only include if some relevance
             if score > 0:
+                started_at = data.get("startedAt")
                 scored.append(CandidateSession(
                     session_id=sid,
                     title=title,
                     started_at=started_at.isoformat() if hasattr(started_at, 'isoformat') else str(started_at) if started_at else None,
-                    mode=mode,
+                    mode=data.get("mode", "lecture"),
                     score=score,
                 ))
 
-        # Sort by score descending
         scored.sort(key=lambda x: -x.score)
         candidates = scored[:req.limit]
-
-        status = "ok" if candidates else "no_match"
-        t_end = time.monotonic()
-
-        top_candidates = [(c.session_id, c.title[:30], c.score) for c in candidates[:3]]
-        logger.info(
-            f"[Chat/candidates] DONE uid={user.uid} query=\"{query[:40]}\" "
-            f"scanned={doc_count} scored={len(scored)} returned={len(candidates)} "
-            f"status={status} tokens={query_tokens} "
-            f"top={top_candidates} ({(t_end - t0)*1000:.0f}ms)"
-        )
-
-        return CandidateResponse(candidates=candidates, status=status)
+        return CandidateResponse(candidates=candidates, status="ok" if candidates else "no_match")
 
     except Exception as e:
-        logger.error(f"[Chat/candidates] Failed: uid={user.uid} query=\"{query[:80]}\" error={e}", exc_info=True)
-        # Graceful fallback — don't fail the UX
+        logger.error(f"[Chat/candidates] Failed: {e}", exc_info=True)
         return CandidateResponse(candidates=[], status="no_match")

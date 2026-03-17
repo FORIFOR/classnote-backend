@@ -1,6 +1,7 @@
 """Context builder — prepares session data for Gemini prompt."""
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("app.services.context_builder")
@@ -167,9 +168,18 @@ def build_turn_prompt(
         todo_section = f"""
 [user_todos]
 {todo_context}
+
+※ TODOをリストアップする際、ユーザーが「期限順」「期限が近い順」と指示した場合は dueDate の昇順で並べてください。
+※ リストアップ時は必ず「1. 」「2. 」のように番号を付けてください。
 """
 
-    return f"""[conversation_summary]
+    # Detect answer language from user message
+    answer_lang = "日本語" if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", message) else "English"
+
+    return f"""[answer_language]
+{answer_lang}
+
+[conversation_summary]
 {summary_text}
 
 [chat_mode]
@@ -185,6 +195,72 @@ def build_turn_prompt(
 {message}
 
 [output_rule]
-JSONのみを返してください。markdown記法は answer フィールド内で使用可能です。
+JSONのみを返してください。
+answer フィールド内では Markdown 記法（#, *, **など）を使わないでください。
+箇条書きは「・」を使い、順序付きリストは「1. 」「2. 」のように番号を付けてください。見出しは短い自然文で書いて空行で区切ってください。
 follow_up_suggestion には次に聞けそうな提案を1つ必ず入れてください。
-conversation_summary_next にはこの会話の要約を1〜2文で入れてください。"""
+conversation_summary_next にはこの会話の要約を1〜2文で入れてください。
+最終回答（answer フィールド）は必ず{answer_lang}で返してください。参照元が他の言語でも回答は{answer_lang}です。"""
+
+
+def build_stream_prompt(
+    message: str,
+    mode: str,
+    contexts: List[dict],
+    history: List[dict],
+    conversation_summary: Optional[str] = None,
+    todo_context: Optional[str] = None,
+) -> str:
+    """Build prompt for streaming (plain text output, no JSON)."""
+    summary_text = conversation_summary if conversation_summary else "(初回の質問)"
+
+    history_lines = []
+    for m in history[-6:]:
+        role = m.get("role", "user")
+        text = m.get("text", "")
+        history_lines.append(f"{role}: {text}")
+    history_text = "\n".join(history_lines) if history_lines else "(なし)"
+
+    if contexts:
+        context_parts = []
+        for c in contexts:
+            part = f"[session_id={c['session_id']}]\n"
+            part += f"title: {c['title']}\n"
+            if c.get('summary'):
+                part += f"summary:\n{c['summary']}\n"
+            if c.get('transcript_excerpt'):
+                part += f"transcript_excerpt:\n{c['transcript_excerpt']}"
+            context_parts.append(part)
+        context_text = "\n\n".join(context_parts)
+    else:
+        context_text = "(セッション文脈なし)"
+
+    todo_section = ""
+    if todo_context:
+        todo_section = f"\n[user_todos]\n{todo_context}\n※ TODOをリストアップする際、ユーザーが「期限順」「期限が近い順」と指示した場合は dueDate の昇順で並べてください。\n※ リストアップ時は必ず「1. 」「2. 」のように番号を付けてください。\n"
+
+    answer_lang = "日本語" if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", message) else "English"
+
+    return f"""[answer_language]
+{answer_lang}
+
+[conversation_summary]
+{summary_text}
+
+[chat_mode]
+{mode}
+{todo_section}
+[chat_history]
+{history_text}
+
+[session_context]
+{context_text}
+
+[user_question]
+{message}
+
+[output_rule]
+回答は{answer_lang}で返してください。
+Markdown記法（#, *, **など）は使わないでください。
+箇条書きは「・」を使い、順序付きリストは「1. 」「2. 」のように番号を付けてください。見出しは短い自然文で書いて空行で区切ってください。
+簡潔で実用的に、読みやすい改行で構成してください。"""
