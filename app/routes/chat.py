@@ -20,20 +20,22 @@ from app.services.scope_resolver import (
     resolve_referent,
     resolve_todo_aware,
     can_answer_from_session,
-    needs_fresh_grounding,
     is_todo_intent,
     has_session_intent,
     extract_topic,
+    needs_fresh_grounding,
 )
-from app.services.context_builder import build_session_context, build_turn_prompt, build_stream_prompt, build_todo_context
+from app.services.chat_router import classify_route, judge_sufficiency, route_to_legacy_mode, get_display_scope, RouteDecision
+from app.services.context_builder import build_session_context, build_turn_prompt, build_stream_prompt, build_todo_context, build_hybrid_prompt
 from app.services.gemini_chat import (
     call_gemini_chat,
     call_gemini_general_chat,
     call_gemini_general_with_search,
+    call_gemini_search_hybrid,
     CHAT_MODEL_NAME,
     GENERAL_MODEL_NAME,
 )
-from app.services.gemini_stream import stream_gemini_chat, stream_gemini_with_search
+from app.services.gemini_stream import stream_gemini_chat, stream_gemini_with_search, stream_gemini_search_hybrid
 from app.services.ai_credits import ai_credits, estimate_cost
 from app.services.ops_logger import log_ai_chat
 
@@ -181,17 +183,72 @@ def _fetch_user_todos(user, limit: int = 30) -> list:
         return []
 
 
-def _auto_resolve_sessions(user, message: str, limit: int = 5) -> list:
+def _clean_session_title(title: str) -> str:
+    """Strip date/time prefix like '3/14 02:34_' from session titles."""
+    import re as _re
+    # Matches patterns like "3/14 02:34_", "3/16 18:14_- "
+    cleaned = _re.sub(r"^\d{1,2}/\d{1,2}\s+\d{2}:\d{2}_[-\s]*", "", title)
+    return cleaned.strip()
+
+
+def _match_sessions_to_text(
+    sessions: list, user_query: str, answer_text: str
+) -> list:
+    """Match sessions to user query and answer text.
+
+    Strategy:
+    1. Check if user query contains distinctive keywords from session titles
+       (user explicitly asked about a specific session) → return those.
+    2. If no query match, return [] and let caller fall back to all sessions.
+       Answer-text matching is too unreliable for Japanese (common words cause
+       false positives).
+    """
+    import re as _re
+
+    query_lower = user_query.lower()
+    query_matched = []
+
+    for s in sessions:
+        title = s.get("title", "")
+        if not title or len(title) < 3:
+            continue
+
+        cleaned_title = _clean_session_title(title)
+        # Split on Japanese/general punctuation for chunks
+        chunks = _re.split(r"[、。：:／/\s　\-–—]+", cleaned_title)
+        # Only keep distinctive chunks (4+ chars to avoid common word matches)
+        chunks = [c for c in chunks if len(c) >= 4]
+
+        # Also use cleaned title as whole for short titles like "デジマースミーティング"
+        if len(cleaned_title) >= 4:
+            chunks.append(cleaned_title)
+
+        if any(c.lower() in query_lower for c in chunks):
+            query_matched.append(s)
+
+    if query_matched:
+        logger.info(
+            f"[_match_sessions] Query matched {len(query_matched)} sessions: "
+            f"{[s.get('title', '?')[:30] for s in query_matched]}"
+        )
+        return query_matched
+
+    # No query match → return empty; caller will fall back to all context sessions
+    return []
+
+
+def _auto_resolve_sessions(user, message: str, limit: int = 20) -> list:
     """Fetch recent session IDs for cold-start queries."""
     try:
         _epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        fetch_limit = max(limit * 2, 60)
 
         try:
             q = (
                 db.collection("sessions")
                 .where("ownerUid", "==", user.uid)
                 .order_by("createdAt", direction="DESCENDING")
-                .limit(30)
+                .limit(fetch_limit)
             )
             docs = list(q.stream())
         except Exception:
@@ -201,7 +258,7 @@ def _auto_resolve_sessions(user, message: str, limit: int = 5) -> list:
                 key=lambda d: d.to_dict().get("createdAt") or d.to_dict().get("startedAt") or _epoch,
                 reverse=True,
             )
-            docs = docs[:30]
+            docs = docs[:fetch_limit]
 
         seen_ids = {d.id for d in docs}
         if hasattr(user, "account_id") and user.account_id and user.account_id != user.uid:
@@ -353,123 +410,168 @@ async def send_chat(
             },
         )
 
-    # ── 6. Check session answerability (session-first!) ──
-    session_answerable = False
-    suggested_mode = "general_static"
+    # ── 6. 2-stage intent routing ──
+    contexts = [session_context] if session_context else []
+    mode = "general_static"
+    model_label = GENERAL_MODEL_NAME
 
+    # Gather session titles for classifier context
+    all_session_titles = []
     if session_context:
-        # If UI explicitly selected this session, force session_grounded
-        if req.ui_scope == "session_detail" and req.current_session_id:
-            session_answerable = True
-            suggested_mode = "session_grounded"
-            logger.info("[Chat/send] UI session_detail → forced session_grounded")
-        # If referent explicitly points to session, force answerable
-        elif referent and referent.get("entity_type") == "session":
-            session_answerable = True
-            suggested_mode = "session_grounded"
-            logger.info("[Chat/send] Referent → forced session_grounded")
-        else:
-            session_answerable, suggested_mode = can_answer_from_session(
-                message, session_context, state
-            )
+        all_session_titles.append(session_context.get("title", ""))
 
-    # ── 7. Route — session first, general fallback ──
+    # Stage 1: Classify intent
+    route = classify_route(
+        message=message,
+        session_titles=all_session_titles if all_session_titles else None,
+        has_active_session=session_context is not None,
+        conversation_context=state.get("active_session_title", ""),
+    )
+    logger.info(f"[Chat/send] Route: {route}")
+
+    # UI explicitly selected session → force session_only
+    if req.ui_scope == "session_detail" and req.current_session_id and session_context:
+        route.mode = "session_only"
+        route.needs_session = True
+        route.needs_web = False
+        logger.info("[Chat/send] UI session_detail → forced session_only")
+    elif referent and referent.get("entity_type") == "session" and session_context:
+        route.mode = "session_only"
+        route.needs_session = True
+        logger.info("[Chat/send] Referent → forced session_only")
+
+    # ── 7. Route — 2-stage: session retrieval + sufficiency check ──
     t_gemini_start = time.monotonic()
     result = None
-    mode = suggested_mode
-    model_label = ""
+    sufficiency = None
+    display_scope = get_display_scope(route)
 
     try:
-        if session_answerable and session_context:
-            # ─── A. Session-first: answer from session ───
-            contexts = [session_context]
-            mode = suggested_mode
+        # ─── A. web_only: go straight to search grounding ───
+        if route.mode == "web_only":
+            mode = "general_fresh"
+            model_label = GENERAL_MODEL_NAME
+            display_scope = get_display_scope(route)
+            logger.info("[Chat/send] → web_only (search grounding)")
+            result = call_gemini_general_with_search(
+                message,
+                history=[h.model_dump() for h in req.history],
+                conversation_summary=req.conversation_summary,
+            )
+            state["last_answer_mode"] = "general_fresh"
 
+        # ─── B. session_only / session_then_web: need session context ───
+        elif route.needs_session:
+            # Load session if not yet loaded
+            contexts = []
+            if session_context:
+                contexts = [session_context]
+            elif has_session_intent(message) or req.recent_session_ids:
+                if req.recent_session_ids:
+                    session_ids = req.recent_session_ids[:20]
+                else:
+                    session_ids = _auto_resolve_sessions(user, message)
+                contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+
+            # Stage 2: Judge sufficiency
+            if contexts:
+                sufficiency = judge_sufficiency(message, contexts[0])
+                display_scope = get_display_scope(route, sufficiency)
+                logger.info(f"[Chat/send] Sufficiency: answerable={sufficiency.answerable} conf={sufficiency.confidence:.2f} web_needed={sufficiency.needs_web_verification}")
+
+                # Decide: session-only or session+web
+                if route.mode == "session_only" and sufficiency.answerable:
+                    # Pure session answer
+                    mode = "session_grounded"
+                    model_label = CHAT_MODEL_NAME
+                    turn_prompt = build_turn_prompt(
+                        message=message, mode=mode, contexts=contexts,
+                        history=[h.model_dump() for h in req.history],
+                        conversation_summary=req.conversation_summary,
+                        todo_context=todo_context_str,
+                    )
+                    logger.info(f"[Chat/send] → session_only (sufficient)")
+                    result = call_gemini_chat(turn_prompt)
+
+                elif route.mode == "session_then_web" or (route.mode == "session_only" and not sufficiency.answerable):
+                    # Session + web supplementation
+                    if sufficiency.answerable and not sufficiency.needs_web_verification:
+                        # Session is enough after all
+                        mode = "session_grounded"
+                        model_label = CHAT_MODEL_NAME
+                        turn_prompt = build_turn_prompt(
+                            message=message, mode=mode, contexts=contexts,
+                            history=[h.model_dump() for h in req.history],
+                            conversation_summary=req.conversation_summary,
+                            todo_context=todo_context_str,
+                        )
+                        logger.info(f"[Chat/send] → session_then_web → sufficient, session_grounded")
+                        result = call_gemini_chat(turn_prompt)
+                    else:
+                        # Need web supplementation
+                        mode = "general_fresh"
+                        model_label = GENERAL_MODEL_NAME
+                        display_scope = "この会議 + 最新Web情報"
+                        # Build prompt with session context + web search
+                        session_summary = "\n".join([
+                            f"【{c.get('title', '')}】{c.get('summary', '')[:500]}"
+                            for c in contexts
+                        ])
+                        augmented_message = (
+                            f"以下は関連する会議の内容です:\n{session_summary}\n\n"
+                            f"この情報を踏まえて、以下の質問に答えてください。"
+                            f"会議内容で答えられる部分はそれを使い、最新情報が必要な部分はWeb検索で補強してください。\n\n"
+                            f"質問: {message}"
+                        )
+                        logger.info(f"[Chat/send] → session_then_web → web supplementation")
+                        result = call_gemini_general_with_search(
+                            augmented_message,
+                            history=[h.model_dump() for h in req.history],
+                            conversation_summary=req.conversation_summary,
+                        )
+
+                # Update state
+                if contexts:
+                    if len(contexts) == 1:
+                        state["active_session_id"] = contexts[0].get("session_id") or active_session_id
+                        state["active_session_title"] = contexts[0].get("title")
+                    else:
+                        state.pop("active_session_id", None)
+                        state.pop("active_session_title", None)
+                    state["last_referenced_entity_type"] = "session"
+                state["last_answer_mode"] = mode if result else "general_static"
+            else:
+                logger.info("[Chat/send] No session contexts found, falling through to general")
+
+        # ─── C. general_static ───
+        if result is None and route.mode == "general_static":
+            mode = "general_static"
+            model_label = GENERAL_MODEL_NAME
+            display_scope = "一般知識"
+            logger.info("[Chat/send] → general_static")
             turn_prompt = build_turn_prompt(
-                message=message,
-                mode=mode,
-                contexts=contexts,
+                message=message, mode=mode, contexts=[],
                 history=[h.model_dump() for h in req.history],
                 conversation_summary=req.conversation_summary,
                 todo_context=todo_context_str,
             )
-            logger.info(f"[Chat/send] Prompt: {len(turn_prompt)} chars")
+            result = call_gemini_general_chat(turn_prompt)
+            state["last_answer_mode"] = "general_static"
 
-            if mode == "session_grounded":
-                model_label = CHAT_MODEL_NAME
-                logger.info("[Chat/send] → session_grounded (session model)")
-                result = call_gemini_chat(turn_prompt)
-            else:
-                model_label = GENERAL_MODEL_NAME
-                logger.info("[Chat/send] → session_plus_general (general model + session ctx)")
-                result = call_gemini_general_chat(turn_prompt)
-
-            # Update state: session was used
-            state["active_session_id"] = active_session_id
-            state["active_session_title"] = session_context.get("title")
-            state["last_referenced_entity_type"] = "session"
-            state["last_referenced_entity_id"] = active_session_id
-            state["last_answer_mode"] = mode
-
-        elif not active_session_id and has_session_intent(message):
-            # ─── B. Cold start: auto-resolve sessions ───
-            logger.info(f"[Chat/send] Session intent detected, auto-resolving for uid={user.uid} account={user.account_id}")
-            session_ids = _auto_resolve_sessions(user, message)
-            contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
-
-            if contexts:
-                mode = "session_plus_general"
-                model_label = GENERAL_MODEL_NAME
-                turn_prompt = build_turn_prompt(
-                    message=message,
-                    mode=mode,
-                    contexts=contexts,
-                    history=[h.model_dump() for h in req.history],
-                    conversation_summary=req.conversation_summary,
-                    todo_context=todo_context_str,
-                )
-                logger.info(f"[Chat/send] → auto-resolve: {len(contexts)} sessions")
-            else:
-                logger.warning(f"[Chat/send] Auto-resolve found 0 contexts (session_ids={session_ids})")
-                result = call_gemini_general_chat(turn_prompt)
-
-                # Set first session as active
-                state["active_session_id"] = contexts[0].get("session_id")
-                state["active_session_title"] = contexts[0].get("title")
-                state["last_referenced_entity_type"] = "session"
-                state["last_referenced_entity_id"] = contexts[0].get("session_id")
-                state["last_answer_mode"] = mode
-
-        # ─── C/D. General fallback (only if not answered above) ───
+        # ─── D. Final fallback ───
         if result is None:
-            if needs_fresh_grounding(message):
-                # ─── C. General + search grounding ───
-                mode = "general_fresh"
-                model_label = GENERAL_MODEL_NAME
-                logger.info("[Chat/send] → general_fresh (search grounding)")
-                result = call_gemini_general_with_search(
-                    message,
-                    history=[h.model_dump() for h in req.history],
-                    conversation_summary=req.conversation_summary,
-                )
-                state["last_answer_mode"] = "general_fresh"
-                # Keep active_session_id — next turn returns to session first
-            else:
-                # ─── D. General static ───
-                mode = "general_static"
-                model_label = GENERAL_MODEL_NAME
-                logger.info("[Chat/send] → general_static")
-                turn_prompt = build_turn_prompt(
-                    message=message,
-                    mode=mode,
-                    contexts=[],
-                    history=[h.model_dump() for h in req.history],
-                    conversation_summary=req.conversation_summary,
-                    todo_context=todo_context_str,
-                )
-                result = call_gemini_general_chat(turn_prompt)
-                state["last_answer_mode"] = "general_static"
-                # Keep active_session_id — next turn returns to session first
+            mode = "general_static"
+            model_label = GENERAL_MODEL_NAME
+            display_scope = "一般知識"
+            logger.info("[Chat/send] → fallback general_static")
+            turn_prompt = build_turn_prompt(
+                message=message, mode=mode, contexts=[],
+                history=[h.model_dump() for h in req.history],
+                conversation_summary=req.conversation_summary,
+                todo_context=todo_context_str,
+            )
+            result = call_gemini_general_chat(turn_prompt)
+            state["last_answer_mode"] = "general_static"
 
     except Exception as e:
         t_fail = time.monotonic()
@@ -535,22 +637,25 @@ async def send_chat(
         state["last_referenced_entity_type"] = "todo"
 
     # ── 9. Build display_scope ──
-    used_sessions_list = result.get("used_sessions", [])
+    # Filter used_sessions: only include sessions that were actually in context
+    raw_used_sessions = result.get("used_sessions", [])
+    if mode in ("general_static", "general_fresh"):
+        # General mode — no session was referenced
+        used_sessions_list = []
+    elif contexts:
+        # Only keep sessions that were actually provided as context
+        context_ids = {c.get("session_id") for c in contexts}
+        used_sessions_list = [s for s in raw_used_sessions if s.get("session_id") in context_ids]
+    else:
+        used_sessions_list = []
+    logger.info(f"[Chat/send] used_sessions: raw={len(raw_used_sessions)} filtered={len(used_sessions_list)}")
 
+    # Override display_scope for special cases (TODO, etc.)
     if todo_context_str and used_sessions_list:
         display_scope = "TODOの出典セッションを参照して回答"
     elif todo_context_str:
         display_scope = "TODOリストを参照して回答"
-    elif mode == "session_grounded" and used_sessions_list:
-        display_scope = None  # UI shows session names
-    elif mode == "session_plus_general":
-        display_scope = "セッションを参考に回答"
-    elif mode == "general_fresh":
-        display_scope = "公開情報を確認して回答"
-    elif mode == "general_static":
-        display_scope = "一般知識に基づいて回答"
-    else:
-        display_scope = None
+    # Otherwise use the display_scope from the router (already set above)
 
     answer = result.get("answer", "")
     latency_ms = int((t_end - t0) * 1000)
@@ -736,38 +841,74 @@ async def chat_stream(
                 message, session_context, state
             )
 
-    # ── 7. Determine route ──
-    mode = suggested_mode
+    # ── 7. LLM-based route classification ──
+    freshness_hint = needs_fresh_grounding(message)
+    session_titles_hint = []
+    if session_context:
+        session_titles_hint.append(session_context.get("title", ""))
+
+    route = await classify_route(
+        message=message,
+        session_titles=session_titles_hint,
+        active_session_title=state.get("active_session_title"),
+        state=state,
+        freshness_hint=freshness_hint,
+        ui_scope=req.ui_scope,
+    )
+
+    # UI session_detail override
+    if req.ui_scope == "session_detail" and req.current_session_id and session_context:
+        if not route.needs_web:
+            route.mode = "session_only"
+            route.needs_session = True
+
+    mode = route_to_legacy_mode(route)
     model_label = ""
     contexts = []
-    use_search = False
+    use_search = route.needs_web
+    display_scope = get_display_scope(route)
 
-    if session_answerable and session_context:
-        contexts = [session_context]
-        mode = suggested_mode
-        model_label = CHAT_MODEL_NAME if mode == "session_grounded" else GENERAL_MODEL_NAME
-    elif not active_session_id and has_session_intent(message):
-        logger.info(f"[Chat/stream] Session intent detected, auto-resolving for uid={user.uid} account={user.account_id}")
-        session_ids = _auto_resolve_sessions(user, message)
-        contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+    if route.mode == "web_only":
+        model_label = GENERAL_MODEL_NAME
+    elif route.needs_session:
+        if session_context:
+            contexts = [session_context]
+        elif has_session_intent(message) or req.recent_session_ids:
+            if req.recent_session_ids:
+                session_ids = req.recent_session_ids[:50]
+            else:
+                session_ids = _auto_resolve_sessions(user, message)
+            contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+
         if contexts:
-            mode = "session_plus_general"
-            model_label = GENERAL_MODEL_NAME
-        else:
-            logger.warning(f"[Chat/stream] Auto-resolve found 0 contexts (session_ids={session_ids})")
-    # Will be set below if still unresolved
-
-    if not contexts and not (session_answerable and session_context):
-        if needs_fresh_grounding(message):
-            mode = "general_fresh"
-            model_label = GENERAL_MODEL_NAME
-            use_search = True
+            suff = judge_sufficiency(message, contexts[0])
+            if route.mode == "session_only" and suff.answerable:
+                mode = "session_grounded"
+                model_label = CHAT_MODEL_NAME
+                use_search = False
+                display_scope = "この会議"
+            elif route.mode == "session_then_web" or not suff.answerable:
+                mode = "general_fresh"
+                model_label = GENERAL_MODEL_NAME
+                use_search = True
+                display_scope = "この会議 + Web"
+            else:
+                mode = "session_plus_general"
+                model_label = GENERAL_MODEL_NAME
+                display_scope = "この会議"
         else:
             mode = "general_static"
             model_label = GENERAL_MODEL_NAME
+            display_scope = "一般知識"
+    else:
+        mode = "general_static"
+        model_label = GENERAL_MODEL_NAME
+        display_scope = "一般知識"
 
     if not model_label:
         model_label = GENERAL_MODEL_NAME
+
+    logger.info(f"[Chat/stream] Route: mode={mode} model={model_label} search={use_search} sessions={len(contexts)} display={display_scope}")
 
     # ── 8. Credit check + consume ──
     credit_cost = estimate_cost(mode)
@@ -795,7 +936,16 @@ async def chat_stream(
     credits_remaining = consume_info.get("remaining", 0)
 
     # ── 9. Build display scope ──
-    used_sessions_list = [{"session_id": c["session_id"], "title": c["title"]} for c in contexts]
+    # For meta event: only show definitive sessions (single grounded).
+    # For multi-session, we defer to done event after seeing the answer.
+    all_context_sessions = [{"session_id": c["session_id"], "title": c["title"]} for c in contexts]
+    if mode in ("general_static", "general_fresh"):
+        used_sessions_list = []
+    elif mode == "session_grounded" and len(contexts) == 1:
+        used_sessions_list = all_context_sessions
+    else:
+        # Multi-session or session_plus_general: defer to done event
+        used_sessions_list = []
 
     if todo_context_str and used_sessions_list:
         display_scope = "TODOの出典セッションを参照して回答"
@@ -803,7 +953,7 @@ async def chat_stream(
         display_scope = "TODOリストを参照して回答"
     elif mode == "session_grounded" and used_sessions_list:
         display_scope = None
-    elif mode == "session_plus_general":
+    elif mode == "session_plus_general" and used_sessions_list:
         display_scope = "セッションを参考に回答"
     elif mode == "general_fresh":
         display_scope = "公開情報を確認して回答"
@@ -814,14 +964,28 @@ async def chat_stream(
 
     # ── 10. Build prompt ──
     history_dicts = [h.model_dump() for h in req.history]
-    turn_prompt = build_stream_prompt(
-        message=message,
-        mode=mode,
-        contexts=contexts,
-        history=history_dicts,
-        conversation_summary=req.conversation_summary,
-        todo_context=todo_context_str,
-    )
+
+    # For session_then_web with contexts: build hybrid prompt
+    if use_search and contexts:
+        session_summary = "\n".join([
+            f"【{c.get('title', '')}】{c.get('summary', '')[:500]}"
+            for c in contexts
+        ])
+        turn_prompt = build_hybrid_prompt(
+            message=message,
+            session_summary=session_summary,
+            history=history_dicts,
+            conversation_summary=req.conversation_summary,
+        )
+    else:
+        turn_prompt = build_stream_prompt(
+            message=message,
+            mode=mode,
+            contexts=contexts,
+            history=history_dicts,
+            conversation_summary=req.conversation_summary,
+            todo_context=todo_context_str,
+        )
 
     logger.info(
         f"[Chat/stream] Route: mode={mode} model={model_label} search={use_search} "
@@ -843,7 +1007,9 @@ async def chat_stream(
 
         full_text = ""
         try:
-            if use_search:
+            if use_search and contexts:
+                gen = stream_gemini_search_hybrid(turn_prompt)
+            elif use_search:
                 gen = stream_gemini_with_search(turn_prompt)
             else:
                 gen = stream_gemini_chat(turn_prompt, model_name=model_label)
@@ -875,11 +1041,17 @@ async def chat_stream(
             return
 
         # Update conversation state
-        if contexts:
+        if contexts and len(contexts) == 1:
+            # Only pin active_session_id for single-session grounded mode
             state["active_session_id"] = contexts[0].get("session_id")
             state["active_session_title"] = contexts[0].get("title")
             state["last_referenced_entity_type"] = "session"
             state["last_referenced_entity_id"] = contexts[0].get("session_id")
+        elif contexts:
+            # Multi-session: clear active_session_id so next turn re-resolves
+            state.pop("active_session_id", None)
+            state.pop("active_session_title", None)
+            state["last_referenced_entity_type"] = "session"
         state["last_answer_mode"] = mode
         state["last_topic"] = extract_topic(message)
         if want_todo and todo_context_str:
@@ -917,12 +1089,28 @@ async def chat_stream(
         # Generate conversation summary for next turn continuity
         summary_next = f"ユーザー: {message[:100]}。回答: {full_text[:200]}"
 
+        # Determine which sessions were actually referenced
+        final_used_sessions = used_sessions_list  # default from meta
+        if all_context_sessions and not used_sessions_list:
+            # Multi-session: match against BOTH user query and answer
+            matched = _match_sessions_to_text(
+                all_context_sessions, message, full_text
+            )
+            if matched:
+                final_used_sessions = matched
+                titles = [s.get("title", "?")[:30] for s in matched]
+                logger.info(f"[Chat/stream] Matched {len(matched)}/{len(all_context_sessions)} sessions: {titles}")
+            elif mode in ("session_grounded", "session_plus_general"):
+                # Session mode but no match — include all as fallback
+                final_used_sessions = all_context_sessions
+
         # Done event (last)
         yield _sse("done", {
             "full_text": full_text,
             "conversation_state": state,
             "conversation_summary_next": summary_next,
             "credits_remaining": credits_remaining,
+            "used_sessions": final_used_sessions,
         })
 
     return StreamingResponse(
