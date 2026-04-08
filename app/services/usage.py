@@ -122,36 +122,38 @@ class UsageLogger:
         increments = {}
         
         # Feature-specific counters
+        # [FIX] Only increment _invocations on "success" to avoid double-counting
+        # (API layer logs "invoke", task worker logs "success" — both called _update_daily_aggregate)
         if feature == "summary":
-            increments["summary_invocations"] = firestore.Increment(1)
             if event_type == "success":
+                increments["summary_invocations"] = firestore.Increment(1)
                 increments["summary_success"] = firestore.Increment(1)
             elif event_type == "error":
                 increments["summary_error"] = firestore.Increment(1)
-                
+
         elif feature == "quiz":
-            increments["quiz_invocations"] = firestore.Increment(1)
             if event_type == "success":
+                increments["quiz_invocations"] = firestore.Increment(1)
                 increments["quiz_success"] = firestore.Increment(1)
             elif event_type == "error":
                 increments["quiz_error"] = firestore.Increment(1)
-                
+
         elif feature == "diarization":
-            increments["diarization_invocations"] = firestore.Increment(1)
             if event_type == "success":
+                increments["diarization_invocations"] = firestore.Increment(1)
                 increments["diarization_success"] = firestore.Increment(1)
-                
+
         elif feature == "qa":
-            increments["qa_invocations"] = firestore.Increment(1)
             if event_type == "success":
+                increments["qa_invocations"] = firestore.Increment(1)
                 increments["qa_success"] = firestore.Increment(1)
                 
         elif feature == "recording":
             increments["session_count"] = firestore.Increment(1)
-            # if payload and payload.get("recording_sec"):
-            #     increments["total_recording_sec"] = firestore.Increment(
-            #         float(payload.get("recording_sec", 0))
-            #     )
+            if payload and payload.get("recording_sec"):
+                rec_sec = float(payload.get("recording_sec", 0))
+                if rec_sec > 0:
+                    increments["total_recording_sec"] = firestore.Increment(rec_sec)
                 
         elif feature == "share":
             increments["share_count"] = firestore.Increment(1)
@@ -289,67 +291,24 @@ class UsageLogger:
 
     async def check_security_state(self, user_id: str, required_states: list = ["normal"]) -> bool:
         """
-        Verify if the user's security state allows the operation.
+        Legacy wrapper – delegates to SecurityService.
         Returns False if BLOCKED/RESTRICTED.
         """
-        try:
-            doc = db.collection("users").document(user_id).get(["securityState", "plan"])
-            if not doc.exists: return True
-            
-            data = doc.to_dict()
-            state = data.get("securityState", "normal")
-            
-            if state == "blocked":
-                return False
-            
-            if state == "restricted" and "restricted" not in required_states:
-                return False
-                
-            return True
-        except Exception as e:
-            logger.error(f"Security state check failed: {e}")
-            return True # Fail open
+        from app.services.security import security_service
+        state = await security_service.check_state(user_id)
+        if state == "blocked":
+            return False
+        if state == "restricted" and "restricted" not in required_states:
+            return False
+        return True
 
     async def track_security_event(self, user_id: str, risk_delta: int, reason: str) -> None:
         """
-        Increment risk score and update security state if threshold exceeded.
+        Legacy wrapper – delegates to SecurityService.register_event().
+        risk_delta is ignored (new system computes from counters).
         """
-        user_ref = db.collection("users").document(user_id)
-        
-        try:
-            @firestore.transactional
-            def txn_risk(transaction, ref):
-                snapshot = ref.get(transaction=transaction)
-                if not snapshot.exists: return
-                
-                data = snapshot.to_dict()
-                old_score = data.get("riskScore", 0)
-                new_score = old_score + risk_delta
-                
-                updates = {"riskScore": new_score}
-                
-                # Thresholds
-                if new_score >= 90:
-                    updates["securityState"] = "blocked"
-                elif new_score >= 60 and data.get("securityState") != "blocked":
-                    updates["securityState"] = "restricted"
-                
-                transaction.update(ref, updates)
-                
-                # Log to a separate collection for audit
-                audit_ref = db.collection("security_audit_logs").document()
-                transaction.set(audit_ref, {
-                    "user_id": user_id,
-                    "delta": risk_delta,
-                    "new_score": new_score,
-                    "reason": reason,
-                    "timestamp": datetime.utcnow()
-                })
-
-            transaction = db.transaction()
-            txn_risk(transaction, user_ref)
-        except Exception as e:
-            logger.error(f"Failed to track security event: {e}")
+        from app.services.security import security_service
+        await security_service.register_event(user_id, reason)
 
     async def check_and_increment_inflight(self, user_id: str, job_type: str, limit: int) -> bool:
         """
@@ -436,9 +395,6 @@ class UsageLogger:
             txn_dec(transaction, user_ref)
         except Exception as e:
             logger.error(f"Failed to decrement inflight for {user_id}/{job_type}: {e}")
-            logger.warning(f"[Security] Risk event for {user_id}: {reason} (delta={risk_delta})")
-        except Exception as e:
-            logger.error(f"Failed to track security event: {e}")
     
     async def get_user_usage_summary(
         self,

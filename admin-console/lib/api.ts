@@ -1,22 +1,9 @@
-import { auth } from "./firebase";
-
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export async function fetchApi(path: string, options: RequestInit = {}) {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error("User not authenticated");
-  }
-
-  // Debug log to verify Env var
-  console.log("Fetching API:", `${API_BASE_URL}${path}`);
-
-  const token = await user.getIdToken();
-
-  const headers = {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
-    ...options.headers,
+    ...(options.headers as Record<string, string>),
   };
 
   try {
@@ -26,32 +13,15 @@ export async function fetchApi(path: string, options: RequestInit = {}) {
     });
 
     if (!response.ok) {
-      const contentType = response.headers.get("content-type") || "";
       const rawBody = await response.text().catch(() => "");
       let errorData: any = {};
-      if (rawBody && contentType.includes("application/json")) {
-        try {
-          errorData = JSON.parse(rawBody);
-        } catch {
-          errorData = {};
-        }
-      }
-      const errorMessage =
-        errorData.detail || `API request failed: ${response.status} ${response.statusText}`;
-      console.error("API Error Details:", {
-        path,
-        status: response.status,
-        statusText: response.statusText,
-        contentType,
-        detail: errorData,
-        body: rawBody.slice(0, 500),
-      });
-      throw new Error(errorMessage);
+      try { errorData = JSON.parse(rawBody); } catch {}
+      throw new Error(errorData.detail || `API error: ${response.status}`);
     }
 
     return response.json();
   } catch (error: any) {
-    console.error("Fetch API Network/Parsing Error:", error);
+    console.error("API Error:", error);
     throw error;
   }
 }

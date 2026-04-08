@@ -7,7 +7,9 @@ from google.cloud import firestore
 from app.firebase import db
 from app.services.account_deletion import LOCKS_COLLECTION, deletion_lock_id
 from app.services.profiling import phase, Phase
+import asyncio
 import time
+import os
 from datetime import datetime, timezone, timedelta
 import datetime as dt_module # Fallback
 try:
@@ -34,12 +36,58 @@ if not firebase_admin._apps:
 # Key: uid, Value: timestamp (seconds)
 USER_ACTIVITY_CACHE = {}
 USER_ACTIVITY_THROTTLE_SEC = 300  # 5 minutes
+_ACTIVITY_CACHE_MAX_SIZE = 5000
+
+# ── Auth resolution cache (uid → accountId) ──────────────────────
+# Eliminates 1-3 Firestore .get() calls per request for known users.
+# Key: uid, Value: (account_id, expire_time)
+_ACCOUNT_ID_CACHE: dict[str, tuple[str, float]] = {}
+_ACCOUNT_CACHE_TTL = 300  # 5 minutes
+_ACCOUNT_CACHE_MAX_SIZE = 5000
+
+
+def _evict_expired_caches() -> None:
+    """Remove expired entries from both caches. Called when size limit is hit."""
+    now = time.monotonic()
+    expired = [k for k, (_, exp) in _ACCOUNT_ID_CACHE.items() if now > exp]
+    for k in expired:
+        _ACCOUNT_ID_CACHE.pop(k, None)
+    expired_activity = [k for k, ts in USER_ACTIVITY_CACHE.items() if now - ts > USER_ACTIVITY_THROTTLE_SEC]
+    for k in expired_activity:
+        USER_ACTIVITY_CACHE.pop(k, None)
+
+
+def _cache_get_account_id(uid: str) -> str | None:
+    """Return cached account_id if still valid, else None."""
+    entry = _ACCOUNT_ID_CACHE.get(uid)
+    if entry is None:
+        return None
+    account_id, expire_at = entry
+    if time.monotonic() > expire_at:
+        _ACCOUNT_ID_CACHE.pop(uid, None)
+        return None
+    return account_id
+
+
+def _cache_set_account_id(uid: str, account_id: str) -> None:
+    """Store uid→accountId with TTL."""
+    if len(_ACCOUNT_ID_CACHE) >= _ACCOUNT_CACHE_MAX_SIZE:
+        _evict_expired_caches()
+    if len(_ACCOUNT_ID_CACHE) >= _ACCOUNT_CACHE_MAX_SIZE:
+        # Still full after eviction — drop oldest 20%
+        to_drop = list(_ACCOUNT_ID_CACHE.keys())[:_ACCOUNT_CACHE_MAX_SIZE // 5]
+        for k in to_drop:
+            _ACCOUNT_ID_CACHE.pop(k, None)
+    _ACCOUNT_ID_CACHE[uid] = (account_id, time.monotonic() + _ACCOUNT_CACHE_TTL)
 
 
 from dataclasses import dataclass
 import logging
+from jose import jwt as jose_jwt, JWTError
 
 logger = logging.getLogger("app.dependencies")
+
+WATCH_TOKEN_SECRET = os.environ.get("WATCH_TOKEN_SECRET", "dev-watch-secret-do-not-use-in-prod")
 
 @dataclass
 class CurrentUser:
@@ -50,6 +98,20 @@ class CurrentUser:
     email: str | None
     display_name: str | None = None
     photo_url: str | None = None
+    has_custom_claims: bool = False  # True if accountId came from Firebase custom claims
+
+
+def _set_account_id_claim(uid: str, account_id: str) -> None:
+    """Set accountId in Firebase custom claims (reflected on next token refresh)."""
+    try:
+        existing = auth.get_user(uid).custom_claims or {}
+        if existing.get("accountId") == account_id:
+            return  # Already set
+        existing["accountId"] = account_id
+        auth.set_custom_user_claims(uid, existing)
+        logger.info(f"[CustomClaims] Set accountId={account_id} for uid={uid}")
+    except Exception as e:
+        logger.warning(f"[CustomClaims] Failed to set claims for uid={uid}: {e}")
 
 
 def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> str:
@@ -57,6 +119,7 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
     [Account Architecture] Resolve uid -> accountId.
 
     Resolution priority:
+    0. In-memory cache (eliminates Firestore reads for known users)
     1. uid_links/{uid}.accountId (existing link)
     2. phone_numbers/{phone}.accountId (if phone in token)
     3. users/{uid}.accountId (legacy fallback)
@@ -64,6 +127,11 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
 
     This function ALWAYS returns an accountId and ensures uid_links is set.
     """
+    # 0. Check in-memory cache first (zero-cost for repeat requests)
+    cached = _cache_get_account_id(uid)
+    if cached:
+        return cached
+
     now = datetime.now(timezone.utc)
 
     # 1. Check uid_links (primary source of truth)
@@ -72,6 +140,7 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
     if link_doc.exists:
         account_id = link_doc.to_dict().get("accountId")
         if account_id:
+            _cache_set_account_id(uid, account_id)
             return account_id
 
     # 2. Check phone_numbers index (for cross-provider unification)
@@ -89,6 +158,7 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
                     "linkedVia": "phone_number_match"
                 }, merge=True)
                 logger.info(f"[resolve_account] Linked uid={uid} to account={account_id} via phone")
+                _cache_set_account_id(uid, account_id)
                 return account_id
 
     # 3. Check users/{uid} (legacy)
@@ -105,6 +175,7 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
                 "linkedVia": "legacy_repair"
             }, merge=True)
             logger.info(f"[resolve_account] Repaired uid_links for uid={uid} -> account={account_id}")
+            _cache_set_account_id(uid, account_id)
             return account_id
 
     # 4. Create new account (no existing link found)
@@ -133,6 +204,7 @@ def _resolve_account_id_for_uid(uid: str, phone_number: str | None = None) -> st
     }, merge=True)
 
     logger.info(f"[resolve_account] Created new account={account_id} for uid={uid}")
+    _cache_set_account_id(uid, account_id)
     return account_id
 
 def _resolve_user_from_token(token: str) -> CurrentUser:
@@ -157,9 +229,17 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
             )
 
         # [CRITICAL] Always resolve accountId - this is the canonical identity
-        # Time account resolution (includes Firestore calls)
-        with phase(Phase.AUTH, op="resolve_account"):
-            account_id = _resolve_account_id_for_uid(uid, phone_number)
+        # [OPTIMIZATION] Check custom claims first (0 Firestore reads)
+        claims_account_id = decoded_token.get("accountId")
+        if claims_account_id:
+            _cache_set_account_id(uid, claims_account_id)
+            account_id = claims_account_id
+            has_claims = True
+        else:
+            # Fallback: Firestore lookup (1-3 reads)
+            with phase(Phase.AUTH, op="resolve_account"):
+                account_id = _resolve_account_id_for_uid(uid, phone_number)
+            has_claims = False
 
         return CurrentUser(
             uid=uid,
@@ -168,7 +248,8 @@ def _resolve_user_from_token(token: str) -> CurrentUser:
             phone_number=phone_number,
             email=email,
             display_name=decoded_token.get("name"),
-            photo_url=decoded_token.get("picture")
+            photo_url=decoded_token.get("picture"),
+            has_custom_claims=has_claims,
         )
 
     except (InvalidIdTokenError, ExpiredIdTokenError, RevokedIdTokenError) as e:
@@ -238,14 +319,14 @@ async def get_current_user(
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    user = _resolve_user_from_token(token)
+    # [PERF] Run sync Firestore/Firebase calls in thread to avoid blocking event loop
+    user = await asyncio.to_thread(_resolve_user_from_token, token)
 
-    # [SECURITY] Check if account is disabled
-    _check_account_disabled(user.account_id, user.uid)
+    # [SECURITY] Check if account is disabled (also offloaded to thread)
+    await asyncio.to_thread(_check_account_disabled, user.account_id, user.uid)
 
     # [NEW] Inject UID into request state for OpsLogger
     request.state.uid = user.uid
-    request.state.email = user.email
     request.state.email = user.email
     # _track_activity(user.uid, background_tasks)
     return user
@@ -271,9 +352,10 @@ async def get_verified_user(
     # But for now, let's check the DB or use a cached approach if clear.
     # Actually, let's just do the DB check. usage of this endpoint implies a "write" or "critical" action usually.
 
-    link_ref = db.collection("uid_links").document(uid)
-    link_doc = link_ref.get()
-    
+    def _check_link():
+        return db.collection("uid_links").document(uid).get()
+    link_doc = await asyncio.to_thread(_check_link)
+
     # If not linked -> Unverified
     if not link_doc.exists:
         raise HTTPException(
@@ -309,7 +391,7 @@ async def get_current_user_optional(
         token = authorization
     
     try:
-        user = _resolve_user_from_token(token)
+        user = await asyncio.to_thread(_resolve_user_from_token, token)
         return user
     except HTTPException:
         return None
@@ -515,11 +597,11 @@ async def get_admin_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # まず通常のユーザー認証
-    user = _resolve_user_from_token(token)
+    # まず通常のユーザー認証 (offload sync to thread)
+    user = await asyncio.to_thread(_resolve_user_from_token, token)
 
-    # 管理者権限チェック
-    is_admin, is_super_admin = _check_admin_claims(token)
+    # 管理者権限チェック (offload sync to thread)
+    is_admin, is_super_admin = await asyncio.to_thread(_check_admin_claims, token)
 
     if not is_admin:
         raise HTTPException(
@@ -550,8 +632,8 @@ async def get_admin_user_optional(
     if not token:
         return None
 
-    user = _resolve_user_from_token(token)
-    is_admin, is_super_admin = _check_admin_claims(token)
+    user = await asyncio.to_thread(_resolve_user_from_token, token)
+    is_admin, is_super_admin = await asyncio.to_thread(_check_admin_claims, token)
 
     if not is_admin:
         raise HTTPException(
@@ -568,4 +650,99 @@ async def get_admin_user_optional(
         display_name=user.display_name,
         photo_url=user.photo_url,
         is_super_admin=is_super_admin
+    )
+
+
+# --- Watch JWT Auth ---
+
+async def get_watch_user(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme),
+) -> CurrentUser:
+    """
+    Verify Watch JWT access token (not Firebase ID token).
+    Used for Watch-specific endpoints that accept Watch-issued JWTs.
+    """
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jose_jwt.decode(token, WATCH_TOKEN_SECRET, algorithms=["HS256"])
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid watch token: {e}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if payload.get("type") != "watch_access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token type",
+        )
+
+    account_id = payload.get("sub")
+    uid = payload.get("uid")
+    if not account_id or not uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+        )
+
+    # Check if account is disabled
+    await asyncio.to_thread(_check_account_disabled, account_id, uid)
+
+    request.state.uid = uid
+    return CurrentUser(
+        uid=uid,
+        account_id=account_id,
+        provider="watch",
+        phone_number=None,
+        email=None,
+    )
+
+
+# --- Cloud Tasks Internal Auth ---
+
+def verify_cloud_tasks_request(request: Request):
+    """
+    [SECURITY] Verify request comes from Cloud Tasks or local development.
+
+    Cloud Tasks adds special headers that Cloud Run strips from external requests:
+    - X-CloudTasks-QueueName
+    - X-CloudTasks-TaskName
+    - X-CloudTasks-TaskRetryCount
+
+    This is a simple but effective way to protect internal endpoints.
+    In local dev (USE_LOCAL_TASKS=1), skip verification.
+    """
+    # Allow local development
+    if os.environ.get("USE_LOCAL_TASKS") == "1":
+        return True
+
+    # Check for Cloud Tasks headers (any of these indicates Cloud Tasks origin)
+    queue_name = request.headers.get("X-CloudTasks-QueueName")
+    task_name = request.headers.get("X-CloudTasks-TaskName")
+
+    if queue_name or task_name:
+        logger.debug(f"[CloudTasks] Verified request from queue={queue_name}")
+        return True
+
+    # Also allow if called with internal secret (backup mechanism)
+    internal_secret = os.environ.get("INTERNAL_TASK_SECRET")
+    if internal_secret:
+        provided_secret = request.headers.get("X-Internal-Secret")
+        if provided_secret == internal_secret:
+            logger.debug("[CloudTasks] Verified via internal secret")
+            return True
+
+    # Reject unauthorized request
+    logger.warning(f"[CloudTasks] Unauthorized request to internal endpoint: {request.url.path}")
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="This endpoint is for internal use only"
     )

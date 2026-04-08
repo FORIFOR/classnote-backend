@@ -16,6 +16,7 @@ from app.services.usage import usage_logger
 from app.dependencies import ensure_can_view, _resolve_user_from_token
 from app.services.session_event_bus import session_event_bus
 from app.services.cost_guard import cost_guard  # [FIX] Add Cost Guard for proper limit checking
+from app.services.stt_circuit_breaker import stt_circuit_breaker
 
 router = APIRouter()
 logger = logging.getLogger("app.websocket")
@@ -192,6 +193,28 @@ async def ws_stream(websocket: WebSocket, session_id: str):
         return
     logger.info(f"[/ws/stream] WebSocket connected session_id={session_id}")
 
+    # [FeatureGate] Check if cloudStt is enabled before proceeding
+    from app.services.app_config import is_feature_enabled
+    if not is_feature_enabled("cloudStt"):
+        logger.warning(f"[/ws/stream] Cloud STT feature is disabled. Rejecting session {session_id}")
+        await websocket.send_json({"event": "error", "code": "feature_disabled", "message": "Cloud STT is currently disabled", "fallbackRecommended": True})
+        await websocket.close(code=1008)
+        return
+
+    # [CircuitBreaker] Fast-fail if Google STT is known to be down
+    if not stt_circuit_breaker.is_available():
+        cb_status = stt_circuit_breaker.get_status()
+        logger.warning(f"[/ws/stream] Circuit breaker OPEN for session {session_id}. status={cb_status}")
+        await websocket.send_json({
+            "event": "error",
+            "code": "stt_unavailable",
+            "message": "Cloud STT is temporarily unavailable. Please use on-device transcription.",
+            "fallbackRecommended": True,
+            "retryAfterSeconds": int(stt_circuit_breaker._cooldown_sec),
+        })
+        await websocket.close(code=1008)
+        return
+
     # Session State Data (Defined early for scope)
     session_data = {}
     uid = None
@@ -266,9 +289,11 @@ async def ws_stream(websocket: WebSocket, session_id: str):
             quota_mode = "user"
             logger.info(f"[/ws/stream] Quota lookup: uid={uid}, accountId={account_id}, mode={quota_mode}")
 
-            # [Security] Blocked/Restricted check
-            if not await usage_logger.check_security_state(uid):
-                 logger.warning(f"[/ws/stream] Security block for user {uid}")
+            # [Security] Time-window risk enforcement
+            from app.services.security import security_service
+            denial = await security_service.enforce(uid, "websocket")
+            if denial:
+                 logger.warning(f"[/ws/stream] Security block for user {uid}: {denial['detail']}")
                  await websocket.send_json({"event": "error", "code": "security_block"})
                  await websocket.close(code=1008, reason="security_block")
                  return
@@ -459,11 +484,17 @@ async def ws_stream(websocket: WebSocket, session_id: str):
             logger.info(f"[/ws/stream] Starting V2 STT stream #{stream_num} (lang={lang})")
 
             should_reconnect = False
+            stt_connected = False  # Track if STT stream connected successfully
 
             try:
                 generator = _create_stream_generator()
 
                 async for event in stt_v2.recognize_stream(generator, sample_rate=rate, language_code=lang):
+                    # [CircuitBreaker] Record success on first event from STT
+                    if not stt_connected:
+                        stt_connected = True
+                        stt_circuit_breaker.record_success()
+
                     if stop_event.is_set():
                         logger.info(f"[/ws/stream] Stop event detected, ending STT stream #{stream_num}")
                         return
@@ -568,9 +599,17 @@ async def ws_stream(websocket: WebSocket, session_id: str):
 
             except Exception as e:
                 logger.error(f"[/ws/stream] STT Error on stream #{stream_num}: {e}", exc_info=True)
+                # [CircuitBreaker] Record failure if STT never connected
+                if not stt_connected:
+                    stt_circuit_breaker.record_failure()
+                    logger.warning(f"[/ws/stream] Circuit breaker recorded failure. status={stt_circuit_breaker.get_status()}")
                 if not stop_requested:
                     try:
-                        await websocket.send_json({"event": "error", "message": str(e)})
+                        await websocket.send_json({
+                            "event": "error",
+                            "message": str(e),
+                            "fallbackRecommended": not stt_connected,
+                        })
                     except Exception:
                         pass
                 return
@@ -656,6 +695,22 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                             audio_started_at = time.time() # [NEW] Track when audio input is expected
                             stt_task = asyncio.create_task(run_stt(language_code, sample_rate))
                             await websocket.send_json({"event": "connected"})
+
+                            # [Drain] Notify client if server is in drain mode
+                            # Client can finish current segment and switch to on-device
+                            try:
+                                from app.services.app_config import get_app_config
+                                app_cfg = get_app_config()
+                                if app_cfg.maintenance.enabled and app_cfg.maintenance.mode == "drain":
+                                    await websocket.send_json({
+                                        "event": "drain",
+                                        "reason": "maintenance",
+                                        "message": app_cfg.maintenance.message_ja or "サーバーメンテナンス中です。録音はローカルで継続されます。",
+                                        "gracePeriodSeconds": 30,
+                                    })
+                                    logger.info(f"[/ws/stream] Sent drain event to session {session_id}")
+                            except Exception as drain_err:
+                                logger.warning(f"[/ws/stream] Failed to check drain mode: {drain_err}")
 
                     elif event == "stop":
                         logger.info("[/ws/stream] STOP received")
@@ -820,24 +875,7 @@ async def ws_stream(websocket: WebSocket, session_id: str):
         # Summary Log
         logger.info(f"[/ws/stream] Session End: bytes={total_audio_bytes}, chunks={audio_chunk_count}, max_amp={max_audio_amplitude}")
 
-        # [NEW] Free Plan: Auto-trigger Summary and Quiz (Streaming)
-        if total_audio_bytes > 0:
-            uid = session_data.get("userId") or session_data.get("ownerUserId")
-            if uid:
-                try:
-                    user_doc = db.collection("users").document(uid).get()
-                    if user_doc.exists and user_doc.to_dict().get("plan", "free") == "free":
-                        from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-
-                        # [FIX] Use session-based idempotency key to prevent duplicate consumption
-                        summary_idem_key = f"auto_summary:{session_id}"
-                        quiz_idem_key = f"auto_quiz:{session_id}"
-
-                        logger.info(f"[FreePlan] Auto-triggering Summary/Quiz for {session_id} (Streaming)")
-                        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=summary_idem_key)
-                        enqueue_quiz_task(session_id, count=3, user_id=uid, idempotency_key=quiz_idem_key)
-                except Exception as e:
-                     logger.error(f"[FreePlan] Auto-trigger failed (Stream): {e}")
+        # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
 
         # [FIX] Update cloud_stt_sec quota in Firestore
         if consumed_quota_sec > 0 and quota_id:

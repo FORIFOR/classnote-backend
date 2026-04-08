@@ -14,7 +14,7 @@ import { ExpandableText } from "@/components/ui/ExpandableText";
 const fetcher = (path: string) => fetchApi(path);
 
 export default function DashboardPage() {
-  const { data, error, isLoading } = useSWR("/admin/stats/dashboard?period=24h", fetcher);
+  const { data, error, isLoading } = useSWR("/dashboard/stats?period=24h", fetcher);
 
   if (isLoading) return <div className="p-8">Loading dashboard...</div>;
   if (error) return <div className="p-8 text-red-600">Failed to load dashboard: {error.message}</div>;

@@ -1,0 +1,16 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg=NEXT_PUBLIC_API_URL=https://deepnote-api-900324644592.asia-northeast1.run.app'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_API_KEY=AIzaSyB9ZJAYy39oCegV6ovK_dEXhL2w5Cy06nQ'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=classnote-x-dev.firebaseapp.com'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_PROJECT_ID=classnote-x-dev'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=classnote-x-dev.firebasestorage.app'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=900324644592'
+      - '--build-arg=NEXT_PUBLIC_FIREBASE_APP_ID=1:900324644592:ios:ca44eeb4f26eacbeed9435'
+      - '-t'
+      - 'asia-northeast1-docker.pkg.dev/classnote-x-dev/classnote-repo/classnote-dashboard:latest'
+      - '.'
+images:
+  - 'asia-northeast1-docker.pkg.dev/classnote-x-dev/classnote-repo/classnote-dashboard:latest'

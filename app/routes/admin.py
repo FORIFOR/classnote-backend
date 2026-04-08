@@ -154,6 +154,79 @@ async def get_dashboard_stats(
         "recentAlerts": recent_alerts
     }
 
+
+@router.get("/daily-sessions")
+async def get_daily_sessions(
+    days: int = Query(14, ge=1, le=90),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """
+    日別セッション統計（録音数・ユーザ数・Cloud/Device内訳・文字起こし・要約・合計時間）
+    """
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    JST = timezone(timedelta(hours=9))
+
+    sessions = list(
+        db.collection("sessions")
+        .where("createdAt", ">=", start)
+        .order_by("createdAt")
+        .stream()
+    )
+
+    from collections import defaultdict
+    daily = defaultdict(lambda: {
+        "date": "",
+        "sessions": 0,
+        "uniqueUsers": 0,
+        "cloud": 0,
+        "device": 0,
+        "withTranscript": 0,
+        "withSummary": 0,
+        "totalMinutes": 0.0,
+        "_users": set(),
+    })
+
+    for s in sessions:
+        d = s.to_dict()
+        created = d.get("createdAt")
+        if not created:
+            continue
+        day_key = created.astimezone(JST).strftime("%Y-%m-%d")
+        day_label = created.astimezone(JST).strftime("%m/%d (%a)")
+        mode = d.get("transcriptionMode", "")
+        uid = d.get("ownerUid", "")
+        dur = d.get("durationSec") or 0
+
+        bucket = daily[day_key]
+        bucket["date"] = day_label
+        bucket["sessions"] += 1
+        bucket["_users"].add(uid)
+        bucket["totalMinutes"] += dur / 60
+        if "cloud" in mode:
+            bucket["cloud"] += 1
+        else:
+            bucket["device"] += 1
+        if len(d.get("transcriptText", "") or "") > 0:
+            bucket["withTranscript"] += 1
+        if d.get("summaryMarkdown"):
+            bucket["withSummary"] += 1
+
+    result = []
+    for key in sorted(daily.keys()):
+        v = daily[key]
+        v["uniqueUsers"] = len(v.pop("_users"))
+        v["totalMinutes"] = round(v["totalMinutes"], 1)
+        result.append(v)
+
+    return {
+        "days": result,
+        "totalSessions": len(sessions),
+        "period": f"{days}d",
+    }
+
+
 @router.get("/events")
 async def list_events(
     limit: int = 50,
@@ -242,48 +315,70 @@ async def get_user_detail(uid: str, admin_user: dict = Depends(get_current_admin
 @router.post("/users/{uid}/actions")
 async def user_actions(uid: str, action_body: Dict[str, Any], admin_user: dict = Depends(get_current_admin_user)):
     """
-    ユーザーへのアクション（隔離、BANなど）
-    Body: { "action": "quarantine", "durationMinutes": 60, "reason": "Abuse" }
+    ユーザーへのアクション（隔離、BAN、状態設定、リセットなど）
+    Body examples:
+      { "action": "quarantine", "durationMinutes": 60, "reason": "Abuse" }
+      { "action": "ban", "reason": "..." }
+      { "action": "release" }
+      { "action": "set_state", "state": "watch|restricted|blocked", "reason": "..." }
+      { "action": "reset_security", "reason": "..." }
     """
+    from app.services.security import security_service
     db = get_db()
     action = action_body.get("action")
-    
+    admin_uid = admin_user.get("uid", "unknown")
+    reason = action_body.get("reason", "Admin Action")
+
     if action == "quarantine":
         duration = action_body.get("durationMinutes", 60)
         until = datetime.now(timezone.utc) + timedelta(minutes=duration)
-        
+
         db.collection("users").document(uid).update({
             "securityState": "quarantined",
             "quarantineUntil": until,
-            "securityNote": action_body.get("reason", "Admin Action")
+            "securityNote": reason
         })
-        
-        # Log this admin action to ops_events
+
         OpsLogger().log(
             severity=Severity.WARN,
-            event_type=EventType.ABUSE_DETECTED, # Or explicit ADMIN_ACTION type
+            event_type=EventType.ABUSE_DETECTED,
             uid=uid,
             message=f"User quarantined by admin for {duration} mins",
-            debug={"adminUid": admin_user.get("uid"), "reason": action_body.get("reason")}
+            debug={"adminUid": admin_uid, "reason": reason}
         )
-        
+
         return {"status": "quarantined", "until": until}
-        
+
     elif action == "ban":
         db.collection("users").document(uid).update({
             "securityState": "banned",
-            "securityNote": action_body.get("reason", "Admin Action")
+            "securityNote": reason
         })
         return {"status": "banned"}
-        
+
     elif action == "release":
-        db.collection("users").document(uid).update({
-            "securityState": firestore.DELETE_FIELD,
-            "quarantineUntil": firestore.DELETE_FIELD
-        })
-        return {"status": "released"}
-        
-    raise HTTPException(400, "Invalid action")
+        return await security_service.admin_reset(uid, admin_uid, reason)
+
+    elif action == "set_state":
+        state = action_body.get("state")
+        if not state:
+            raise HTTPException(400, "Missing 'state' field")
+        result = await security_service.admin_set_state(uid, state, admin_uid, reason)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return result
+
+    elif action == "reset_security":
+        return await security_service.admin_reset(uid, admin_uid, reason)
+
+    raise HTTPException(400, "Invalid action. Supported: quarantine, ban, release, set_state, reset_security")
+
+
+@router.get("/users/{uid}/security")
+async def get_user_security(uid: str, admin_user: dict = Depends(get_current_admin_user)):
+    """ユーザーのセキュリティプロファイル・カウンター・直近イベントを取得"""
+    from app.services.security import security_service
+    return await security_service.get_security_profile(uid)
 
 
 # --- Account Disable/Enable Endpoints ---
@@ -849,4 +944,93 @@ async def list_failed_jobs(
         "hours": hours,
         "count": len(failed_jobs),
         "jobs": failed_jobs[:limit]
+    }
+
+
+@router.post("/admin/backfill-audio-urls")
+async def backfill_audio_signed_urls(
+    admin: dict = Depends(get_current_admin_user),
+    account_id: Optional[str] = Query(None, description="Specific account to backfill"),
+    limit: int = Query(100, le=500),
+):
+    """
+    Backfill signedGetUrl for sessions that have audio uploaded but no cached URL.
+    Needed because iOS reads signedGetUrl directly from Firestore.
+    """
+    from app.firebase import db as firestore_db, storage_client, AUDIO_BUCKET_NAME
+    from app.routes.sessions import signing_credentials, _get_signing_email
+    import asyncio
+
+    sa_email = _get_signing_email()
+    if not sa_email:
+        raise HTTPException(500, "No signing service account configured")
+
+    creds = signing_credentials(sa_email)
+    if not creds:
+        raise HTTPException(500, "Failed to create signing credentials")
+
+    now_utc = datetime.now(timezone.utc)
+    expires = now_utc + timedelta(days=7)
+
+    # Query sessions with audio uploaded
+    query = firestore_db.collection("sessions").where("audioStatus", "==", "uploaded")
+    if account_id:
+        query = query.where("ownerAccountId", "==", account_id)
+
+    updated = 0
+    skipped = 0
+    errors = []
+
+    def _do_backfill():
+        nonlocal updated, skipped
+        for doc in query.limit(limit).stream():
+            data = doc.to_dict()
+
+            # Skip if already has valid cached URL
+            cached_expires = data.get("signedGetUrlExpiresAt")
+            if cached_expires and hasattr(cached_expires, "replace"):
+                exp = cached_expires.replace(tzinfo=timezone.utc) if cached_expires.tzinfo is None else cached_expires
+                if exp > now_utc + timedelta(hours=1):
+                    skipped += 1
+                    continue
+
+            audio_info = data.get("audio") or {}
+            gcs_path = audio_info.get("gcsPath") or data.get("audioPath")
+            if not gcs_path:
+                skipped += 1
+                continue
+
+            # Extract blob name
+            bucket_prefix = f"gs://{AUDIO_BUCKET_NAME}/"
+            if gcs_path.startswith(bucket_prefix):
+                blob_name = gcs_path[len(bucket_prefix):]
+            elif gcs_path.startswith("gs://"):
+                parts = gcs_path.split("/", 3)
+                blob_name = parts[3] if len(parts) > 3 else gcs_path
+            else:
+                blob_name = gcs_path
+
+            try:
+                blob = storage_client.bucket(AUDIO_BUCKET_NAME).blob(blob_name)
+                url = blob.generate_signed_url(
+                    version="v4",
+                    expiration=expires,
+                    method="GET",
+                    credentials=creds,
+                )
+                doc.reference.update({
+                    "signedGetUrl": url,
+                    "signedGetUrlExpiresAt": expires,
+                })
+                updated += 1
+            except Exception as e:
+                errors.append({"sessionId": doc.id, "error": str(e)[:100]})
+
+    await asyncio.to_thread(_do_backfill)
+
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors[:10],
+        "expiresAt": expires.isoformat(),
     }
