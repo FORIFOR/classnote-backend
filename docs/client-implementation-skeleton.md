@@ -1066,6 +1066,8 @@ struct SessionAIChatSheet: View {
 
 ## 3. transcript jump と citation tap
 
+### 3-1. 操作マップ
+
 | 操作 | Desktop | iOS |
 |---|---|---|
 | citation chip tap | `dispatchAction({type:"jump_to_transcript", targetMs})` → `onJumpToTranscript(ms)` → Transcript タブ `seekTo(ms)` | `dispatchAction(.jumpToTranscript)` → `onJumpToTranscript` callback → ScrollViewReader で Transcript row に scroll + AVPlayer seek |
@@ -1073,6 +1075,332 @@ struct SessionAIChatSheet: View {
 | action button (create_todo) | 同上 → `/todos` listener で TODO リストが自動更新 | 同上 |
 | action button (copy_answer) | クライアントだけで完結 (`navigator.clipboard.writeText`) | `UIPasteboard.general.string` |
 | action button (rewrite_answer) | `POST /v1/chat` を `responseMode=rewrite` + hinted preset で再発行 | 同上 |
+
+### 3-2. Tauri / React: `useTranscriptJumpStore`
+
+```ts
+// src/stores/transcriptJumpStore.ts
+import { create } from "zustand";
+
+export interface JumpTarget {
+  requestId: string;        // unique so the same ms twice re-fires the effect
+  startSec: number;
+  segmentId?: string;
+}
+
+interface State {
+  pendingTarget: JumpTarget | null;
+  requestJump(target: { startSec: number; segmentId?: string }): void;
+  clearPending(): void;
+}
+
+export const useTranscriptJumpStore = create<State>((set) => ({
+  pendingTarget: null,
+  requestJump: (t) =>
+    set({ pendingTarget: { requestId: crypto.randomUUID(), ...t } }),
+  clearPending: () => set({ pendingTarget: null }),
+}));
+```
+
+```ts
+// src/features/chat/handlers/handleChatAction.ts
+import type { ChatAction, Citation } from "../api/types";
+import { useTranscriptJumpStore } from "@/stores/transcriptJumpStore";
+import { useUIStore } from "@/stores/uiStore";
+
+export function handleCitationClick(citation: Citation) {
+  if (citation.type === "transcript" && typeof citation.startMs === "number") {
+    useUIStore.getState().setSessionDetailActiveTab?.("transcript");
+    useTranscriptJumpStore.getState().requestJump({
+      startSec: Math.floor(citation.startMs / 1000),
+      segmentId: citation.segmentId,
+    });
+    return;
+  }
+  if (citation.type === "summary_evidence" && typeof citation.startMs === "number") {
+    useUIStore.getState().setSessionDetailActiveTab?.("transcript");
+    useTranscriptJumpStore.getState().requestJump({
+      startSec: Math.floor(citation.startMs / 1000),
+    });
+  }
+}
+
+export function handleChatAction(action: ChatAction) {
+  if (action.type === "jump_to_transcript") {
+    useUIStore.getState().setSessionDetailActiveTab?.("transcript");
+    useTranscriptJumpStore.getState().requestJump({
+      startSec: Math.floor(action.targetMs / 1000),
+      segmentId: action.segmentId,
+    });
+  }
+}
+```
+
+```tsx
+// src/features/session/TranscriptTab.tsx — listener side
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranscriptJumpStore } from "@/stores/transcriptJumpStore";
+
+interface Segment { id: string; startSec: number; text: string; }
+
+export function TranscriptTab({ segments }: { segments: Segment[] }) {
+  const pending = useTranscriptJumpStore((s) => s.pendingTarget);
+  const clearPending = useTranscriptJumpStore((s) => s.clearPending);
+  const [highlighted, setHighlighted] = useState<string | null>(null);
+  const refs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  const targetId = useMemo(() => {
+    if (!pending) return null;
+    if (pending.segmentId) return pending.segmentId;
+    let best: string | null = null, bestD = Infinity;
+    for (const s of segments) {
+      const d = Math.abs(s.startSec - pending.startSec);
+      if (d < bestD) { bestD = d; best = s.id; }
+    }
+    return best;
+  }, [pending, segments]);
+
+  useEffect(() => {
+    if (!pending || !targetId) return;
+    refs.current[targetId]?.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlighted(targetId);
+    const t = window.setTimeout(() => { setHighlighted(null); clearPending(); }, 1800);
+    return () => window.clearTimeout(t);
+  }, [pending, targetId, clearPending]);
+
+  return (
+    <div className="space-y-2">
+      {segments.map((s) => (
+        <div
+          key={s.id}
+          ref={(n) => { refs.current[s.id] = n; }}
+          className={highlighted === s.id
+            ? "rounded-xl border border-white/30 bg-white/10 p-3 transition"
+            : "rounded-xl p-3"}
+        >
+          <div className="mb-1 text-xs text-zinc-500">{s.startSec}s</div>
+          <div className="text-sm">{s.text}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+### 3-3. Rust 側から emit するパターン (optional)
+
+AI panel が別ウィンドウにいる場合や overlay から jump させたい場合のみ使う。frontend 内で完結するなら不要。
+
+```rust
+// src-tauri/src/commands.rs
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+
+#[derive(Serialize, Clone)]
+pub struct TranscriptJumpPayload {
+    pub session_id: String,
+    pub target_ms: u64,
+    pub segment_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn emit_transcript_jump(
+    app: AppHandle,
+    session_id: String,
+    target_ms: u64,
+    segment_id: Option<String>,
+) -> Result<(), String> {
+    app.emit("transcript-jump", TranscriptJumpPayload { session_id, target_ms, segment_id })
+       .map_err(|e| e.to_string())
+}
+```
+
+```ts
+// src/tauri/registerTranscriptJumpListener.ts
+import { listen } from "@tauri-apps/api/event";
+import { useTranscriptJumpStore } from "@/stores/transcriptJumpStore";
+import { useUIStore } from "@/stores/uiStore";
+
+export async function registerTranscriptJumpListener() {
+  return listen<{ session_id: string; target_ms: number; segment_id?: string | null }>(
+    "transcript-jump",
+    (event) => {
+      useUIStore.getState().setSessionDetailActiveTab?.("transcript");
+      useTranscriptJumpStore.getState().requestJump({
+        startSec: Math.floor(event.payload.target_ms / 1000),
+        segmentId: event.payload.segment_id ?? undefined,
+      });
+    }
+  );
+}
+```
+
+### 3-4. SwiftUI: `SessionDetailTranscriptJumpStore`
+
+```swift
+// Features/SessionDetail/SessionDetailTranscriptJumpStore.swift
+import Foundation
+
+@MainActor
+final class SessionDetailTranscriptJumpStore: ObservableObject {
+    struct JumpTarget: Equatable {
+        let requestId: UUID
+        let targetSec: Double
+        let segmentId: String?
+    }
+
+    @Published var pendingTarget: JumpTarget?
+
+    func requestJump(targetSec: Double, segmentId: String?) {
+        pendingTarget = JumpTarget(
+            requestId: UUID(),
+            targetSec: targetSec,
+            segmentId: segmentId
+        )
+    }
+
+    func clear() { pendingTarget = nil }
+}
+```
+
+`SessionAIChatStore` に `jumpStore` を注入し、citation tap / action tap で `requestJump` を呼ぶ:
+
+```swift
+@MainActor
+final class SessionAIChatStore: ObservableObject {
+    // ... 既存 Published ...
+    let jumpStore: SessionDetailTranscriptJumpStore
+    private let api: SessionAIChatAPI
+    private let sseClient = SessionAIChatSSEClient()
+
+    init(api: SessionAIChatAPI, jumpStore: SessionDetailTranscriptJumpStore) {
+        self.api = api; self.jumpStore = jumpStore
+    }
+
+    func handleCitationTap(_ citation: SessionAICitation) {
+        if citation.type == "transcript" || citation.type == "summary_evidence" {
+            let sec = Double(citation.startMs ?? 0) / 1000.0
+            jumpStore.requestJump(targetSec: sec, segmentId: citation.segmentId)
+        }
+    }
+
+    func handleActionTap(_ action: SessionAIAction) {
+        if case .jumpToTranscript(let ms, let segId) = action {
+            jumpStore.requestJump(targetSec: Double(ms) / 1000.0, segmentId: segId)
+        }
+    }
+}
+```
+
+```swift
+// Features/SessionDetail/TranscriptTabView.swift — scroll + highlight
+import SwiftUI
+
+struct TranscriptSegment: Identifiable, Equatable {
+    let id: String
+    let startSec: Double
+    let text: String
+}
+
+struct TranscriptTabView: View {
+    let segments: [TranscriptSegment]
+    @ObservedObject var jumpStore: SessionDetailTranscriptJumpStore
+    let onSeekToTime: (Double) -> Void
+
+    @State private var highlighted: String?
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(segments) { seg in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(timeLabel(seg.startSec))
+                                .font(.caption2).foregroundStyle(.secondary)
+                            Text(seg.text).font(.body)
+                        }
+                        .padding(12)
+                        .background(highlighted == seg.id
+                                    ? Color.accentColor.opacity(0.15)
+                                    : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .id(seg.id)
+                        .onTapGesture { onSeekToTime(seg.startSec) }
+                    }
+                }
+                .padding(16)
+            }
+            .onChange(of: jumpStore.pendingTarget) { _, target in
+                guard let target, let dest = nearest(for: target) else { return }
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(dest.id, anchor: .center)
+                }
+                onSeekToTime(target.targetSec)
+                highlighted = dest.id
+                Task {
+                    try? await Task.sleep(for: .milliseconds(1800))
+                    highlighted = nil
+                    jumpStore.clear()
+                }
+            }
+        }
+    }
+
+    private func nearest(for t: SessionDetailTranscriptJumpStore.JumpTarget) -> TranscriptSegment? {
+        if let sid = t.segmentId {
+            return segments.first(where: { $0.id == sid })
+        }
+        return segments.min(by: { abs($0.startSec - t.targetSec) < abs($1.startSec - t.targetSec) })
+    }
+
+    private func timeLabel(_ sec: Double) -> String {
+        let total = Int(sec); return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+}
+```
+
+### 3-5. SessionDetailScreen での接続
+
+```swift
+struct SessionDetailScreen: View {
+    @StateObject private var jumpStore = SessionDetailTranscriptJumpStore()
+    @State private var selectedTab: DetailTab = .overview
+    @State private var showAI = false
+
+    let transcriptSegments: [TranscriptSegment]
+    let api: SessionAIChatAPI
+    let sessionId: String
+
+    var body: some View {
+        VStack {
+            // ...header / tabs...
+            switch selectedTab {
+            case .transcript:
+                TranscriptTabView(
+                    segments: transcriptSegments,
+                    jumpStore: jumpStore,
+                    onSeekToTime: { _ in /* AVPlayer seek */ }
+                )
+            default: EmptyView()
+            }
+        }
+        .sheet(isPresented: $showAI) {
+            SessionAIChatSheet(
+                store: SessionAIChatStore(api: api, jumpStore: jumpStore),
+                sessionId: sessionId,
+                activeTab: selectedTab.rawValue,
+                currentPlaybackMs: nil,
+                onJumpToTranscript: { selectedTab = .transcript }
+            )
+        }
+    }
+}
+```
+
+**ポイント**:
+- `jumpStore` は **SessionDetailScreen 直下で 1 つだけ生成**し、`SessionAIChatSheet` 内の store にも同じインスタンスを渡す。
+- citation tap → `SessionAIChatStore.handleCitationTap` → `jumpStore.requestJump` → `TranscriptTabView.onChange(of: pendingTarget)` → `ScrollViewReader.scrollTo` + `AVPlayer.seek`
+- `sheet` closed 中でも `jumpStore` は alive なので、sheet を閉じてから transcript の jump を完了させることも可能。
 
 ## 4. チェックリスト
 
