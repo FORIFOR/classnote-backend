@@ -108,27 +108,74 @@ Error envelope (統一):
 
 ## Firestore schema
 
-### Conversation docs
+### Conversation docs (Phase 7.3 — sub-collection form)
 
 ```
 sessions/{sessionId}/conversations/{conversationId}
   conversationId  : string
   scope           : { type, sessionId }
   ownerAccountId  : string
-  createdAt, updatedAt
-  messages        : [
-    { role: "user"|"assistant", text: string, at: timestamp,
-      citations?: [...], mode?: string, usedModel?: string }
-  ]
+  schemaVersion   : 2
+  createdAt, updatedAt, lastMessageAt  : serverTimestamp
+  messageCount    : number (Firestore.Increment)
+  # NO `messages` array. Each message is its own doc below.
 
-accounts/{accountId}/conversations/{conversationId}   # general scope
-  (same shape, no scope.sessionId)
+sessions/{sessionId}/conversations/{conversationId}/messages/{messageId}
+  messageId       : string (= Firestore doc id)
+  conversationId  : string
+  role            : "user" | "assistant"
+  text            : string
+  createdAt       : serverTimestamp
+  clientSortKey   : number (monotonic ms — stable sort before serverTs resolves)
+  authorUid?      : string        # user messages only
+  authorAccountId?: string        # user messages only
+  citations?      : [...]         # assistant messages only
+  mode?           : string        # assistant messages only
+  usedModel?      : string        # assistant messages only
+
+accounts/{accountId}/conversations/{conversationId}       # general scope
+accounts/{accountId}/conversations/{conversationId}/messages/{messageId}
+  (same shape, scope.type = "general", no scope.sessionId)
 ```
 
-**Note (MVP limitation)**: `messages` is appended using read-modify-write on
-the whole array — no concurrency control. Fine for single-user single-device
-usage; needs a sub-collection rewrite if multiple tabs/devices write the
-same conversation simultaneously. Tracked as Phase 7.3.
+**Why sub-collection**: each message is an independent Firestore doc, so
+concurrent appends (multi-tab / multi-device / server-side retry) are
+conflict-free. The previous MVP stored the whole array under one doc and
+used read-modify-write, which lost updates under concurrency.
+
+**Writes are batched**: `chat_once` / `chat_stream` commit *two* message
+docs (user + assistant) plus the parent metadata update in a single
+`db.batch()` so a crash between them can't leave a half-written turn.
+
+**Sort order**: LLM context load does
+`messages.order_by(createdAt DESC).limit(12)` then reverses to
+chronological. If two docs land with identical `serverTimestamp`,
+`clientSortKey` (wall-clock ms at write time, +1 for the assistant reply)
+gives a stable tie-breaker.
+
+**Listener pattern**: clients may subscribe directly to
+`sessions/{id}/conversations/{cid}/messages` (rules: Phase 3) and append
+UI rows as messages arrive. This is how the Desktop / iOS chat view stays
+live without polling.
+
+### Retrieval endpoints (Phase 7.3)
+
+```
+GET /v1/sessions/{sessionId}/chat/conversations/{conversationId}/messages
+  ?limit=50&before=<clientSortKey>
+    → { conversationId, scope, messages: [...], nextCursor }
+
+GET /v1/chat/conversations/{conversationId}/messages   # general scope
+  ?limit=50&before=<clientSortKey>
+    → same shape
+```
+
+- Messages returned in **reverse-chronological order**.
+- `nextCursor` = last message's `clientSortKey` when a full page was
+  returned; pass it as `before=` for the next older page.
+- `limit` capped at 200.
+- Permission: session scope honors `compute_permissions` owner / shared;
+  general scope requires the caller's accountId to own the parent path.
 
 ## Credits policy
 
@@ -214,7 +261,13 @@ keys returned by `/v1/session-details/{id}/transcript`.
   - Client should append `token.data.text` until `done` arrives.
   - `done.data.citations` は stream 終了後に非同期で構築された結果。
   - LLM 失敗時は credits 自動 refund + `event:error`。
-- **Phase 7.3**: conversation as sub-collection (solve concurrent append)
+- ~~**Phase 7.3**: conversation as sub-collection (solve concurrent append)~~ ✅ 完了
+  - Messages は `conversations/{cid}/messages/{messageId}` の独立 doc
+  - batched write で user + assistant + parent metadata を atomic に更新
+  - `GET /v1/sessions/{sid}/chat/conversations/{cid}/messages` と
+    `GET /v1/chat/conversations/{cid}/messages` が pagination 対応
+  - 並列 append 時の lost update 問題は解消済み
+  - clients は listener で messages sub-collection を直接 subscribe 可能 (rules は Phase 3 で許可済み)
 - **Phase 7.4**: embedding-based retrieval via Vertex AI
 - **Phase 7.5**: explicit Tool Runner with function-calling (jump_to_timestamp,
   insert_into_notes, generate_quiz_from_session as server-side tools)
