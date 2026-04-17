@@ -267,6 +267,12 @@ def enrich_summary_with_anchors(
         if not isinstance(items, list):
             continue
         for item in items:
+            # Phase 7.10: forward-path citation already satisfied
+            # (llm._hydrate_source_segment_ids populated sourceSegmentIds +
+            # segmentId + startSec from LLM-provided ids). Skip text matching
+            # to avoid overwriting the more reliable LLM result.
+            if isinstance(item, dict) and item.get("sourceSegmentIds"):
+                continue
             before = isinstance(item, dict) and item.get("anchorMs") is not None
             _enrich_dict_item(item, text_key, normalized_segments)
             if not before and isinstance(item, dict) and item.get("anchorMs") is not None:

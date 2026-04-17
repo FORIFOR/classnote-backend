@@ -172,6 +172,54 @@ def normalize_summary_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dic
     ):
         _normalize_list(key)
 
+    # Phase 7.10: surface citation fields the llm hydrator populated
+    # (sourceSegmentIds, segmentId, startSec/endSec, sourceCount) on
+    # every bullet list. These are additive — existing `evidence: []`
+    # behavior is preserved for clients that already consume it.
+    for key in (
+        "highlights",
+        "keyPoints",
+        "decisions",
+        "todos",
+        "openQuestions",
+        "discussionPoints",
+        "conversationHighlights",
+    ):
+        items = result.get(key)
+        if not isinstance(items, list):
+            continue
+        normalized_citations: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            # Keep the existing shape; just make sure citation fields are
+            # present and typed when the llm/anchor step put them there.
+            cit_fields: Dict[str, Any] = {}
+            src_ids = item.get("sourceSegmentIds")
+            if isinstance(src_ids, list) and src_ids:
+                cit_fields["sourceSegmentIds"] = [str(x) for x in src_ids]
+            seg_id = item.get("segmentId")
+            if isinstance(seg_id, (str, int)) and str(seg_id):
+                cit_fields["segmentId"] = str(seg_id)
+            for ms_key in ("startMs", "endMs"):
+                v = item.get(ms_key)
+                if isinstance(v, (int, float)):
+                    cit_fields[ms_key] = int(v)
+            for sec_key in ("startSec", "endSec"):
+                v = item.get(sec_key)
+                if isinstance(v, (int, float)):
+                    cit_fields[sec_key] = round(float(v), 2)
+            if "startMs" in cit_fields and "startSec" not in cit_fields:
+                cit_fields["startSec"] = round(cit_fields["startMs"] / 1000.0, 2)
+            if "endMs" in cit_fields and "endSec" not in cit_fields:
+                cit_fields["endSec"] = round(cit_fields["endMs"] / 1000.0, 2)
+            source_count = item.get("sourceCount")
+            if isinstance(source_count, int):
+                cit_fields["sourceCount"] = source_count
+            item.update(cit_fields)
+            normalized_citations.append(item)
+        result[key] = normalized_citations
+
     # sections have nested bullets
     sections = result.get("sections")
     if isinstance(sections, list):
