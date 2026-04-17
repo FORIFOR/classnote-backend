@@ -421,11 +421,13 @@ async def send_chat(
         all_session_titles.append(session_context.get("title", ""))
 
     # Stage 1: Classify intent
-    route = classify_route(
+    route = await classify_route(
         message=message,
-        session_titles=all_session_titles if all_session_titles else None,
-        has_active_session=session_context is not None,
-        conversation_context=state.get("active_session_title", ""),
+        session_titles=all_session_titles,
+        active_session_title=state.get("active_session_title"),
+        state=state,
+        freshness_hint=needs_fresh_grounding(message),
+        ui_scope=req.ui_scope,
     )
     logger.info(f"[Chat/send] Route: {route}")
 
@@ -471,7 +473,8 @@ async def send_chat(
                     session_ids = req.recent_session_ids[:20]
                 else:
                     session_ids = _auto_resolve_sessions(user, message)
-                contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+                # SECURITY: always access-check — recent_session_ids is client-controlled
+                contexts = _load_session_contexts(session_ids, user, message)
 
             # Stage 2: Judge sufficiency
             if contexts:
@@ -751,6 +754,122 @@ def _sse(event_type: str, data: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+_ES_CREATE_SYSTEM = """あなたはエントリーシート（ES）作成の専門家です。
+就職・転職活動中のユーザーが、企業への応募書類を作成するサポートをしてください。
+
+■ 役割
+- ユーザーが提示する企業名・設問・文字数制限に合わせて、説得力のある回答案を生成してください。
+- 簡潔かつ具体的なエピソード・数値を盛り込み、採用担当者に響く文体で書いてください。
+- 必要に応じてSTAR法（状況・課題・行動・結果）を活用してください。
+
+■ 出力形式
+- Markdown記法（#, *, **など）は使わないでください。
+- 箇条書きは「・」を使ってください。
+- 回答本文と、簡単な改善アドバイス（1〜2文）を返してください。"""
+
+_ES_MOCK_SYSTEM = """あなたは採用面接官として振る舞います。
+ユーザーのESや志望動機をもとに、実際の面接のように深掘り質問を行ってください。
+
+■ 役割
+- 1ターンに1問だけ質問してください。複数問を一度に聞かないでください。
+- ユーザーの前回の回答に対し、短評（1〜2文）を述べてから次の質問に移ってください。
+- 表面的な回答には「もう少し具体的に教えてください」と深掘りしてください。
+- 面接全体を通じて自然な会話の流れを保ってください。
+
+■ 出力形式
+- Markdown記法は使わないでください。
+- 短評 → 次の質問、の順で返してください。"""
+
+
+def _stream_es_scope(req: "ChatRequest", user, account_id: str, message: str, t0: float, pre_info: dict):
+    """Early-return streaming handler for es_create / es_mock ui_scopes."""
+    from app.services.gemini_chat import stream_gemini_chat, GENERAL_MODEL_NAME
+    from vertexai.generative_models import GenerativeModel, GenerationConfig
+    import vertexai as _vertexai
+    import os as _os
+
+    system_instruction = _ES_CREATE_SYSTEM if req.ui_scope == "es_create" else _ES_MOCK_SYSTEM
+    mode = "general_static"
+    credit_cost = estimate_cost(mode)
+
+    allowed, consume_info = ai_credits.consume(account_id, credit_cost, mode)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": consume_info.get("reason", "credit_limit"),
+                "credit_cost": credit_cost,
+                "credits_remaining": consume_info.get("remaining", 0),
+            },
+        )
+    credits_remaining = consume_info.get("remaining", 0)
+
+    # Build prompt: history + current message
+    history_lines = []
+    for h in req.history[-6:]:
+        role_label = "ユーザー" if h.role == "user" else "アシスタント"
+        history_lines.append(f"{role_label}: {h.text}")
+    history_text = "\n".join(history_lines) if history_lines else "(初回)"
+
+    turn_prompt = f"""[会話履歴]
+{history_text}
+
+[ユーザーの入力]
+{message}"""
+
+    def event_stream():
+        yield _sse("meta", {
+            "mode": mode,
+            "model": GENERAL_MODEL_NAME,
+            "used_search": False,
+            "used_sessions": [],
+            "display_scope": "ES・面接サポート",
+            "credit_cost": credit_cost,
+            "credits_remaining": credits_remaining,
+        })
+
+        full_text = ""
+        try:
+            project = _os.environ.get("GOOGLE_CLOUD_PROJECT") or _os.environ.get("GCP_PROJECT")
+            region = _os.environ.get("VERTEX_REGION", "us-central1")
+            _vertexai.init(project=project, location=region)
+
+            model = GenerativeModel(
+                GENERAL_MODEL_NAME,
+                system_instruction=system_instruction,
+            )
+            config = GenerationConfig(temperature=0.6, top_p=0.9)
+            for chunk in model.generate_content(turn_prompt, generation_config=config, stream=True):
+                text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+                if text:
+                    full_text += text
+                    yield _sse("token", {"text": text})
+        except Exception as e:
+            logger.error(f"[Chat/stream/{req.ui_scope}] Gemini error: {e}", exc_info=True)
+            ai_credits.refund(account_id, credit_cost, mode)
+            yield _sse("error", {"message": "AI service temporarily unavailable"})
+            return
+
+        t_end = time.monotonic()
+        logger.info(
+            f"[Chat/stream/{req.ui_scope}] DONE uid={user.uid} "
+            f"latency={int((t_end - t0)*1000)}ms answer_len={len(full_text)}"
+        )
+        yield _sse("done", {
+            "full_text": full_text,
+            "conversation_state": {},
+            "conversation_summary_next": f"ユーザー: {message[:100]}。回答: {full_text[:200]}",
+            "credits_remaining": credits_remaining,
+            "used_sessions": [],
+        })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/stream")
 async def chat_stream(
     req: ChatRequest,
@@ -790,6 +909,10 @@ async def chat_stream(
                 "credits_remaining": pre_info.get("remaining", 0),
             },
         )
+
+    # ── 2b. ES / mock interview scopes (bypass session routing) ──
+    if req.ui_scope in ("es_create", "es_mock"):
+        return _stream_es_scope(req, user, account_id, message, t0, pre_info)
 
     # ── 3. Resolve referent / TODO / active session ──
     referent = resolve_referent(message, state)
@@ -878,7 +1001,8 @@ async def chat_stream(
                 session_ids = req.recent_session_ids[:50]
             else:
                 session_ids = _auto_resolve_sessions(user, message)
-            contexts = _load_session_contexts(session_ids, user, message, skip_access_check=True)
+            # SECURITY: always access-check — recent_session_ids is client-controlled
+            contexts = _load_session_contexts(session_ids, user, message)
 
         if contexts:
             suff = judge_sufficiency(message, contexts[0])

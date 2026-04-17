@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from google.cloud import firestore
 from pydantic import BaseModel, Field
 
-from app.dependencies import get_current_user, CurrentUser, CurrentUser
+from app.dependencies import get_current_user, CurrentUser, verify_cloud_tasks_request
 from app.firebase import db
 from app.services.apple import apple_service
 from app.services.app_config import is_feature_enabled, get_maintenance_error_response
@@ -338,6 +338,14 @@ async def sync_ios_entitlements(
         actual_product_id = apple_status.get("product_id") or product_id
         existing_token = apple_status.get("app_account_token")
 
+        # SECURITY: only Production transactions may drive account.plan updates.
+        # Sandbox/TestFlight users can still produce "active" responses from
+        # Apple — without this guard they could flip production accounts/plan
+        # to "basic". Matches the policy used in confirm_ios_purchase.
+        transaction_info = apple_status.get("transaction") or {}
+        jws_env = transaction_info.get("environment", "Production")
+        is_production_item = jws_env == "Production"
+
         # Determine plan from product_id
         plan = _plan_for_product_id(actual_product_id)
         if not active:
@@ -399,12 +407,21 @@ async def sync_ios_entitlements(
 
         entitlement_ref.set(entitlement_data, merge=True)
 
-        # 5. Update account plan if this is the best entitlement
-        if active and plan != "free":
+        # 5. Update account plan if this is the best entitlement (Production ONLY)
+        if active and plan != "free" and is_production_item:
             is_entitled = True
             if plan == "basic":  # or compare priority
                 best_plan = plan
                 best_expires_at = expires_date
+        elif active and plan != "free" and not is_production_item:
+            logger.info(
+                "entitlements_sync_sandbox_ignored_for_plan",
+                extra={
+                    "originalTransactionId": original_transaction_id,
+                    "environment": jws_env,
+                    "uid": current_user.uid,
+                },
+            )
 
         synced_details.append({
             "originalTransactionId": original_transaction_id,
@@ -717,14 +734,20 @@ async def confirm_ios_purchase(
     )
 
 
-@router.post("/apple/reconcile")
+@router.post("/apple/reconcile", dependencies=[Depends(verify_cloud_tasks_request)])
 async def reconcile_apple_subscriptions():
     """
     Daily reconciliation task: Verify all active Apple subscriptions against Apple API.
 
-    This endpoint should be called by Cloud Scheduler (cron job) once per day.
+    This endpoint should be called by Cloud Scheduler / Cloud Tasks once per day.
     It fetches all subscriptions marked as active/billing_retry/grace_period and
     verifies their current status with Apple's Get All Subscription Statuses API.
+
+    SECURITY: gated by `verify_cloud_tasks_request` so only Cloud Tasks /
+    Cloud Scheduler with the internal secret (or a valid Cloud Tasks header)
+    can trigger it. Previously this was public, which let anyone drive
+    unbounded Apple API calls and flip any `accounts/{id}.plan` to free on
+    transient "not_found".
 
     Returns:
         Summary of reconciliation results
@@ -942,6 +965,14 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
             webhook_env = fields.get("environment", "Production")
             is_production_webhook = webhook_env == "Production"
 
+            # [NEW 2026-02] Extract autoRenewStatus from renewal_info
+            # autoRenewStatus: 1 = will renew, 0 = user cancelled (won't renew)
+            auto_renew_status = None
+            if renewal_info:
+                auto_renew_raw = _get_field(renewal_info, "autoRenewStatus")
+                if auto_renew_raw is not None:
+                    auto_renew_status = int(auto_renew_raw) == 1
+
             if not is_production_webhook:
                 logger.info(
                     "billing.webhook.sandbox_transaction",
@@ -961,14 +992,19 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
             if link_doc.exists:
                 account_id = link_doc.to_dict().get("accountId")
                 if account_id and is_production_webhook:
-                    db.collection("accounts").document(account_id).set({
+                    account_update = {
                         "plan": plan,
                         "planExpiresAt": _ms_to_datetime(fields.get("expiresDateMs")),
                         "planUpdatedAt": firestore.SERVER_TIMESTAMP,
                         "lastTransactionId": fields.get("transactionId"),
                         "originalTransactionId": original_transaction_id,
                         "appleEntitlementId": f"apple:{original_transaction_id}" if original_transaction_id else None,
-                    }, merge=True)
+                    }
+                    # [NEW 2026-02] Store autoRenewStatus for UI display
+                    # This allows iOS to show "有効期限: ○月○日まで（更新予定なし）"
+                    if auto_renew_status is not None:
+                        account_update["subscriptionAutoRenews"] = auto_renew_status
+                    db.collection("accounts").document(account_id).set(account_update, merge=True)
 
                     logger.info(
                          "subscription_state_transition",
@@ -978,9 +1014,22 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                              "toPlan": plan,
                              "reason": f"notification_{notification_type}",
                              "transactionId": fields.get("transactionId"),
-                             "expiresAt": fields.get("expiresDateMs")
+                             "expiresAt": fields.get("expiresDateMs"),
+                             "autoRenewStatus": auto_renew_status,
                          }
                      )
+
+                    # [NEW 2026-02] Log when user cancels auto-renewal
+                    if notification_type == "DID_CHANGE_RENEWAL_STATUS" and auto_renew_status is False:
+                        logger.info(
+                            "subscription_auto_renew_cancelled",
+                            extra={
+                                "uid": uid,
+                                "accountId": account_id,
+                                "expiresAt": fields.get("expiresDateMs"),
+                                "note": "User cancelled auto-renewal. Still active until expiresAt."
+                            }
+                        )
 
             # Update entitlements collection (record both Production and Sandbox for auditing)
             if original_transaction_id:
@@ -996,6 +1045,9 @@ async def handle_app_store_notifications(req: AppStoreNotificationRequest):
                     "updatedAt": firestore.SERVER_TIMESTAMP,
                     "updatedBy": "webhook",
                 }
+                # [NEW 2026-02] Store autoRenewStatus for UI display
+                if auto_renew_status is not None:
+                    entitlement_update["autoRenewStatus"] = auto_renew_status
                 # Only set ownerAccountId/ownerUserId if not already set (don't overwrite)
                 existing_entitlement = entitlement_ref.get()
                 if not existing_entitlement.exists:
