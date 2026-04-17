@@ -154,12 +154,16 @@ def list_presets() -> List[Dict[str, str]]:
 @dataclass
 class ChatContext:
     user: Any  # CurrentUser
-    scope: Dict[str, Any]  # {"type": "session"|"general", "sessionId"?: str}
+    scope: Dict[str, Any]  # {"type": "session"|"general"|"multi_session"|"overlay_live", "sessionId"?: str, "sessionIds"?: [str]}
     message: str
     preset: Optional[str] = None
     conversation_id: Optional[str] = None
-    selected_context: Optional[Dict[str, Any]] = None  # {"tab","evidenceId","quote"...}
+    selected_context: Optional[Dict[str, Any]] = None  # legacy alias for clientContext; kept for backwards compat
     history: Optional[List[Dict[str, str]]] = None  # [{"role","text"}]
+    # v2 contract extensions (Phase 7.4)
+    client_context: Optional[Dict[str, Any]] = None  # {"surface","activeTab","selectedText","selectedEvidenceId","selectedSegmentId","currentPlaybackMs"}
+    response_mode: Optional[str] = None  # "default" | "concise" | "structured" | "rewrite" | "coaching"
+    idempotency_key: Optional[str] = None
 
 
 def _scope_type(ctx: ChatContext) -> str:
@@ -396,6 +400,64 @@ def _save_turn(
         batch.commit()
     except Exception as e:
         logger.warning(f"[session_chat] conversation save failed: {e}")
+
+
+def _write_chat_trace(
+    *,
+    ctx: ChatContext,
+    conversation_id: str,
+    scope_type: str,
+    intent: str,
+    mode_label: str,
+    used_model: Optional[str],
+    citations: List[Dict[str, Any]],
+    latency_ms: int,
+    route_needs_web: bool,
+    has_summary: bool,
+) -> None:
+    """Persist a diagnostic trace for every assistant turn.
+
+    Stored at /chat_traces/{traceId} (root-level collection so admin
+    dashboards can query across sessions). Never block user-visible flow.
+    """
+    try:
+        trace_id = f"trace_{uuid.uuid4().hex[:20]}"
+        sid = (ctx.scope or {}).get("sessionId")
+        db.collection("chat_traces").document(trace_id).set(
+            {
+                "id": trace_id,
+                "conversationId": conversation_id,
+                "sessionId": sid,
+                "userId": ctx.user.uid,
+                "accountId": ctx.user.account_id,
+                "routing": {
+                    "scopeType": scope_type,
+                    "intent": intent,
+                    "modeLabel": mode_label,
+                    "usedWeb": route_needs_web,
+                    "usedSummary": has_summary,
+                    "preset": ctx.preset,
+                    "responseMode": ctx.response_mode,
+                },
+                "clientContext": ctx.client_context or ctx.selected_context or None,
+                "citations": [
+                    {
+                        "kind": c.get("type"),
+                        "segmentId": c.get("segmentId"),
+                        "startMs": c.get("startMs"),
+                        "endMs": c.get("endMs"),
+                        "score": c.get("score"),
+                    }
+                    for c in (citations or [])[:10]
+                ],
+                "citationCount": len(citations or []),
+                "usedModel": used_model,
+                "latencyMs": {"total": latency_ms},
+                "createdAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception as e:
+        logger.warning(f"[session_chat] chat_trace write failed: {e}")
 
 
 def fetch_conversation_messages(
@@ -640,17 +702,53 @@ async def chat_once(ctx: ChatContext) -> Dict[str, Any]:
         used_model,
     )
 
+    # 9. Build v2-shape response (Phase 7.4)
+    intent = infer_intent(ctx.message, scope_type)
+    blocks = _build_answer_blocks(answer)
+    actions = _build_actions(scope_type, citations, answer, intent)
+    confidence = infer_confidence(
+        citations,
+        has_summary=bool(session_context and session_context.get("summary")),
+        scope_type=scope_type,
+        used_web=route.needs_web,
+    )
+
+    # 10. Persist chat_trace (best effort; never block response)
+    try:
+        await asyncio.to_thread(
+            _write_chat_trace,
+            ctx=ctx,
+            conversation_id=conversation_id,
+            scope_type=scope_type,
+            intent=intent,
+            mode_label=mode_label,
+            used_model=used_model,
+            citations=citations,
+            latency_ms=elapsed_ms,
+            route_needs_web=route.needs_web,
+            has_summary=bool(session_context and session_context.get("summary")),
+        )
+    except Exception as trace_err:
+        logger.warning(f"[v1/chat] trace write failed: {trace_err}")
+
     return {
         "conversationId": conversation_id,
         "scope": ctx.scope,
         "preset": ctx.preset,
         "mode": mode_label,
         "usedModel": used_model,
-        "answer": {"text": answer},
+        "intent": intent,
+        "confidence": confidence,
+        "answer": {
+            "text": answer,        # kept for v1 clients
+            "blocks": blocks,      # v2 structured
+        },
         "citations": citations,
+        "actions": actions,
         "creditCost": credit_cost,
         "creditsRemaining": credits_remaining,
         "latencyMs": elapsed_ms,
+        # v1 client compat (preset chips) — unchanged, now complementary to actions
         "suggestedActions": _suggest_follow_up_actions(ctx.preset, scope_type),
     }
 
@@ -670,6 +768,232 @@ def _suggest_follow_up_actions(preset: Optional[str], scope_type: str) -> List[D
     if preset and preset in rotation:
         rotation.remove(preset)
     return [{"id": pid, "label": _PRESETS[pid]["label"]} for pid in rotation[:3]]
+
+
+# ---------------------------------------------------------------------------
+# Answer block construction (Phase 7.4 — structured answer shape)
+#
+# The LLM returns plaintext. We produce a minimal `blocks[]` structure that
+# the client can render without special parsing. Detection is conservative:
+#  - consecutive "・" / "-" / "•" lines → bullet_list
+#  - consecutive "1. " / "2. " lines    → numbered_list
+#  - "## " or "### " prefix → section header (body follows until blank line)
+#  - everything else → paragraph
+#
+# This is intentionally heuristic. A future Phase 7.5+ may request JSON
+# output directly from the LLM with an answer-schema constraint; until
+# then, this preserves the exact answer text under `text` while giving
+# clients a predictable block structure to render.
+# ---------------------------------------------------------------------------
+
+
+import re as _re
+
+
+_BULLET_PREFIX_RE = _re.compile(r"^\s*(?:[・•\-]|\*)\s+")
+_NUMBERED_PREFIX_RE = _re.compile(r"^\s*(\d+)[.)]\s+")
+_HEADING_PREFIX_RE = _re.compile(r"^\s*(#{1,3})\s+(.+)$")
+
+
+def _strip_bullet_marker(line: str) -> str:
+    line = _BULLET_PREFIX_RE.sub("", line, count=1)
+    line = _NUMBERED_PREFIX_RE.sub("", line, count=1)
+    return line.strip()
+
+
+def _build_answer_blocks(text: str) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    lines = text.splitlines()
+    blocks: List[Dict[str, Any]] = []
+    paragraph_buf: List[str] = []
+    bullet_buf: List[str] = []
+    numbered_buf: List[str] = []
+
+    def _flush_paragraph():
+        nonlocal paragraph_buf
+        if paragraph_buf:
+            joined = " ".join(p.strip() for p in paragraph_buf if p.strip())
+            if joined:
+                blocks.append({"type": "paragraph", "text": joined})
+            paragraph_buf = []
+
+    def _flush_bullets():
+        nonlocal bullet_buf
+        if bullet_buf:
+            blocks.append({"type": "bullet_list", "items": bullet_buf})
+            bullet_buf = []
+
+    def _flush_numbered():
+        nonlocal numbered_buf
+        if numbered_buf:
+            blocks.append({"type": "numbered_list", "items": numbered_buf})
+            numbered_buf = []
+
+    def _flush_all():
+        _flush_paragraph()
+        _flush_bullets()
+        _flush_numbered()
+
+    for raw in lines:
+        line = raw.rstrip()
+        if not line.strip():
+            _flush_all()
+            continue
+
+        heading = _HEADING_PREFIX_RE.match(line)
+        if heading:
+            _flush_all()
+            title = heading.group(2).strip()
+            blocks.append({"type": "section", "title": title, "body": ""})
+            continue
+
+        if _BULLET_PREFIX_RE.match(line):
+            _flush_paragraph()
+            _flush_numbered()
+            bullet_buf.append(_strip_bullet_marker(line))
+            continue
+
+        if _NUMBERED_PREFIX_RE.match(line):
+            _flush_paragraph()
+            _flush_bullets()
+            numbered_buf.append(_strip_bullet_marker(line))
+            continue
+
+        _flush_bullets()
+        _flush_numbered()
+        # If the last block is a section with empty body, pour into body
+        if blocks and blocks[-1].get("type") == "section" and not blocks[-1].get("body"):
+            blocks[-1]["body"] = line.strip()
+            continue
+        paragraph_buf.append(line)
+
+    _flush_all()
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Intent router (rule-based fallback — v2)
+#
+# The existing `chat_router.classify_route` is LLM-based; this is the cheap
+# keyword-pass used to tag chat_traces.routing.intent and choose the task
+# prompt without an LLM roundtrip.
+# ---------------------------------------------------------------------------
+
+
+INTENT_KEYWORDS: Dict[str, List[str]] = {
+    "session_todo_extraction": ["TODO", "todo", "タスク", "宿題", "やること", "アクションアイテム"],
+    "session_decision_extraction": ["決定", "決めた", "合意", "結論", "決まった"],
+    "session_summary_rewrite": ["Slack", "slack", "メール", "共有文", "短く", "要約して"],
+    "session_compare": ["比較", "違い", "前回", "前の"],
+    "web_grounded_qa": ["最新", "最近", "今日", "直近", "ニュース", "現在"],
+    "quiz_generation": ["クイズ", "テスト", "理解度", "問題"],
+}
+
+
+def infer_intent(text: str, scope_type: str) -> str:
+    if not text:
+        return "session_qa" if scope_type == "session" else "general_knowledge"
+    lowered = text.lower()
+    for intent, keywords in INTENT_KEYWORDS.items():
+        if any(k in text or k.lower() in lowered for k in keywords):
+            if intent == "web_grounded_qa" and scope_type in ("session", "multi_session"):
+                return "web_grounded_qa"
+            if intent.startswith("session_") and scope_type in ("session", "multi_session"):
+                return intent
+            if intent == "quiz_generation":
+                return intent
+            if intent == "web_grounded_qa":
+                return intent
+    if scope_type == "overlay_live":
+        return "meeting_assist_live"
+    if scope_type == "general":
+        return "general_knowledge"
+    return "session_qa"
+
+
+def infer_confidence(
+    citations: List[Dict[str, Any]],
+    has_summary: bool,
+    scope_type: str,
+    used_web: bool,
+) -> str:
+    if scope_type == "general" and used_web:
+        return "medium"
+    if scope_type == "general":
+        return "low"
+    if len(citations) >= 2 and has_summary:
+        return "high"
+    if citations or has_summary:
+        return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Action builder (Phase 7.4 — discriminated union payloads)
+# ---------------------------------------------------------------------------
+
+
+def _build_actions(
+    scope_type: str,
+    citations: List[Dict[str, Any]],
+    answer_text: str,
+    intent: str,
+) -> List[Dict[str, Any]]:
+    """Build suggested `actions[]` with concrete payloads for the client.
+
+    Action types that may appear:
+      - jump_to_transcript   (if transcript citation present)
+      - save_as_note         (always suggestable for session scope)
+      - create_todo          (if intent=session_todo_extraction or answer contains TODO bullets)
+      - copy_answer          (always)
+      - rewrite_answer       (slack / email / summary modes)
+    """
+    actions: List[Dict[str, Any]] = []
+
+    if scope_type == "session":
+        # Jump to the top-scored transcript citation
+        top_transcript = next(
+            (c for c in citations if c.get("type") == "transcript" and c.get("startMs") is not None),
+            None,
+        )
+        if top_transcript:
+            actions.append(
+                {
+                    "type": "jump_to_transcript",
+                    "targetMs": int(top_transcript["startMs"]),
+                    "segmentId": top_transcript.get("segmentId"),
+                }
+            )
+
+        if answer_text:
+            actions.append(
+                {
+                    "type": "save_as_note",
+                    "payload": {"text": answer_text[:2000]},
+                }
+            )
+
+        if intent == "session_todo_extraction":
+            # Extract each bullet as a candidate TODO payload
+            for block in _build_answer_blocks(answer_text):
+                if block.get("type") == "bullet_list":
+                    for item in block.get("items", [])[:5]:
+                        actions.append(
+                            {
+                                "type": "create_todo",
+                                "payload": {"text": item},
+                            }
+                        )
+                    break
+
+    actions.append({"type": "copy_answer"})
+
+    if intent == "session_summary_rewrite":
+        actions.append({"type": "rewrite_answer", "mode": "slack"})
+        actions.append({"type": "rewrite_answer", "mode": "email"})
+
+    return actions
 
 
 # ---------------------------------------------------------------------------
@@ -789,26 +1113,38 @@ async def chat_stream(ctx: ChatContext):
     On LLM failure: yields `error` event and refunds the consumed credits.
     Client is expected to implement reconnection / backoff independently.
     """
+    # v2 event order (Phase 7.4): meta → status(routing) → status(retrieving)
+    #                            → status(generating) → token* → citation*
+    #                            → action* → message → done
+    yield {"event": "status", "data": {"phase": "routing"}}
     prep = await _prepare_chat(ctx)
+    intent = infer_intent(ctx.message, prep.scope_type)
     used_model = (
         CHAT_MODEL_NAME
         if prep.scope_type == "session" and not prep.route_needs_web
         else GENERAL_MODEL_NAME
     )
     t_start = time.monotonic()
+    message_id = f"msg_ai_{uuid.uuid4().hex[:16]}"
 
     yield {
         "event": "meta",
         "data": {
             "conversationId": prep.conversation_id,
+            "messageId": message_id,
             "scope": ctx.scope,
             "preset": ctx.preset,
+            "intent": intent,
             "mode": prep.mode_label,
             "usedModel": used_model,
             "creditCost": prep.credit_cost,
             "creditsRemaining": prep.credits_remaining,
         },
     }
+
+    if prep.scope_type == "session":
+        yield {"event": "status", "data": {"phase": "retrieving"}}
+    yield {"event": "status", "data": {"phase": "generating"}}
 
     full_text_parts: List[str] = []
 
@@ -853,7 +1189,9 @@ async def chat_stream(ctx: ChatContext):
             if not chunk:
                 continue
             full_text_parts.append(chunk)
-            yield {"event": "token", "data": {"text": chunk}}
+            # v2 contract emits `delta`; v1 clients still listen to `token`
+            yield {"event": "delta", "data": {"text": chunk}}
+            yield {"event": "token", "data": {"text": chunk}}  # v1 compat
 
     except Exception as e:
         logger.exception(f"[v1/chat:stream] LLM stream failed: {e}")
@@ -887,15 +1225,68 @@ async def chat_stream(ctx: ChatContext):
         used_model,
     )
 
+    # Emit citations as individual events (v2 clients can render them live)
+    for c in citations:
+        yield {"event": "citation", "data": {"citation": c}}
+
+    blocks = _build_answer_blocks(full_text)
+    actions = _build_actions(prep.scope_type, citations, full_text, intent)
+    confidence = infer_confidence(
+        citations,
+        has_summary=bool(prep.session_context and prep.session_context.get("summary")),
+        scope_type=prep.scope_type,
+        used_web=prep.route_needs_web,
+    )
+    for a in actions:
+        yield {"event": "action", "data": {"action": a}}
+
+    # Final structured message (v2) — clients can skip streaming and wait for this
+    yield {
+        "event": "message",
+        "data": {
+            "message": {
+                "messageId": message_id,
+                "answer": {"text": full_text, "blocks": blocks},
+                "citations": citations,
+                "actions": actions,
+                "confidence": confidence,
+            }
+        },
+    }
+
+    latency_ms = int((time.monotonic() - t_start) * 1000)
+
+    # Best-effort trace
+    try:
+        await asyncio.to_thread(
+            _write_chat_trace,
+            ctx=ctx,
+            conversation_id=prep.conversation_id,
+            scope_type=prep.scope_type,
+            intent=intent,
+            mode_label=prep.mode_label,
+            used_model=used_model,
+            citations=citations,
+            latency_ms=latency_ms,
+            route_needs_web=prep.route_needs_web,
+            has_summary=bool(prep.session_context and prep.session_context.get("summary")),
+        )
+    except Exception:
+        pass
+
     yield {
         "event": "done",
         "data": {
             "conversationId": prep.conversation_id,
-            "answer": {"text": full_text},
+            "messageId": message_id,
+            "answer": {"text": full_text, "blocks": blocks},
             "citations": citations,
+            "actions": actions,
+            "confidence": confidence,
+            "intent": intent,
             "creditCost": prep.credit_cost,
             "creditsRemaining": prep.credits_remaining,
-            "latencyMs": int((time.monotonic() - t_start) * 1000),
+            "latencyMs": latency_ms,
             "suggestedActions": _suggest_follow_up_actions(ctx.preset, prep.scope_type),
         },
     }

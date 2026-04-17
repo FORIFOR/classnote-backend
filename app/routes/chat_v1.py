@@ -51,8 +51,9 @@ router = APIRouter(prefix="/v1", tags=["AI Chat v1"])
 
 
 class ChatScope(BaseModel):
-    type: Literal["session", "general"]
+    type: Literal["session", "general", "multi_session", "overlay_live"]
     sessionId: Optional[str] = None
+    sessionIds: Optional[List[str]] = None
 
 
 class ChatHistoryItem(BaseModel):
@@ -61,6 +62,7 @@ class ChatHistoryItem(BaseModel):
 
 
 class SelectedContext(BaseModel):
+    """Legacy alias of clientContext. Clients should migrate to `clientContext`."""
     tab: Optional[str] = None  # "overview" | "transcript" | "notes" | "quiz"
     evidenceId: Optional[str] = None
     quote: Optional[str] = Field(None, max_length=2000)
@@ -68,9 +70,33 @@ class SelectedContext(BaseModel):
     startMs: Optional[int] = None
 
 
+class ChatClientContext(BaseModel):
+    """Where the request originated (Phase 7.4 contract)."""
+    surface: Optional[
+        Literal[
+            "desktop_session_detail",
+            "ios_session_detail",
+            "global_chat",
+            "overlay",
+        ]
+    ] = None
+    activeTab: Optional[Literal["overview", "transcript", "notes", "quiz"]] = None
+    selectedText: Optional[str] = Field(None, max_length=2000)
+    selectedEvidenceId: Optional[str] = None
+    selectedSegmentId: Optional[str] = None
+    currentPlaybackMs: Optional[int] = None
+
+
+class UserMessageInput(BaseModel):
+    """Phase 7.4: request body carries `message: {text}` (wrapped)."""
+    text: str = Field("", max_length=4000)
+
+
 class ChatV1Request(BaseModel):
     scope: ChatScope
-    message: str = Field("", max_length=4000)
+    # `message` accepts both the legacy plain string and the new wrapped object.
+    # Pydantic discriminates on JSON shape at parse time.
+    message: Any = ""
     preset: Optional[
         Literal[
             "summarize",
@@ -84,6 +110,23 @@ class ChatV1Request(BaseModel):
     conversationId: Optional[str] = None
     history: Optional[List[ChatHistoryItem]] = None
     selectedContext: Optional[SelectedContext] = None
+    # Phase 7.4 additions
+    clientContext: Optional[ChatClientContext] = None
+    responseMode: Optional[
+        Literal["default", "concise", "structured", "rewrite", "coaching"]
+    ] = None
+    idempotencyKey: Optional[str] = Field(None, max_length=128)
+
+    def normalized_message(self) -> str:
+        """Return the user text regardless of legacy vs v2 shape."""
+        m = self.message
+        if isinstance(m, str):
+            return m
+        if isinstance(m, dict):
+            return str(m.get("text") or "")
+        if isinstance(m, UserMessageInput):
+            return m.text
+        return ""
 
 
 class Citation(BaseModel):
@@ -194,11 +237,14 @@ async def post_chat(
     ctx = ChatContext(
         user=current_user,
         scope=body.scope.model_dump(),
-        message=body.message or "",
+        message=body.normalized_message() or "",
         preset=body.preset,
         conversation_id=body.conversationId,
         selected_context=body.selectedContext.model_dump() if body.selectedContext else None,
         history=[h.model_dump() for h in (body.history or [])],
+        client_context=body.clientContext.model_dump() if body.clientContext else None,
+        response_mode=body.responseMode,
+        idempotency_key=body.idempotencyKey,
     )
 
     try:
@@ -372,11 +418,14 @@ async def post_chat_stream(
     ctx = ChatContext(
         user=current_user,
         scope=body.scope.model_dump(),
-        message=body.message or "",
+        message=body.normalized_message() or "",
         preset=body.preset,
         conversation_id=body.conversationId,
         selected_context=body.selectedContext.model_dump() if body.selectedContext else None,
         history=[h.model_dump() for h in (body.history or [])],
+        client_context=body.clientContext.model_dump() if body.clientContext else None,
+        response_mode=body.responseMode,
+        idempotency_key=body.idempotencyKey,
     )
 
     # Pre-flight: run NotFound/Forbidden/CreditLimit checks before opening the
