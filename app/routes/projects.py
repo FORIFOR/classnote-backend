@@ -34,6 +34,11 @@ class FolderCreateRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
 
 
+class FolderCreateAndAssignRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    color: Optional[str] = Field(None, max_length=32)
+
+
 class FolderUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=80)
     color: Optional[str] = Field(None, max_length=32)
@@ -184,6 +189,62 @@ async def set_session_organization(
         raise HTTPException(status_code=404, detail=str(exc))
 
     return {"ok": True, **result}
+
+
+@router.post("/sessions/{session_id}/folder:create-and-assign")
+async def create_folder_and_assign_session(
+    session_id: str,
+    body: FolderCreateAndAssignRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Atomic: create a new folder and assign this session to it.
+
+    Used by the post-recording sheet when the user types a new folder name
+    instead of picking an existing one. One round-trip instead of two, so
+    the client doesn't need to handle a half-created state on network errors.
+    """
+    # 1. Resolve session + permission
+    _, snapshot, resolved_id = _resolve_session(session_id, current_user.uid, current_user.account_id)
+    session_data = snapshot.to_dict() or {}
+    ensure_can_view(session_data, current_user, resolved_id)
+
+    # 2. Create folder (under caller's uid — matches existing POST /folders behavior)
+    now = _now()
+    folder_id = f"fld_{uuid.uuid4().hex[:16]}"
+    folder_payload = {
+        "name": body.name,
+        "color": body.color,
+        "description": None,
+        "isArchived": False,
+        "createdAt": now,
+        "updatedAt": now,
+        "deletedAt": None,
+    }
+    project_folders.folder_ref(current_user.uid, folder_id).set(folder_payload)
+
+    # 3. Assign
+    try:
+        organization = project_folders.set_session_organization(
+            uid=current_user.uid,
+            session_id=resolved_id,
+            folder_id=folder_id,
+            session_data=session_data,
+            finalized=(session_data.get("status") == "final"),
+            account_id=current_user.account_id,
+        )
+    except ValueError as exc:
+        # Very rare — folder was just created, but clean up anyway
+        try:
+            project_folders.folder_ref(current_user.uid, folder_id).delete()
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return {
+        "ok": True,
+        "folder": _serialize_doc(folder_id, folder_payload),
+        **organization,
+    }
 
 
 @router.get("/sessions/{session_id}/organization")
