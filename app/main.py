@@ -45,7 +45,7 @@ def _check_env_vars():
 
 _check_env_vars()
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, projects, session_details
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -242,6 +242,8 @@ app.include_router(account_merge.router, tags=["Account Merge"])
 app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
 app.include_router(sessions.router, tags=["Sessions"])
+app.include_router(session_details.router)  # /v1/session-details/* — read model BFF
+app.include_router(projects.router, tags=["Projects"])
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)
 app.include_router(websocket.router, tags=["Streaming"])
 app.include_router(auth.router, tags=["Authentication"])
@@ -299,6 +301,10 @@ app.include_router(invites.router, tags=["Invites"])
 # [NEW] AI Chat (session-aware conversational AI)
 app.include_router(chat.router, tags=["AI Chat"])
 
+# [NEW] Interview feature (analyze, meta, stats)
+from app.routes import interviews
+app.include_router(interviews.router, tags=["Interview"])
+
 # [NEW] Translation API (Cloud Translation v2)
 app.include_router(translate.router, tags=["Translation"])
 
@@ -324,6 +330,39 @@ try:
 except ImportError as e:
     print(f"WARNING: Failed to import billing_stripe router: {e}")
 
+# ============================================================================
+# API v2 Routers (new paths — coexist with legacy routes above)
+# ============================================================================
+try:
+    from app.api.routers import (
+        system as api_system, auth as api_auth, accounts as api_accounts,
+        users as api_users, billing as api_billing,
+        sessions as api_sessions, capture as api_capture,
+        artifacts as api_artifacts, jobs as api_jobs, ai as api_ai,
+        tasks as api_tasks, shares as api_shares,
+        watch as api_watch, ops as api_ops, admin as api_admin,
+        screen as api_screen,
+        v2 as api_v2,
+    )
+    for r in [
+        api_system, api_auth, api_accounts, api_users, api_billing,
+        api_sessions, api_capture, api_artifacts, api_jobs, api_ai,
+        api_tasks, api_shares, api_watch, api_ops, api_admin, api_screen,
+        api_v2,
+    ]:
+        app.include_router(r.router)
+
+    # Optional routers (may fail if dependencies missing)
+    for mod_name in ["invites", "images", "assets", "reactions", "exports", "analytics", "usage", "internal_jobs"]:
+        try:
+            mod = __import__(f"app.api.routers.{mod_name}", fromlist=["router"])
+            app.include_router(mod.router)
+        except Exception:
+            pass
+except Exception as e:
+    print(f"WARNING: Failed to load API v2 routers: {e}")
+    import traceback
+    traceback.print_exc()
 
 
 @app.get("/health")
@@ -376,4 +415,3 @@ async def logo():
     import os
     file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "logo.png")
     return FileResponse(file_path, media_type="image/png")
-
