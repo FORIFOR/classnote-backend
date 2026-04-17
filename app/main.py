@@ -45,7 +45,7 @@ def _check_env_vars():
 
 _check_env_vars()
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, projects, session_details
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, projects, session_details, chat_v1
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -243,6 +243,7 @@ app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
 app.include_router(sessions.router, tags=["Sessions"])
 app.include_router(session_details.router)  # /v1/session-details/* — read model BFF
+app.include_router(chat_v1.router)            # /v1/chat — session-first AI chat (Phase 7)
 app.include_router(projects.router, tags=["Projects"])
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)
 app.include_router(websocket.router, tags=["Streaming"])
