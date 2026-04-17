@@ -25,7 +25,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.dependencies import CurrentUser, get_current_user
@@ -210,3 +213,98 @@ async def list_chat_presets(
 ):
     """Return the canonical preset catalog. Clients can render them as chips."""
     return session_chat.list_presets()
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming variant (Phase 7.2)
+# ---------------------------------------------------------------------------
+
+
+def _sse_pack(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/chat:stream")
+async def post_chat_stream(
+    body: ChatV1Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """SSE variant of POST /v1/chat.
+
+    Stream events (in order):
+      - event: meta   — {conversationId, scope, preset, mode, usedModel, creditCost, creditsRemaining}
+      - event: token  — {text: "..."}  (emitted repeatedly as the LLM produces deltas)
+      - event: done   — {conversationId, answer:{text}, citations, creditCost,
+                         creditsRemaining, latencyMs, suggestedActions}
+
+    Error handling:
+      - pre-LLM errors (auth / scope / credits / permissions) → HTTP status
+        code via HTTPException before the stream starts.
+      - LLM failure mid-stream → event: error with {code, message}; credits
+        are refunded before the event is emitted.
+    """
+    if body.scope.type == "session" and not body.scope.sessionId:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "SCOPE_INVALID", "message": "scope.sessionId required"}},
+        )
+    if not body.message and not body.preset:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "EMPTY_QUERY",
+                    "message": "message もしくは preset のいずれかを指定してください",
+                }
+            },
+        )
+
+    ctx = ChatContext(
+        user=current_user,
+        scope=body.scope.model_dump(),
+        message=body.message or "",
+        preset=body.preset,
+        conversation_id=body.conversationId,
+        selected_context=body.selectedContext.model_dump() if body.selectedContext else None,
+        history=[h.model_dump() for h in (body.history or [])],
+    )
+
+    # Pre-flight: run NotFound/Forbidden/CreditLimit checks before opening the
+    # stream, so clients see proper HTTP status codes instead of an "open"
+    # SSE body. We do this by invoking the shared prep helper first; if it
+    # succeeds, we hand it off to the generator using an already-consumed
+    # credit. chat_stream repeats the prep internally; for atomicity we
+    # accept one extra cheap read.  (Phase 7.3 will make prep shareable.)
+    try:
+        # Permission check — raises before credits are touched
+        if body.scope.type == "session" and body.scope.sessionId:
+            session_chat._load_session(ctx)  # raises NotFound/Forbidden
+
+    except Exception as e:  # noqa: BLE001
+        raise _map_error(e)
+
+    async def event_source():
+        try:
+            async for ev in session_chat.chat_stream(ctx):
+                yield _sse_pack(ev["event"], ev["data"])
+        except session_chat.CreditLimitError as e:
+            yield _sse_pack(
+                "error",
+                {
+                    "code": e.info.get("reason", "INSUFFICIENT_CREDITS"),
+                    "message": "AIクレジットが不足しています",
+                    "details": {
+                        "creditCost": e.info.get("cost"),
+                        "creditsRemaining": e.info.get("remaining", 0),
+                    },
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[v1/chat:stream] unexpected error during stream")
+            yield _sse_pack("error", {"code": "INTERNAL_ERROR", "message": str(e)[:200]})
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

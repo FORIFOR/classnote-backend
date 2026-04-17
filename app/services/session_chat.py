@@ -43,6 +43,11 @@ from app.services.gemini_chat import (
     call_gemini_general_with_search,
     call_gemini_search_hybrid,
 )
+from app.services.gemini_stream import (
+    stream_gemini_chat,
+    stream_gemini_search_hybrid,
+    stream_gemini_with_search,
+)
 from app.services.session_projection import compute_permissions
 
 
@@ -563,3 +568,232 @@ def _suggest_follow_up_actions(preset: Optional[str], scope_type: str) -> List[D
     if preset and preset in rotation:
         rotation.remove(preset)
     return [{"id": pid, "label": _PRESETS[pid]["label"]} for pid in rotation[:3]]
+
+
+# ---------------------------------------------------------------------------
+# Preparation helper — shared by chat_once and chat_stream
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChatPrep:
+    scope_type: str
+    session_data: Dict[str, Any]
+    transcript_chunks: List[Dict[str, Any]]
+    effective_message: str
+    route_needs_web: bool
+    mode_label: str
+    credit_cost: int
+    credits_remaining: Optional[int]
+    conversation_id: str
+    history: List[Dict[str, str]]
+    session_context: Optional[Dict[str, Any]]
+
+
+async def _prepare_chat(ctx: ChatContext) -> ChatPrep:
+    """Shared preparation for non-stream and stream variants.
+
+    Side effects: consumes AI credits. Caller is responsible for refunding
+    them on LLM failure (the `credit_cost` + `mode_label` are returned here
+    precisely so the caller can call ai_credits.refund in its except path).
+    """
+    scope_type = _scope_type(ctx)
+
+    session_data: Dict[str, Any] = {}
+    transcript_chunks: List[Dict[str, Any]] = []
+    if scope_type == "session":
+        session_data = _load_session(ctx)
+        transcript_chunks = await asyncio.to_thread(
+            _load_transcript_chunks, session_data["id"]
+        )
+
+    effective_message = _effective_message(ctx)
+
+    session_title = session_data.get("title") if scope_type == "session" else None
+    route = await chat_router.classify_route(
+        message=effective_message,
+        session_titles=[session_title] if session_title else [],
+        active_session_title=session_title,
+        state={},
+        freshness_hint=False,
+        ui_scope="session_detail" if scope_type == "session" else "global_ai",
+    )
+    if scope_type == "session" and not route.needs_session:
+        route.needs_session = True
+
+    session_context = (
+        context_builder.build_session_context(session_data, effective_message)
+        if session_data
+        else None
+    )
+
+    mode_label = "session_grounded"
+    if scope_type == "general" and route.needs_web:
+        mode_label = "general_fresh"
+    elif scope_type == "general":
+        mode_label = "general_static"
+    elif route.needs_web:
+        mode_label = "session_plus_general"
+
+    credit_cost = estimate_cost(mode_label)
+    ok, info = ai_credits.consume(ctx.user.account_id, credit_cost, mode_label)
+    if not ok:
+        raise CreditLimitError({**(info or {}), "cost": credit_cost, "mode": mode_label})
+    credits_remaining = (info or {}).get("remaining")
+
+    conversation_id, history = _load_conversation(ctx)
+
+    return ChatPrep(
+        scope_type=scope_type,
+        session_data=session_data,
+        transcript_chunks=transcript_chunks,
+        effective_message=effective_message,
+        route_needs_web=route.needs_web,
+        mode_label=mode_label,
+        credit_cost=credit_cost,
+        credits_remaining=credits_remaining,
+        conversation_id=conversation_id,
+        history=history,
+        session_context=session_context,
+    )
+
+
+def _build_hybrid_session_summary(session_context: Optional[Dict[str, Any]]) -> str:
+    if not session_context:
+        return ""
+    parts = []
+    if session_context.get("title"):
+        parts.append(f"タイトル: {session_context['title']}")
+    if session_context.get("summary"):
+        parts.append(f"要約:\n{session_context['summary']}")
+    if session_context.get("transcript_excerpt"):
+        parts.append(f"抜粋:\n{session_context['transcript_excerpt']}")
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Streaming entry point
+# ---------------------------------------------------------------------------
+
+
+async def chat_stream(ctx: ChatContext):
+    """Async-generator version of chat_once; yields SSE-ready events.
+
+    Events emitted in order:
+      1. meta          — mode / conversationId / credits / usedModel
+      2. token*        — incremental text deltas from Gemini
+      3. done          — fullText + citations + suggestedActions + latencyMs
+
+    On LLM failure: yields `error` event and refunds the consumed credits.
+    Client is expected to implement reconnection / backoff independently.
+    """
+    prep = await _prepare_chat(ctx)
+    used_model = (
+        CHAT_MODEL_NAME
+        if prep.scope_type == "session" and not prep.route_needs_web
+        else GENERAL_MODEL_NAME
+    )
+    t_start = time.monotonic()
+
+    yield {
+        "event": "meta",
+        "data": {
+            "conversationId": prep.conversation_id,
+            "scope": ctx.scope,
+            "preset": ctx.preset,
+            "mode": prep.mode_label,
+            "usedModel": used_model,
+            "creditCost": prep.credit_cost,
+            "creditsRemaining": prep.credits_remaining,
+        },
+    }
+
+    full_text_parts: List[str] = []
+
+    def _run_sync_stream():
+        """Pick the right gemini_stream variant based on the routing decision."""
+        if prep.scope_type == "session" and not prep.route_needs_web:
+            turn_prompt = context_builder.build_turn_prompt(
+                message=prep.effective_message,
+                mode=prep.mode_label,
+                contexts=[prep.session_context] if prep.session_context else [],
+                history=prep.history,
+                conversation_summary=None,
+            )
+            return stream_gemini_chat(turn_prompt, model_name=CHAT_MODEL_NAME)
+        if prep.scope_type == "session" and prep.route_needs_web:
+            hybrid = context_builder.build_hybrid_prompt(
+                message=prep.effective_message,
+                session_summary=_build_hybrid_session_summary(prep.session_context),
+                history=prep.history,
+                conversation_summary=None,
+            )
+            return stream_gemini_search_hybrid(hybrid)
+        if prep.scope_type == "general" and prep.route_needs_web:
+            return stream_gemini_with_search(prep.effective_message)
+        # general static
+        turn_prompt = context_builder.build_turn_prompt(
+            message=prep.effective_message,
+            mode=prep.mode_label,
+            contexts=[],
+            history=prep.history,
+            conversation_summary=None,
+        )
+        return stream_gemini_chat(turn_prompt, model_name=GENERAL_MODEL_NAME)
+
+    try:
+        iterator = await asyncio.to_thread(_run_sync_stream)
+        # Drain the blocking iterator chunk-by-chunk off the event loop
+        while True:
+            chunk = await asyncio.to_thread(next, iterator, None)
+            if chunk is None:
+                break
+            if not chunk:
+                continue
+            full_text_parts.append(chunk)
+            yield {"event": "token", "data": {"text": chunk}}
+
+    except Exception as e:
+        logger.exception(f"[v1/chat:stream] LLM stream failed: {e}")
+        try:
+            ai_credits.refund(ctx.user.account_id, prep.credit_cost, prep.mode_label)
+        except Exception:
+            pass
+        yield {
+            "event": "error",
+            "data": {
+                "code": "CHAT_ERROR",
+                "message": "AI 応答の生成に失敗しました",
+            },
+        }
+        return
+
+    full_text = "".join(full_text_parts)
+    citations = (
+        _build_citations(full_text, prep.transcript_chunks)
+        if prep.scope_type == "session"
+        else []
+    )
+    await asyncio.to_thread(
+        _save_turn,
+        ctx,
+        prep.conversation_id,
+        ctx.message,
+        full_text,
+        citations,
+        prep.mode_label,
+        used_model,
+    )
+
+    yield {
+        "event": "done",
+        "data": {
+            "conversationId": prep.conversation_id,
+            "answer": {"text": full_text},
+            "citations": citations,
+            "creditCost": prep.credit_cost,
+            "creditsRemaining": prep.credits_remaining,
+            "latencyMs": int((time.monotonic() - t_start) * 1000),
+            "suggestedActions": _suggest_follow_up_actions(ctx.preset, prep.scope_type),
+        },
+    }

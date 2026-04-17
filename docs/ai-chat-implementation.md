@@ -209,7 +209,11 @@ keys returned by `/v1/session-details/{id}/transcript`.
 
 ## Out of scope for MVP (planned)
 
-- **Phase 7.2**: SSE variant `POST /v1/chat:stream` (reuse `gemini_stream`)
+- ~~**Phase 7.2**: SSE variant `POST /v1/chat:stream` (reuse `gemini_stream`)~~ ✅ 完了
+  - Event order: `meta` → `token*` → `done`  (error 時は途中で `error` event)
+  - Client should append `token.data.text` until `done` arrives.
+  - `done.data.citations` は stream 終了後に非同期で構築された結果。
+  - LLM 失敗時は credits 自動 refund + `event:error`。
 - **Phase 7.3**: conversation as sub-collection (solve concurrent append)
 - **Phase 7.4**: embedding-based retrieval via Vertex AI
 - **Phase 7.5**: explicit Tool Runner with function-calling (jump_to_timestamp,
