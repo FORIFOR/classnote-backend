@@ -1402,7 +1402,432 @@ struct SessionDetailScreen: View {
 - citation tap → `SessionAIChatStore.handleCitationTap` → `jumpStore.requestJump` → `TranscriptTabView.onChange(of: pendingTarget)` → `ScrollViewReader.scrollTo` + `AVPlayer.seek`
 - `sheet` closed 中でも `jumpStore` は alive なので、sheet を閉じてから transcript の jump を完了させることも可能。
 
-## 4. チェックリスト
+## 4. Folder picker + Conversation Highlights (Phase 7.9)
+
+### 4-1. Backend 契約
+
+新規エンドポイント (`/folders` 系は既存、`create-and-assign` のみ新規):
+
+```
+POST /folders                                        # 既存 — create
+GET  /folders                                        # 既存 — list (account-aware)
+PATCH /folders/{folderId}                            # 既存
+DELETE /folders/{folderId}                           # 既存
+GET  /folders/{folderId}/sessions                    # 既存
+PUT  /sessions/{session_id}/organization             # 既存 — assign
+GET  /sessions/{session_id}/organization             # 既存
+POST /sessions/{session_id}/folder:create-and-assign # ★ 新規 — atomic 作成+割当
+```
+
+`create-and-assign` request/response:
+```jsonc
+// POST /sessions/{session_id}/folder:create-and-assign
+{ "name": "4月定例", "color": null }
+// ← 200
+{
+  "ok": true,
+  "folder": { "id": "fld_xxx", "name": "4月定例", "color": null, ... },
+  "sessionId": "sess_xxx",
+  "folderId": "fld_xxx"
+}
+```
+
+### 4-2. Summary v2 `conversationHighlights[]`
+
+`/v1/session-details/{id}/overview` (既存) のレスポンスに今回から
+`payload.conversationHighlights[]` が含まれます:
+
+```jsonc
+"conversationHighlights": [
+  {
+    "id": "hl_1",
+    "text": "最近、家賃が一気に上がったという懸念が共有された。",
+    "topic": "生活費",
+    "importance": "high" | "medium" | "low",
+    "primaryTimestampMs": 3469000,
+    "segmentIds": ["seg_241"],
+    "evidence": [
+      { "segmentId": "seg_241", "startMs": 3469000, "endMs": 3478000, "quotePreview": "..." }
+    ]
+  }
+]
+```
+
+- 生成は **summary 生成と同一 LLM コール**で行われる (`summary:generate`
+  endpoint の副産物)。別 API は追加しない。
+- `primaryTimestampMs` は **transcript segments 突合で backend が確定**
+  した値を使う (LLM 生値は不採用)。
+- `evidence[]` は **常に配列**、空の場合も `[]`。
+- 件数は 5〜12 件程度 (prompt で指定)。
+
+### 4-3. Tauri / React: Folder picker + highlights section
+
+```tsx
+// src/features/folders/api/folderApi.ts
+import type { FolderDTO } from "./types";
+
+export async function listFolders(token: string): Promise<FolderDTO[]> {
+  const r = await fetch("/folders", { headers: { Authorization: `Bearer ${token}` } });
+  return (await r.json()) as FolderDTO[];
+}
+export async function createFolderAndAssign(
+  token: string, sessionId: string, name: string
+): Promise<{ folder: FolderDTO; folderId: string }> {
+  const r = await fetch(`/sessions/${sessionId}/folder:create-and-assign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok) throw new Error("failed");
+  return (await r.json()) as any;
+}
+export async function assignSessionFolder(
+  token: string, sessionId: string, folderId: string | null
+) {
+  const r = await fetch(`/sessions/${sessionId}/organization`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ folderId }),
+  });
+  if (!r.ok) throw new Error("failed");
+}
+```
+
+```tsx
+// src/features/folders/components/PostRecordingFolderModal.tsx
+import React, { useEffect, useState } from "react";
+import { listFolders, assignSessionFolder, createFolderAndAssign } from "../api/folderApi";
+
+export function PostRecordingFolderModal(props: {
+  sessionId: string;
+  getToken: () => Promise<string>;
+  onClose: () => void;
+}) {
+  const [folders, setFolders] = useState<any[]>([]);
+  const [newName, setNewName] = useState("");
+
+  useEffect(() => {
+    void (async () => {
+      const token = await props.getToken();
+      setFolders(await listFolders(token));
+    })();
+  }, []);
+
+  const handle = async (action: () => Promise<void>) => {
+    try { await action(); props.onClose(); } catch (e) { console.error(e); }
+  };
+
+  return (
+    <div className="rounded-3xl border bg-zinc-950 p-5 w-[420px]">
+      <div className="mb-4 text-lg font-semibold">保存先フォルダ</div>
+      <div className="mb-4 space-y-2 max-h-[320px] overflow-auto">
+        <button className="w-full rounded-2xl border px-4 py-3 text-left text-sm"
+          onClick={() => handle(async () => {
+            await assignSessionFolder(await props.getToken(), props.sessionId, null);
+          })}>
+          未分類のまま
+        </button>
+        {folders.map((f) => (
+          <button key={f.id} className="w-full rounded-2xl border px-4 py-3 text-left text-sm"
+            onClick={() => handle(async () => {
+              await assignSessionFolder(await props.getToken(), props.sessionId, f.id);
+            })}>
+            {f.name}
+          </button>
+        ))}
+      </div>
+      <div className="space-y-2">
+        <input className="w-full rounded-2xl border bg-transparent px-4 py-3 text-sm"
+          placeholder="新しいフォルダ名" value={newName}
+          onChange={(e) => setNewName(e.target.value)} />
+        <button className="w-full rounded-2xl border px-4 py-3 text-sm"
+          disabled={!newName.trim()}
+          onClick={() => handle(async () => {
+            await createFolderAndAssign(await props.getToken(), props.sessionId, newName.trim());
+          })}>
+          作成して保存
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+```tsx
+// src/features/session/ConversationHighlightsSection.tsx
+import React from "react";
+import { useTranscriptJumpStore } from "@/stores/transcriptJumpStore";
+import { useUIStore } from "@/stores/uiStore";
+
+export type ConvHighlight = {
+  id: string;
+  text: string;
+  topic?: string;
+  importance: "high" | "medium" | "low";
+  primaryTimestampMs?: number;
+  segmentIds?: string[];
+};
+
+function fmt(ms: number): string {
+  const sec = Math.floor(ms / 1000);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h > 0
+    ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+export function ConversationHighlightsSection({ items }: { items: ConvHighlight[] }) {
+  if (!items || !items.length) return null;
+  return (
+    <div className="space-y-3">
+      <div className="text-base font-semibold">会話ハイライト</div>
+      {items.map((item) => (
+        <div key={item.id} className="rounded-2xl border bg-white/5 p-4">
+          <div className="flex gap-3">
+            <div className={`mt-2 h-2 w-2 rounded-full ${
+              item.importance === "high" ? "bg-rose-400"
+              : item.importance === "medium" ? "bg-violet-400" : "bg-zinc-500"}`} />
+            <div className="space-y-2 flex-1">
+              {item.topic && (
+                <div className="text-xs text-zinc-400">{item.topic}</div>
+              )}
+              <div className="text-sm leading-7 text-zinc-200">{item.text}</div>
+              {item.primaryTimestampMs != null && (
+                <button
+                  className="text-sm font-semibold text-blue-400 underline"
+                  onClick={() => {
+                    useUIStore.getState().setSessionDetailActiveTab?.("transcript");
+                    useTranscriptJumpStore.getState().requestJump({
+                      startSec: Math.floor(item.primaryTimestampMs! / 1000),
+                      segmentId: item.segmentIds?.[0],
+                    });
+                  }}
+                >
+                  {fmt(item.primaryTimestampMs)}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+Summary タブ配置順 (推奨):
+1. TL;DR / Decisions / Todos / KeyPoints (既存)
+2. **会話ハイライト** ← 新セクション
+3. Open Questions / Discussion Points / Terms / Formulas
+
+### 4-4. SwiftUI: Folder picker + highlights section
+
+```swift
+// Features/Folders/FolderAPI.swift
+import Foundation
+
+struct FolderDTO: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let color: String?
+}
+
+struct CreateAndAssignResponse: Decodable {
+    let folderId: String
+    let folder: FolderDTO
+}
+
+final class FolderAPI {
+    let baseURL: URL
+    let tokenProvider: () async throws -> String
+    init(baseURL: URL, tokenProvider: @escaping () async throws -> String) {
+        self.baseURL = baseURL
+        self.tokenProvider = tokenProvider
+    }
+
+    private func authed(_ path: String, method: String = "GET", body: Any? = nil) async throws -> URLRequest {
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = method
+        req.setValue("Bearer \(try await tokenProvider())", forHTTPHeaderField: "Authorization")
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        return req
+    }
+
+    func list() async throws -> [FolderDTO] {
+        let (data, _) = try await URLSession.shared.data(for: try await authed("/folders"))
+        return try JSONDecoder().decode([FolderDTO].self, from: data)
+    }
+
+    func assign(sessionId: String, folderId: String?) async throws {
+        _ = try await URLSession.shared.data(
+            for: try await authed(
+                "/sessions/\(sessionId)/organization",
+                method: "PUT",
+                body: ["folderId": folderId as Any]
+            )
+        )
+    }
+
+    func createAndAssign(sessionId: String, name: String) async throws -> CreateAndAssignResponse {
+        let (data, _) = try await URLSession.shared.data(
+            for: try await authed(
+                "/sessions/\(sessionId)/folder:create-and-assign",
+                method: "POST",
+                body: ["name": name]
+            )
+        )
+        return try JSONDecoder().decode(CreateAndAssignResponse.self, from: data)
+    }
+}
+```
+
+```swift
+// Features/Folders/PostRecordingFolderPickerSheet.swift
+import SwiftUI
+
+@MainActor
+final class PostRecordingFolderPickerStore: ObservableObject {
+    @Published var folders: [FolderDTO] = []
+    @Published var newFolderName: String = ""
+    @Published var isLoading = false
+
+    private let api: FolderAPI
+    init(api: FolderAPI) { self.api = api }
+
+    func load() async {
+        isLoading = true
+        defer { isLoading = false }
+        folders = (try? await api.list()) ?? []
+    }
+
+    func assign(sessionId: String, folderId: String?) async {
+        try? await api.assign(sessionId: sessionId, folderId: folderId)
+    }
+
+    func createAndAssign(sessionId: String) async {
+        let name = newFolderName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        _ = try? await api.createAndAssign(sessionId: sessionId, name: name)
+    }
+}
+
+struct PostRecordingFolderPickerSheet: View {
+    @StateObject var store: PostRecordingFolderPickerStore
+    let sessionId: String
+    let onDone: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("既存フォルダ") {
+                    Button("未分類のまま") {
+                        Task { await store.assign(sessionId: sessionId, folderId: nil); onDone() }
+                    }
+                    ForEach(store.folders) { folder in
+                        Button(folder.name) {
+                            Task { await store.assign(sessionId: sessionId, folderId: folder.id); onDone() }
+                        }
+                    }
+                }
+                Section("新規作成") {
+                    TextField("新しいフォルダ名", text: $store.newFolderName)
+                    Button("作成して保存") {
+                        Task { await store.createAndAssign(sessionId: sessionId); onDone() }
+                    }
+                    .disabled(store.newFolderName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .navigationTitle("保存先フォルダ")
+            .task { await store.load() }
+        }
+    }
+}
+```
+
+```swift
+// Features/SessionDetail/ConversationHighlightsSection.swift
+import SwiftUI
+
+struct ConversationHighlightItem: Identifiable, Decodable {
+    let id: String
+    let text: String
+    let topic: String?
+    let importance: String
+    let primaryTimestampMs: Int?
+    let segmentIds: [String]?
+}
+
+struct ConversationHighlightsSection: View {
+    let items: [ConversationHighlightItem]
+    let onTapTimestamp: (Int, String?) -> Void
+
+    var body: some View {
+        if items.isEmpty { EmptyView() } else {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("会話ハイライト").font(.headline)
+                ForEach(items) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Circle()
+                            .fill(color(for: item.importance))
+                            .frame(width: 8, height: 8)
+                            .padding(.top, 6)
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let t = item.topic {
+                                Text(t).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Text(item.text).font(.body)
+                            if let ms = item.primaryTimestampMs {
+                                Button(timeLabel(ms)) {
+                                    onTapTimestamp(ms, item.segmentIds?.first)
+                                }
+                                .font(.callout.weight(.semibold))
+                            }
+                        }
+                    }
+                    .padding(14)
+                    .background(.regularMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                }
+            }
+        }
+    }
+
+    private func color(for imp: String) -> Color {
+        switch imp {
+        case "high":   return .pink
+        case "medium": return .purple
+        default:       return .secondary
+        }
+    }
+
+    private func timeLabel(_ ms: Int) -> String {
+        let sec = ms / 1000, h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60
+        return h > 0
+            ? String(format: "%02d:%02d:%02d", h, m, s)
+            : String(format: "%02d:%02d", m, s)
+    }
+}
+```
+
+SummaryTab での利用:
+```swift
+if !summary.conversationHighlights.isEmpty {
+    ConversationHighlightsSection(
+        items: summary.conversationHighlights,
+        onTapTimestamp: { ms, segmentId in
+            jumpStore.requestJump(
+                targetSec: Double(ms) / 1000.0,
+                segmentId: segmentId
+            )
+        }
+    )
+}
+```
+
+## 5. チェックリスト
 
 - [ ] Desktop: `SessionAIPanel` を SessionDetail 右ペインに差し込み
 - [ ] iOS: `SessionAIChatSheet` を SessionDetailScreen の AI ボタンで open

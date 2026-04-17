@@ -199,6 +199,41 @@ def normalize_summary_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dic
         if not isinstance(result.get(key), list):
             result[key] = []
 
+    # Phase 7.9: conversationHighlights normalization (natural-sentence cards
+    # with a single primaryTimestampMs). Evidence always an array, importance
+    # coerced to known enum, id auto-filled if missing.
+    conv_highlights = result.get("conversationHighlights")
+    if isinstance(conv_highlights, list):
+        normalized_highlights: List[Dict[str, Any]] = []
+        for idx, item in enumerate(conv_highlights):
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            importance = item.get("importance")
+            if importance not in ("high", "medium", "low"):
+                importance = "medium"
+            hl: Dict[str, Any] = {
+                "id": str(item.get("id") or f"hl_{idx + 1}"),
+                "text": text.strip(),
+                "importance": importance,
+                "evidence": _normalize_evidence(item.get("evidence")),
+            }
+            if item.get("topic"):
+                hl["topic"] = str(item["topic"]).strip()[:60]
+            ts_ms = item.get("primaryTimestampMs")
+            if isinstance(ts_ms, (int, float)) and ts_ms >= 0:
+                hl["primaryTimestampMs"] = int(ts_ms)
+            if isinstance(item.get("segmentIds"), list):
+                hl["segmentIds"] = [str(s) for s in item["segmentIds"] if s]
+            if item.get("evidenceHint"):
+                hl["evidenceHint"] = str(item["evidenceHint"])[:80]
+            normalized_highlights.append(hl)
+        result["conversationHighlights"] = normalized_highlights
+    else:
+        result["conversationHighlights"] = []
+
     return result
 
 
