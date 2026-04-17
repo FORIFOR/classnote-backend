@@ -497,6 +497,11 @@ async def _handle_summarize_task_core(request: Request):
                 update_payload["title"] = auto_title
                 logger.info(f"[Summary] Auto-updated title: '{current_title}' → '{auto_title}'")
         doc_ref.update(update_payload)
+        # Phase 7.10: record transcriptVersion alongside the summary so a
+        # transcript re-finalize invalidates stale citations. Clients can
+        # detect drift by comparing session.transcriptVersion against
+        # derived/summary.meta.transcriptVersion.
+        transcript_version = int(data.get("transcriptVersion") or 1)
         derived_ref.set({
             "status": "succeeded",
             "result": {
@@ -509,6 +514,7 @@ async def _handle_summarize_task_core(request: Request):
             "meta": {
                 "schemaVersion": summary_json_version,
                 "type": summary_type,
+                "transcriptVersion": transcript_version,
             },
             "modelInfo": {"provider": "vertexai"},
             "updatedAt": datetime.now(timezone.utc),

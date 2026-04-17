@@ -4,7 +4,7 @@ import json
 import math
 import random
 import time
-from typing import List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 from app.services.profiling import get_profiler, Phase, PROFILING_ENABLED
 
@@ -1332,16 +1332,116 @@ JSON のみ返してください。形式:
 def _build_summary_tags_prompt(
     text: str,
     mode: str,
+    *,
+    segments: Optional[List[dict]] = None,
 ) -> str:
     """
     モードに応じた要約プロンプトを生成する。
     - meeting: 議事録形式（決定事項、TODO、議論ポイント）
     - lecture: 講義ノート形式（要点、キーワード、学習ポイント）
     要約・タグ・再生リストを一括で生成する。
+
+    segments (Phase 7.10): transcript segment / chunk list with
+    {id, text, speaker?, startMs, endMs}. When provided, we append a
+    forward-path citation section that asks the LLM to return
+    `sourceSegmentIds` per bullet. The existing plaintext transcript
+    and existing prompts are left unchanged so behavior without
+    segments is identical to before.
     """
     if mode == "lecture":
-        return _build_lecture_summary_prompt(text)
-    return _build_meeting_summary_prompt(text)
+        base = _build_lecture_summary_prompt(text)
+    else:
+        base = _build_meeting_summary_prompt(text)
+
+    if segments:
+        base += _build_segment_citation_suffix(segments)
+    return base
+
+
+def _format_segments_for_prompt(
+    segments: List[dict],
+    limit: int = 300,
+    max_chars: int = 45_000,
+) -> str:
+    """Render segments as `[seg_104 00:57:49] (speaker) text` lines.
+
+    Hard caps on count and total characters so oversized sessions don't
+    blow the prompt token budget. Returns empty string when no usable
+    segments remain after filtering.
+    """
+    lines: List[str] = []
+    total = 0
+    for seg in segments[:limit]:
+        sid = (
+            seg.get("id")
+            or seg.get("segmentId")
+            or (seg.get("segmentIds") or [None])[0]
+        )
+        if not sid:
+            continue
+        sid = str(sid)
+        start_ms = seg.get("startMs")
+        if start_ms is None and seg.get("startSec") is not None:
+            try:
+                start_ms = int(float(seg["startSec"]) * 1000)
+            except (TypeError, ValueError):
+                start_ms = None
+        if not isinstance(start_ms, (int, float)):
+            continue
+        start_sec = int(start_ms) // 1000
+        hh, rem = divmod(start_sec, 3600)
+        mm, ss = divmod(rem, 60)
+        ts = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+        speaker = seg.get("speaker") or ""
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        prefix = f"[{sid} {ts}]"
+        if speaker:
+            prefix += f" ({speaker})"
+        line = f"{prefix} {text}"
+        if total + len(line) > max_chars:
+            break
+        lines.append(line)
+        total += len(line) + 1
+    return "\n".join(lines)
+
+
+def _build_segment_citation_suffix(segments: List[dict]) -> str:
+    """Citation-aware suffix appended to the main summary prompt.
+
+    Asks the LLM to:
+      1. Return each bullet with an additional `sourceSegmentIds` array
+         referencing the segment ids seen in the transcript_with_ids block.
+      2. Use only ids that actually appear in that block — never fabricate.
+      3. Keep arrays small (1-4 ids) so the citation is precise.
+
+    The existing JSON schema intentionally does NOT declare
+    sourceSegmentIds as required, so omission is tolerated (falls back
+    to the text-matching anchor_resolver). Forward-path ids, when
+    returned, are preferred over text-matching.
+    """
+    formatted = _format_segments_for_prompt(segments)
+    if not formatted:
+        return ""
+    return f"""
+
+# 文字起こし (segment id 付き)
+以下は同じ文字起こしに segment id と発話時刻を付けたものです。要約の各項目について、
+**根拠となる発話の segment id** を `sourceSegmentIds` 配列で返してください。
+
+# segment-id 付き transcript
+{formatted}
+
+# 追加のルール (sourceSegmentIds)
+- `highlights`, `decisions`, `todos`, `openQuestions`, `discussionPoints`,
+  `conversationHighlights`, `sections[*].bullets` の各要素に
+  `sourceSegmentIds: ["seg_XXX", ...]` を**可能なら**付ける。
+- 上の transcript に **実在する id** だけ書く。存在しない id は**絶対に書かない**。
+- 1 項目あたり 1〜4 個まで。広すぎる引用は避ける。
+- 根拠がはっきりしない場合は空配列 `[]` でよい。
+- 時刻 (startSec / endSec) はサーバ側で segment id から導出するので、項目側には書かない。
+"""
 
 
 def _build_meeting_summary_prompt(
@@ -1805,9 +1905,21 @@ async def _map_extract_chunk(chunk: str, mode: str, chunk_index: int) -> dict:
         return {}
 
 
-async def _reduce_synthesize(extracted: List[dict], mode: str, source_len: int, custom_instruction: str = "") -> dict:
+async def _reduce_synthesize(
+    extracted: List[dict],
+    mode: str,
+    source_len: int,
+    custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
+) -> dict:
     """
     Reduce phase: Synthesize all extracted points into structured JSON.
+
+    segments (Phase 7.11): transcript segments/chunks with id+time. When
+    provided, the reduce prompt is appended with a segment-id-tagged
+    transcript and the LLM is asked to include `sourceSegmentIds` on each
+    produced bullet. Falls back to text-matching anchor_resolver (existing
+    behavior) when the LLM doesn't ground a bullet.
     """
     from vertexai.generative_models import GenerationConfig
 
@@ -1822,6 +1934,13 @@ async def _reduce_synthesize(extracted: List[dict], mode: str, source_len: int, 
 
     prompt_template = _REDUCE_PROMPT_LECTURE if mode == "lecture" else _REDUCE_PROMPT_MEETING
     prompt = prompt_template.format(extracted_points=combined)
+
+    # Phase 7.11: segment-id citation suffix. Shares the same contract as
+    # the single-path forward-path implementation (Phase 7.10) so the
+    # downstream _hydrate_source_segment_ids step handles both paths
+    # uniformly.
+    if segments:
+        prompt += _build_segment_citation_suffix(segments)
 
     # Inject user custom instruction
     if custom_instruction:
@@ -1927,9 +2046,19 @@ async def _generate_summary_hierarchical(
     mode: str,
     progress_callback=None,
     custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
 ) -> dict:
     """
     Hierarchical Map→Reduce summarization with optimised chunking.
+
+    segments (Phase 7.11): transcript segment list with {id, text, startMs,
+    endMs, speaker?}. Threaded into the FINAL reduce pass only — the
+    per-chunk map phase and per-group intermediate reduces keep their
+    current lean prompts. The final reduce appends a segment-id-tagged
+    transcript and asks the LLM to return `sourceSegmentIds` on each
+    bullet; downstream `_hydrate_source_segment_ids` validates and
+    attaches startSec/endSec. Bullets the LLM didn't ground still fall
+    back to anchor_resolver text matching.
 
     Key optimisations vs previous version:
     - MAP_CHUNK_SIZE (12K) instead of CHUNK_SIZE (80K) → many small, fast map calls
@@ -2004,9 +2133,15 @@ async def _generate_summary_hierarchical(
     logger.info(f"[Hierarchical] Combined extracted size: {combined_size} chars")
 
     if combined_size > REDUCE_BATCH_LIMIT and len(extracted) > 6:
-        result = await _multi_level_reduce(extracted, mode, source_len=len(text), custom_instruction=custom_instruction)
+        result = await _multi_level_reduce(
+            extracted, mode, source_len=len(text),
+            custom_instruction=custom_instruction, segments=segments,
+        )
     else:
-        result = await _reduce_synthesize(extracted, mode, source_len=len(text), custom_instruction=custom_instruction)
+        result = await _reduce_synthesize(
+            extracted, mode, source_len=len(text),
+            custom_instruction=custom_instruction, segments=segments,
+        )
 
     reduce_time = time_module.perf_counter() - reduce_start
     logger.info(f"[Hierarchical] Reduce phase completed in {reduce_time:.2f}s")
@@ -2068,10 +2203,22 @@ async def _generate_summary_hierarchical(
     return final_result
 
 
-async def _multi_level_reduce(extracted: List[dict], mode: str, source_len: int, custom_instruction: str = "") -> dict:
+async def _multi_level_reduce(
+    extracted: List[dict],
+    mode: str,
+    source_len: int,
+    custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
+) -> dict:
     """
     Multi-level reduce for large numbers of map results.
     Groups extracted data → parallel partial reduces → final reduce.
+
+    Phase 7.11: segments flow only through the FINAL reduce pass.
+    Intermediate group-level reduces don't get the segment-id transcript
+    to keep their prompts small; they just collapse extracted facts into
+    extraction-format, which the final reduce then grounds against the
+    real transcript via sourceSegmentIds.
     """
     GROUP_SIZE = 6  # chunks per reduce group
 
@@ -2124,9 +2271,15 @@ async def _multi_level_reduce(extracted: List[dict], mode: str, source_len: int,
     if not intermediate:
         raise ValueError("All reduce groups failed")
 
-    # Final reduce (apply custom instruction only on the final pass)
+    # Final reduce (apply custom instruction + segment-id citation only here)
     logger.info(f"[Hierarchical] Final reduce from {len(intermediate)} intermediate results")
-    final = await _reduce_synthesize(intermediate, mode, source_len=source_len, custom_instruction=custom_instruction)
+    final = await _reduce_synthesize(
+        intermediate,
+        mode,
+        source_len=source_len,
+        custom_instruction=custom_instruction,
+        segments=segments,
+    )
     if not final.get("tags") and fallback_tags:
         final["tags"] = fallback_tags
     return final
@@ -2446,16 +2599,35 @@ async def generate_summary_and_tags(
     if use_hierarchical:
         if USE_HIERARCHICAL_SUMMARY:
             logger.info("[Hierarchical] Using Map→Reduce summarization")
-            result = await _generate_summary_hierarchical(text, mode, progress_callback=progress_callback, custom_instruction=custom_instruction)
+            # Phase 7.11: segments flow through to the FINAL reduce so long
+            # sessions also get forward-path citation (sourceSegmentIds).
+            result = await _generate_summary_hierarchical(
+                text,
+                mode,
+                progress_callback=progress_callback,
+                custom_instruction=custom_instruction,
+                segments=segments,
+            )
         else:
             logger.info("Using traditional chunked summarization")
             result = await _generate_summary_chunked(text, mode, custom_instruction=custom_instruction)
     else:
-        # 通常の要約処理（singleパス）
-        result = await _generate_summary_single(text, mode, custom_instruction=custom_instruction)
+        # 通常の要約処理（singleパス）— Phase 7.10: segments を渡して LLM に
+        # sourceSegmentIds を返してもらう forward-path を有効化
+        result = await _generate_summary_single(
+            text, mode, custom_instruction=custom_instruction, segments=segments
+        )
 
-    # Post-process: attach anchorMs / segmentIds to bullets when segments available.
+    # Post-process (always runs when segments are available):
+    #   1. sourceSegmentIds validation + startSec/endSec derivation
+    #      (resolves LLM-returned ids against the real segment time range)
+    #   2. anchor_resolver fallback for bullets without sourceSegmentIds
+    #      (existing text-matching behavior; now ids-preferred)
     if segments and isinstance(result, dict) and isinstance(result.get("summaryJson"), dict):
+        try:
+            _hydrate_source_segment_ids(result["summaryJson"], segments)
+        except Exception as e:
+            logger.warning(f"[summary] sourceSegmentIds hydration failed (non-fatal): {e}")
         try:
             from app.services.anchor_resolver import enrich_summary_with_anchors
             enrich_summary_with_anchors(result["summaryJson"], segments)
@@ -2463,6 +2635,114 @@ async def generate_summary_and_tags(
             logger.warning(f"[summary] anchor enrichment failed (non-fatal): {e}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.10 — forward-path citation hydration
+# ---------------------------------------------------------------------------
+
+
+_BULLET_LIST_KEYS = (
+    "highlights",
+    "decisions",
+    "todos",
+    "openQuestions",
+    "discussionPoints",
+    "conversationHighlights",
+)
+
+
+def _hydrate_source_segment_ids(
+    summary_json: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+) -> None:
+    """Validate LLM-returned sourceSegmentIds and attach start/endSec.
+
+    For each bullet in every known list:
+      - Drop any `sourceSegmentIds` entry that isn't in the real segment map.
+      - When ≥1 valid id remains, set:
+          `segmentId` = first id (stable representative for UI jump)
+          `startSec`, `endSec` = min/max over matched segments
+          `startMs`, `endMs` = same but in ms
+          `sourceCount` = number of matched ids
+      - Bullets without LLM-provided ids are left untouched here so the
+        downstream anchor_resolver can still fill them via text matching.
+    """
+    if not isinstance(summary_json, dict):
+        return
+
+    seg_by_id: Dict[str, Dict[str, Any]] = {}
+    for seg in segments:
+        sid = (
+            seg.get("id")
+            or seg.get("segmentId")
+            or (seg.get("segmentIds") or [None])[0]
+        )
+        if not sid:
+            continue
+        sid = str(sid)
+        # Prefer startMs if present, otherwise derive from startSec
+        start_ms = seg.get("startMs")
+        if start_ms is None and seg.get("startSec") is not None:
+            try:
+                start_ms = int(float(seg["startSec"]) * 1000)
+            except (TypeError, ValueError):
+                start_ms = None
+        end_ms = seg.get("endMs")
+        if end_ms is None and seg.get("endSec") is not None:
+            try:
+                end_ms = int(float(seg["endSec"]) * 1000)
+            except (TypeError, ValueError):
+                end_ms = None
+        if start_ms is None:
+            continue
+        seg_by_id[sid] = {
+            "startMs": int(start_ms),
+            "endMs": int(end_ms) if isinstance(end_ms, (int, float)) else int(start_ms),
+        }
+
+    if not seg_by_id:
+        return
+
+    def _apply(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_ids = item.get("sourceSegmentIds")
+            if not isinstance(raw_ids, list) or not raw_ids:
+                continue
+            matched = [str(x) for x in raw_ids if isinstance(x, (str, int)) and str(x) in seg_by_id]
+            if not matched:
+                # LLM hallucinated ids — drop entirely so anchor_resolver can
+                # retry via text matching.
+                item["sourceSegmentIds"] = []
+                continue
+            # Cap at 4 to enforce prompt-time constraint on the server side too.
+            matched = matched[:4]
+            item["sourceSegmentIds"] = matched
+            start_ms = min(seg_by_id[sid]["startMs"] for sid in matched)
+            end_ms = max(seg_by_id[sid]["endMs"] for sid in matched)
+            item["segmentId"] = matched[0]
+            item["segmentIds"] = matched        # maintained for v1 clients
+            item["startMs"] = int(start_ms)
+            item["endMs"] = int(end_ms)
+            item["startSec"] = round(start_ms / 1000.0, 2)
+            item["endSec"] = round(end_ms / 1000.0, 2)
+            item["sourceCount"] = len(matched)
+            # anchorMs retained for back-compat; anchor_resolver won't override
+            item.setdefault("anchorMs", int(start_ms))
+
+    for key in _BULLET_LIST_KEYS:
+        _apply(summary_json.get(key))
+
+    # sections[*].bullets (lecture mode)
+    sections = summary_json.get("sections")
+    if isinstance(sections, list):
+        for sec in sections:
+            if isinstance(sec, dict):
+                _apply(sec.get("bullets"))
 
 
 async def _generate_summary_chunked(text: str, mode: str, custom_instruction: str = "") -> dict:
@@ -2536,13 +2816,22 @@ async def _generate_summary_chunked(text: str, mode: str, custom_instruction: st
     return result
 
 
-async def _generate_summary_single(text: str, mode: str, custom_instruction: str = "") -> dict:
+async def _generate_summary_single(
+    text: str,
+    mode: str,
+    custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
+) -> dict:
     """
     単一テキストの要約処理（通常の短いテキスト用）。
+
+    segments (Phase 7.10): when provided, the prompt is appended with a
+    segment-id-tagged transcript and the LLM is asked to return
+    `sourceSegmentIds` per bullet.
     """
     from vertexai.generative_models import GenerationConfig
 
-    prompt = _build_summary_tags_prompt(text, mode)
+    prompt = _build_summary_tags_prompt(text, mode, segments=segments)
     if custom_instruction:
         prompt += f"\n\n# ユーザーからの追加指示\n{custom_instruction}\n"
 
