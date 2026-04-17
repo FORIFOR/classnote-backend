@@ -59,6 +59,24 @@ async def create_folder(
     body: FolderCreateRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    # Reject if another active folder in the same account already has this
+    # name (case-insensitive, whitespace-trimmed). Archived/deleted folder
+    # names are free to reuse.
+    if project_folders.folder_name_exists(
+        current_user.uid, current_user.account_id, body.name
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "FOLDER_NAME_DUPLICATE",
+                    "message": "同じ名前のフォルダが既に存在します",
+                    "retryable": False,
+                    "details": {"name": body.name},
+                }
+            },
+        )
+
     now = _now()
     folder_id = f"fld_{uuid.uuid4().hex[:16]}"
     payload = {
@@ -116,6 +134,27 @@ async def update_folder(
     if not snap.exists or (snap.to_dict() or {}).get("deletedAt"):
         raise HTTPException(status_code=404, detail="Folder not found")
     patch = {k: v for k, v in body.model_dump(exclude_unset=True).items()}
+
+    # Reject rename to an already-used name (excluding self).
+    if "name" in patch and isinstance(patch["name"], str):
+        if project_folders.folder_name_exists(
+            current_user.uid,
+            current_user.account_id,
+            patch["name"],
+            exclude_folder_id=folder_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "code": "FOLDER_NAME_DUPLICATE",
+                        "message": "同じ名前のフォルダが既に存在します",
+                        "retryable": False,
+                        "details": {"name": patch["name"]},
+                    }
+                },
+            )
+
     patch["updatedAt"] = _now()
     ref.set(patch, merge=True)
     data = snap.to_dict() or {}
@@ -207,6 +246,22 @@ async def create_folder_and_assign_session(
     _, snapshot, resolved_id = _resolve_session(session_id, current_user.uid, current_user.account_id)
     session_data = snapshot.to_dict() or {}
     ensure_can_view(session_data, current_user, resolved_id)
+
+    # 1b. Duplicate-name guard (same rule as POST /folders)
+    if project_folders.folder_name_exists(
+        current_user.uid, current_user.account_id, body.name
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "FOLDER_NAME_DUPLICATE",
+                    "message": "同じ名前のフォルダが既に存在します",
+                    "retryable": False,
+                    "details": {"name": body.name},
+                }
+            },
+        )
 
     # 2. Create folder (under caller's uid — matches existing POST /folders behavior)
     now = _now()

@@ -145,6 +145,50 @@ def validate_folder_account(
         raise ValueError("folder not found")
 
 
+def _normalize_folder_name(name: str) -> str:
+    """Case-insensitive + whitespace-trimmed comparison key for folder names.
+
+    Using str.casefold() (stronger than lower()) so "フォルダ" vs "ＦＯＬＤＡ"
+    and "TEST" vs "test" collapse to the same bucket. Trailing / leading
+    whitespace is also ignored.
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.strip().casefold()
+
+
+def folder_name_exists(
+    uid: str,
+    account_id: Optional[str],
+    name: str,
+    *,
+    exclude_folder_id: Optional[str] = None,
+) -> bool:
+    """True iff another *active* folder under the account uses this name.
+
+    Comparison is case-insensitive + whitespace-trimmed (see
+    `_normalize_folder_name`). Scans every member-uid folder subcollection
+    via `iter_account_folders`, same account-aware resolution used by
+    `GET /folders`.
+
+    - exclude_folder_id: skip this folder (used by PATCH so renaming to
+      the same normalized key doesn't collide with itself).
+    - Soft-deleted folders (`deletedAt` set) are excluded by
+      `iter_account_folders`, so archived/deleted names can be reused.
+    """
+    if not name or not name.strip():
+        return False
+    target = _normalize_folder_name(name)
+    if not target:
+        return False
+    for _member_uid, folder_id, data in iter_account_folders(uid, account_id):
+        if exclude_folder_id and folder_id == exclude_folder_id:
+            continue
+        if _normalize_folder_name(str(data.get("name") or "")) == target:
+            return True
+    return False
+
+
 def build_session_ref_payload(
     session_id: str,
     session_data: Dict[str, Any],
