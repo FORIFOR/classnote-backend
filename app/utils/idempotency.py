@@ -84,5 +84,33 @@ class IdempotencyManager:
             "error": error
         })
 
+    async def release(self, key: str, context: Optional[str] = None) -> bool:
+        """
+        Release a lock so it can be re-processed on a subsequent attempt.
+
+        Use this when a handler failed transiently and we want the upstream
+        (e.g. Stripe retry) to re-deliver the event. Without this the lock
+        stays in "processing" forever and the event can never be retried.
+
+        Returns True if the lock existed and was removed, False otherwise.
+        """
+        doc_ref = self.collection.document(key)
+        try:
+            snap = doc_ref.get()
+            if not snap.exists:
+                return False
+            if context:
+                existing_context = (snap.to_dict() or {}).get("context")
+                if existing_context and existing_context != context:
+                    logger.warning(
+                        f"[idempotency] release context mismatch: key={key} expected={context} actual={existing_context}"
+                    )
+                    return False
+            doc_ref.delete()
+            return True
+        except Exception as e:
+            logger.error(f"[idempotency] release failed for {key}: {e}")
+            return False
+
 # Global instance
 idempotency = IdempotencyManager()

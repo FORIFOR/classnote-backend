@@ -1,21 +1,29 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
+from app.dependencies import verify_cloud_tasks_request
 from google.cloud import firestore
 # from app.firebase import db
-from app.firebase import AUDIO_BUCKET_NAME
+from app.firebase import AUDIO_BUCKET_NAME, db, storage_client
 from app.services.llm import (
     GEMINI_MODEL_NAME,
     generate_quiz,
+    generate_quiz_batch,
+    generate_quiz_json,
+    quiz_json_to_markdown,
+    generate_quick_summary,
     generate_summary_and_tags,
     clean_quiz_markdown,
     answer_question,
     translate_text,
     generate_playlist_timeline,
 )
-from app.services.transcripts import resolve_transcript_text
+from app.services.transcripts import resolve_transcript_text, resolve_transcript_text_async, count_transcript_chunks, get_transcript_chunks
+from app.services.import_state import mark_import_completed
+from app.services.audit import emit as audit_emit
 from app.services.playlist_utils import normalize_playlist_items
 from app.services.usage import usage_logger
 from app.services.ops_logger import log_job_transition, log_llm_event, log_stt_event, ErrorCode
 from app.services.cost_guard import cost_guard
+from app.services.ai_credits import ai_credits, estimate_cost
 from app.services.session_event_bus import publish_session_event
 from app.services.account_deletion import (
     LOCKS_COLLECTION,
@@ -25,7 +33,8 @@ from app.services.account_deletion import (
 from app.services.app_config import is_feature_enabled
 import logging
 import json
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timezone, timedelta
 
 router = APIRouter()
 logger = logging.getLogger("app.tasks")
@@ -34,7 +43,193 @@ logger = logging.getLogger("app.tasks")
 async def ping_task():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc)}
 
-@router.post("/internal/tasks/summarize")
+
+# ═══════════════════════════════════════════════════════════════
+# YouTube Health Check (daily scheduled)
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/internal/tasks/youtube_health_check", include_in_schema=False)
+async def youtube_health_check(request: Request):
+    """
+    YouTube字幕取得のヘルスチェック。
+    Cloud Scheduler から毎朝呼ばれ、結果を Firestore に保存する。
+    テスト動画の字幕を取得し、成功/失敗を記録する。
+    """
+    import asyncio
+    from google.cloud import firestore as fs
+    import os
+
+    # テスト用動画（短い公開動画）
+    TEST_VIDEO_ID = "jNQXAC9IVRw"  # "Me at the zoo" (first YouTube video)
+    TEST_VIDEO_FALLBACK = "dQw4w9WgXcQ"
+
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+    db = fs.Client(project=project_id)
+    now = datetime.now(timezone.utc)
+
+    results = {
+        "checkedAt": now,
+        "proxy": {"status": "unknown"},
+        "direct": {"status": "unknown"},
+    }
+
+    # 1. プロキシ経由テスト
+    try:
+        from app.services.youtube import fetch_youtube_transcript
+        def _fetch_proxy():
+            return fetch_youtube_transcript(TEST_VIDEO_ID, languages=["en"], format="text")
+        r = await asyncio.to_thread(_fetch_proxy)
+        segments = len(r.get("items", []))
+        text_len = len(r.get("text", ""))
+        results["proxy"] = {
+            "status": "ok",
+            "segments": segments,
+            "textLength": text_len,
+            "videoId": TEST_VIDEO_ID,
+            "latencyMs": None,
+        }
+    except Exception as e:
+        # フォールバック動画でも試す
+        try:
+            def _fetch_proxy_fb():
+                return fetch_youtube_transcript(TEST_VIDEO_FALLBACK, languages=["en"], format="text")
+            r = await asyncio.to_thread(_fetch_proxy_fb)
+            results["proxy"] = {
+                "status": "ok",
+                "segments": len(r.get("items", [])),
+                "textLength": len(r.get("text", "")),
+                "videoId": TEST_VIDEO_FALLBACK,
+            }
+        except Exception as e2:
+            results["proxy"] = {"status": "error", "error": str(e2)[:300], "videoId": TEST_VIDEO_ID}
+
+    # 2. 直接接続テスト
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        def _fetch_direct():
+            ytt = YouTubeTranscriptApi()
+            fetched = ytt.fetch(TEST_VIDEO_ID, languages=["en"])
+            return len(fetched.to_raw_data())
+        count = await asyncio.to_thread(_fetch_direct)
+        results["direct"] = {"status": "ok", "segments": count, "videoId": TEST_VIDEO_ID}
+    except Exception as e:
+        results["direct"] = {"status": "error", "error": str(e)[:300]}
+
+    # 3. 結果を Firestore に保存
+    # config/youtube_health に最新結果、history サブコレクションに履歴
+    health_ref = db.collection("config").document("youtube_health")
+    health_ref.set({
+        "lastCheck": results,
+        "updatedAt": now,
+    }, merge=True)
+
+    # 履歴を追加（30日分保持）
+    history_ref = health_ref.collection("history").document(now.strftime("%Y-%m-%d"))
+    history_ref.set(results)
+
+    logger.info(f"[YouTubeHealth] proxy={results['proxy']['status']}, direct={results['direct']['status']}")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# Quick Summary Worker (30-60s preview, no CostGuard consumption)
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/internal/tasks/summarize_quick", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_summarize_quick_task(request: Request):
+    """Quick Summary: 先出し要約（highlights 3件 + topicSummary）。CostGuard消費なし。"""
+    if not is_feature_enabled("summarization"):
+        return {"status": "skipped", "reason": "feature_disabled"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    session_id = payload.get("sessionId")
+    idempotency_key = payload.get("idempotencyKey")
+    user_id = payload.get("userId")
+
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+
+    try:
+        from google.cloud import firestore
+        import os
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+
+        doc_ref = db.collection("sessions").document(session_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return {"status": "skipped", "reason": "not_found"}
+
+        data = doc.to_dict()
+        derived_ref = doc_ref.collection("derived").document("summary_quick")
+
+        # べき等チェック
+        if idempotency_key:
+            derived_snap = derived_ref.get()
+            if derived_snap.exists:
+                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
+                if current_key and current_key == idempotency_key:
+                    return {"status": "skipped", "reason": "idempotent_hit"}
+
+        transcript = await resolve_transcript_text_async(session_id, data) or ""
+        mode = data.get("mode", "lecture")
+
+        # ★ Translation sessions: normalize mode
+        if mode == "translate" or data.get("importType") == "translate":
+            if "===ORIGINAL===" in transcript:
+                original_part = transcript.split("\n===TRANSLATION===")[0]
+                transcript = original_part.replace("===ORIGINAL===\n", "").strip()
+            mode = "lecture"
+
+        if not transcript:
+            derived_ref.set({
+                "status": "failed", "errorReason": "Transcript empty",
+                "updatedAt": datetime.now(timezone.utc), "idempotencyKey": idempotency_key,
+            }, merge=True)
+            return {"status": "failed", "reason": "empty_transcript"}
+
+        # LLM呼び出し（Quick: 短いプロンプト、少ないトークン）
+        result = await generate_quick_summary(transcript, mode=mode)
+
+        derived_ref.set({
+            "status": "succeeded",
+            "result": {"markdown": result["markdown"], "topicSummary": result.get("topicSummary", "")},
+            "updatedAt": datetime.now(timezone.utc),
+            "idempotencyKey": idempotency_key,
+        }, merge=True)
+
+        # topicSummary をセッション本体にも保存（一覧表示用）
+        if result.get("topicSummary"):
+            doc_ref.update({"topicSummary": result["topicSummary"]})
+
+        await publish_session_event(session_id, "assets.updated", {"fields": ["summary_quick"]})
+        logger.info(f"[QuickSummary] Completed for {session_id}")
+        return {"status": "completed"}
+
+    except Exception as e:
+        logger.exception(f"[QuickSummary] Failed for {session_id}")
+        try:
+            derived_ref.set({
+                "status": "failed", "errorReason": str(e),
+                "updatedAt": datetime.now(timezone.utc), "idempotencyKey": idempotency_key,
+            }, merge=True)
+        except Exception:
+            pass
+        error_str = str(e)
+        if "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str:
+            raise HTTPException(status_code=503, detail="Transient error, retrying...")
+        return {"status": "failed", "error": error_str}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Full Summary Worker
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/internal/tasks/summarize", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_summarize_task(request: Request):
     try:
         payload = await request.json()
@@ -84,6 +279,8 @@ async def _handle_summarize_task_core(request: Request):
     cost_guard_id = None
     cost_guard_mode = "user"
     has_consumed = False
+    # Track AI credits actually deducted so we can refund on failure
+    credits_consumed = 0
 
     try:
 
@@ -117,15 +314,29 @@ async def _handle_summarize_task_core(request: Request):
         cost_guard_mode = "account" if owner_account_id else "user"
         has_consumed = False  # Track if we've consumed quota for refund on failure
 
-        transcript = resolve_transcript_text(session_id, data) or ""
+        transcript = await resolve_transcript_text_async(session_id, data) or ""
         mode = data.get("mode", "lecture")
+
+        # ★ Translation sessions: extract original text only for better summary quality
+        import_type = data.get("importType")
+        if (mode == "translate" or import_type == "translate") and "===ORIGINAL===" in transcript:
+            original_part = transcript.split("\n===TRANSLATION===")[0]
+            transcript = original_part.replace("===ORIGINAL===\n", "").strip()
+            mode = "lecture"  # Use lecture-style summary template
+        elif mode == "translate":
+            mode = "lecture"  # Fallback: translate mode always uses lecture template
+
         derived_ref = doc_ref.collection("derived").document("summary")
 
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                d_data = derived_snap.to_dict() or {}
+                current_key = d_data.get("idempotencyKey")
+                current_status = d_data.get("status")
+                # Only skip if key matches AND previous run actually succeeded
+                # If status is still "running", the previous task may have crashed
+                if current_key and current_key == idempotency_key and current_status in ("succeeded", "completed"):
                     if job_id:
                          db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
@@ -165,7 +376,7 @@ async def _handle_summarize_task_core(request: Request):
 
         # [FIX] CostGuard - Count usage when task actually executes (not just at API layer)
         if not usage_reserved and cost_guard_id:
-            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode)
+            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode, user_id=final_user_id)
             if not allowed:
                 logger.warning(f"[CostGuard] BLOCKED summary {session_id} for {cost_guard_id}. Monthly limit exceeded.")
                 err_msg = "Monthly summary limit exceeded"
@@ -174,12 +385,77 @@ async def _handle_summarize_task_core(request: Request):
                 return {"status": "blocked", "error": err_msg}
             has_consumed = True
             logger.info(f"[CostGuard] Reserved summary_generated for {cost_guard_id} ({cost_guard_mode})")
+        elif usage_reserved and cost_guard_id:
+            # Quota was already reserved by caller (e.g. finalize); track for refund on failure
+            has_consumed = True
+
+        # AI Credits: consume 1 credit for summary
+        # Skip when the caller already reserved credits via credits_reservations.reserve()
+        # (finalize v2 path sets usage_reserved=True). Otherwise double-charge occurs,
+        # because reserve() already deducts credits via ai_credits.consume().
+        if cost_guard_id and not usage_reserved:
+            _credit_cost = estimate_cost("summary_generated")
+            _ok, _info = ai_credits.consume(cost_guard_id, _credit_cost, "summary_generated")
+            if _ok:
+                credits_consumed = _credit_cost
+            else:
+                # cost_guard already allowed; ai_credits is a parallel counter (daily soft cap etc.)
+                # Proceed with the task but do NOT mark credits_consumed so no refund is issued.
+                logger.warning(
+                    f"[AICredits] consume skipped for summary {cost_guard_id}: {(_info or {}).get('reason')}"
+                )
 
         # ops_logger: job started
         logger.info(f"Starting summary task for {session_id} job={job_id}")
         log_job_transition(session_id, "summarize", "started", uid=final_user_id, job_id=job_id)
 
-        result = await generate_summary_and_tags(transcript, mode=mode)
+        # ── Progress callback: update derived/summary_progress in real-time ──
+        progress_ref = doc_ref.collection("derived").document("summary_progress")
+
+        # Write initial progress immediately so polling picks it up right away
+        progress_ref.set({
+            "status": "running",
+            "phase": "preparing",
+            "percent": 0,
+            "message": "要約を準備中...",
+            "updatedAt": datetime.now(timezone.utc),
+        }, merge=True)
+        await publish_session_event(session_id, "assets.updated", {"fields": ["summary_progress"]})
+
+        async def _progress_cb(done: int, total: int, phase: str):
+            try:
+                pct = int(done / max(total, 1) * 100) if phase != "done" else 100
+                phase_msg = {"map": "テキストを分析中", "reduce": "要約を生成中", "done": "完了"}.get(phase, phase)
+                progress_ref.set({
+                    "status": "done" if phase == "done" else "running",
+                    "phase": phase,
+                    "percent": pct,
+                    "message": f"{phase_msg} {done}/{total}" if phase != "done" else "完了",
+                    "updatedAt": datetime.now(timezone.utc),
+                }, merge=True)
+                await publish_session_event(session_id, "assets.updated", {"fields": ["summary_progress"]})
+            except Exception as prog_err:
+                logger.debug(f"[Progress] update failed (non-blocking): {prog_err}")
+
+        from app.services.llm import get_user_custom_prompts
+        summary_instruction, _ = get_user_custom_prompts(final_user_id)
+
+        # Fetch transcript chunks so the summary pipeline can ground each
+        # bullet with anchorMs / segmentIds instead of relying on LLM-emitted
+        # timestamps (which are unreliable).
+        try:
+            transcript_segments = await asyncio.to_thread(get_transcript_chunks, session_id)
+        except Exception as seg_err:
+            logger.warning(f"[summarize] failed to load transcript chunks for anchors: {seg_err}")
+            transcript_segments = None
+
+        result = await generate_summary_and_tags(
+            transcript,
+            mode=mode,
+            progress_callback=_progress_cb,
+            custom_instruction=summary_instruction,
+            segments=transcript_segments,
+        )
 
         # ops_logger: LLM call completed
         log_llm_event(session_id, "summary", "completed", uid=final_user_id, model=GEMINI_MODEL_NAME)
@@ -188,6 +464,8 @@ async def _handle_summarize_task_core(request: Request):
         summary_type = result.get("summaryType") or mode
         summary_json_version = result.get("summaryJsonVersion") or 1
         tags = (result.get("tags") or [])[:4]
+        facts = result.get("facts") or []
+        suggested_title = result.get("suggestedTitle")
 
         topic_summary = None
         if summary_markdown:
@@ -196,7 +474,7 @@ async def _handle_summarize_task_core(request: Request):
                  if line.strip() and not line.startswith('#'):
                      topic_summary = line.strip()[:100]
                      break
-        
+
         update_payload = {
             "summaryStatus": "completed",
             "summaryMarkdown": summary_markdown,
@@ -209,6 +487,15 @@ async def _handle_summarize_task_core(request: Request):
             "autoTags": tags,
             "status": "要約済み",
         }
+        # Auto-update title if LLM suggested one and current title is default/generic
+        if suggested_title:
+            update_payload["suggestedTitle"] = suggested_title
+            current_title = data.get("title", "")
+            from app.task_queue import _is_default_title, _build_auto_title
+            if not current_title or _is_default_title(current_title):
+                auto_title = _build_auto_title(suggested_title, data)
+                update_payload["title"] = auto_title
+                logger.info(f"[Summary] Auto-updated title: '{current_title}' → '{auto_title}'")
         doc_ref.update(update_payload)
         derived_ref.set({
             "status": "succeeded",
@@ -217,6 +504,7 @@ async def _handle_summarize_task_core(request: Request):
                 "markdown": summary_markdown,
                 "tags": tags,
                 "topicSummary": topic_summary,
+                **({"suggestedTitle": suggested_title} if suggested_title else {}),
             },
             "meta": {
                 "schemaVersion": summary_json_version,
@@ -229,30 +517,56 @@ async def _handle_summarize_task_core(request: Request):
             "jobId": job_id,
         }, merge=True)
 
+        # ── Save extracted facts for downstream quiz generation ──
+        if facts:
+            import hashlib
+            transcript_hash = hashlib.sha256(transcript.encode()).hexdigest()[:16]
+            facts_ref = doc_ref.collection("derived").document("facts")
+            facts_ref.set({
+                "facts": facts[:60],  # Cap at 60 facts
+                "sourceHash": transcript_hash,
+                "updatedAt": datetime.now(timezone.utc),
+            }, merge=True)
+            logger.info(f"[Facts] Saved {len(facts)} facts for {session_id}")
+
         logger.info(f"Successfully summarized session {session_id}")
 
-        # [TODO EXTRACTION] Update TODOs from summary (idempotent, mode-aware)
+        # [TODO EXTRACTION] Enqueue async TODO extraction (non-blocking)
         if summary_markdown and owner_account_id:
             try:
-                from app.services.todo_extractor import update_todos_from_summary
+                from app.task_queue import enqueue_todo_extraction_task
                 import hashlib
 
-                # Generate sourceKey from summary content hash for idempotency
                 summary_hash = hashlib.sha256(summary_markdown.encode()).hexdigest()[:12]
                 source_key = f"session:{session_id}:artifact:summary:{summary_hash}"
+                doc_ref.update({"todoStatus": "pending"})
 
-                todo_stats = await update_todos_from_summary(
+                enqueue_todo_extraction_task(
                     session_id=session_id,
                     account_id=owner_account_id,
                     source_key=source_key,
                     summary_text=summary_markdown,
                     transcript_text=transcript,
-                    mode=mode,  # Pass session mode for appropriate TODO extraction
+                    mode=mode,
+                    user_id=final_user_id,
                 )
-                logger.info(f"[TODO] Extracted for {session_id} (mode={mode}): created={todo_stats.get('created')}, candidates={todo_stats.get('candidates')}")
+                logger.info(f"[TODO] Enqueued async extraction for {session_id} (mode={mode})")
             except Exception as todo_err:
-                # Non-blocking: don't fail summary if TODO extraction fails
-                logger.warning(f"[TODO] Extraction failed for {session_id} (non-blocking): {todo_err}")
+                logger.warning(f"[TODO] Enqueue failed for {session_id} (non-blocking): {todo_err}")
+
+        # [PLAYLIST PRE-GENERATE] Enqueue playlist generation if not already done (non-blocking)
+        try:
+            existing_playlist = data.get("playlist")
+            playlist_status = data.get("playlistStatus")
+            if not existing_playlist and playlist_status not in ("running", "completed"):
+                from app.task_queue import enqueue_playlist_task
+                pl_job_id = f"playlist_{session_id[:8]}"
+                enqueue_playlist_task(session_id, job_id=pl_job_id, user_id=final_user_id)
+                doc_ref.update({"playlistStatus": "running"})
+                logger.info(f"[Playlist] Pre-enqueued after summary for {session_id}")
+        except Exception as pl_err:
+            logger.warning(f"[Playlist] Pre-enqueue failed for {session_id} (non-blocking): {pl_err}")
+
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
@@ -260,7 +574,10 @@ async def _handle_summarize_task_core(request: Request):
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)
         # Log usage success
         await usage_logger.log(user_id=final_user_id, feature="summary", event_type="success", session_id=session_id)
-        
+        # Record success in monthly doc for accurate remaining count
+        if cost_guard_id:
+            await cost_guard.record_success(cost_guard_id, "summary_generated", mode=cost_guard_mode)
+
         await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
         return {"status": "completed"}
 
@@ -269,6 +586,12 @@ async def _handle_summarize_task_core(request: Request):
         if has_consumed and cost_guard_id:
             await cost_guard.refund_consumption(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode)
             logger.info(f"[CostGuard] Refunded summary_generated for {cost_guard_id} due to failure")
+        # Refund AI credits (monthly/daily counter) on failure
+        if credits_consumed and cost_guard_id:
+            try:
+                ai_credits.refund(cost_guard_id, credits_consumed, "summary_generated")
+            except Exception as refund_err:
+                logger.warning(f"[AICredits] Refund failed for summary {cost_guard_id}: {refund_err}")
 
         logger.exception(f"Summarization failed for session {session_id}")
 
@@ -315,7 +638,7 @@ async def _handle_summarize_task_core(request: Request):
 
 
 
-@router.post("/internal/tasks/import_youtube")
+@router.post("/internal/tasks/import_youtube", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_import_youtube_task(request: Request):
     """
     YouTube取込を行うWorker。
@@ -378,15 +701,9 @@ async def handle_import_youtube_task(request: Request):
             "transcriptSource": "youtube_caption",
             "updatedAt": datetime.now(timezone.utc)
         })
-        
-        # Trigger Next Steps
-        from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-        # [Security] Pass userId to keep inflight tracking correct if they implement handling
-        # [FIX] Use session-based idempotency key to prevent duplicate consumption
-        uid = final_user_id
-        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
-        enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
-        
+
+        # [DISABLED] Auto-summary removed — user triggers manually via generate button
+
         logger.info(f"YouTube Import Success for {session_id}")
 
         # ops_logger: job completed
@@ -407,7 +724,7 @@ async def handle_import_youtube_task(request: Request):
         })
         return {"status": "failed", "error": str(e)}
 
-@router.post("/internal/tasks/quiz")
+@router.post("/internal/tasks/quiz", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_quiz_task(request: Request):
     try:
         payload = await request.json()
@@ -426,8 +743,8 @@ async def handle_quiz_task(request: Request):
 
 async def _handle_quiz_task_core(request: Request):
     """
-    Cloud Tasks Quiz Worker.
-    Decrement inflight count on completion.
+    Cloud Tasks Quiz Worker (single-shot, JSON output).
+    重複防止のため全問を1回のLLM呼び出しで生成する。
     """
     # [FeatureGate] Check if quiz feature is enabled
     if not is_feature_enabled("quiz"):
@@ -442,8 +759,8 @@ async def _handle_quiz_task_core(request: Request):
     session_id = payload.get("sessionId")
     job_id = payload.get("jobId")
     idempotency_key = payload.get("idempotencyKey")
-    count = payload.get("count", 5)
-    user_id = payload.get("userId") # [Security]
+    count = payload.get("count", 8)
+    user_id = payload.get("userId")
     usage_reserved = bool(payload.get("usageReserved"))
 
     if not session_id:
@@ -451,13 +768,14 @@ async def _handle_quiz_task_core(request: Request):
 
     final_user_id = user_id
 
-    # [FIX] Initialize cost_guard variables at top level for exception handler scope
+    # Initialize cost_guard variables at top level for exception handler scope
     cost_guard_id = None
     cost_guard_mode = "user"
     has_consumed = False
+    credits_consumed = 0
 
     try:
-        # [FIX] Initialize DB locally
+        # Initialize DB locally
         from google.cloud import firestore
         import os
         try:
@@ -465,50 +783,63 @@ async def _handle_quiz_task_core(request: Request):
             db = firestore.Client(project=project_id)
         except Exception as e:
             return {"status": "failed", "error": f"DB Init Failed: {e}"}
-        
+
         doc_ref = db.collection("sessions").document(session_id)
         doc = doc_ref.get()
-        
+
         if not doc.exists:
             return {"status": "skipped"}
-            
+
         data = doc.to_dict()
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
 
-        # [FIX] Resolve account ID for cost guard
+        # Resolve account ID for cost guard
         owner_account_id = data.get("ownerAccountId")
         cost_guard_id = owner_account_id or final_user_id
         cost_guard_mode = "account" if owner_account_id else "user"
-        has_consumed = False  # Track if we've consumed quota for refund on failure
 
-        transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
+        # ★ Translation sessions: normalize mode for quiz generation
+        if mode == "translate":
+            mode = "lecture"
+
         derived_ref = doc_ref.collection("derived").document("quiz")
 
+        # ── Idempotency check ──
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                d_data = derived_snap.to_dict() or {}
+                current_key = d_data.get("idempotencyKey")
+                current_status = d_data.get("status")
+                # Only skip if key matches AND previous run actually succeeded
+                if current_key and current_key == idempotency_key and current_status in ("succeeded", "completed"):
                     if job_id:
-                         db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
+                        db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
-        
-        if not transcript:
-            doc_ref.update({"quizStatus": "failed", "quizError": "Transcript empty", "status": "録音済み"})
-            if job_id:
-                db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": "Transcript empty"}, merge=True)
-            derived_ref.set({
-                "status": "failed",
-                "errorReason": "Transcript empty",
-                "updatedAt": datetime.now(timezone.utc),
-                "idempotencyKey": idempotency_key,
-            }, merge=True)
-            await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
-            return {"status": "failed"}
 
-        # generate_quiz, clean_quiz_markdown imported at top level now
+        # ── Resolve input: Facts or transcript ──
+        facts_ref = doc_ref.collection("derived").document("facts")
+        facts_snap = facts_ref.get()
+        facts = (facts_snap.to_dict() or {}).get("facts", []) if facts_snap.exists else []
+
+        if not facts:
+            transcript = await resolve_transcript_text_async(session_id, data) or ""
+            if not transcript:
+                doc_ref.update({"quizStatus": "failed", "quizError": "Transcript empty", "status": "録音済み"})
+                if job_id:
+                    db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": "Transcript empty"}, merge=True)
+                derived_ref.set({
+                    "status": "failed", "errorReason": "Transcript empty",
+                    "updatedAt": datetime.now(timezone.utc), "idempotencyKey": idempotency_key,
+                }, merge=True)
+                await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
+                return {"status": "failed"}
+        else:
+            transcript = ""
+            logger.info(f"[Quiz] Using {len(facts)} facts instead of transcript for {session_id}")
+
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "running"}, merge=True)
 
@@ -518,9 +849,9 @@ async def _handle_quiz_task_core(request: Request):
             "status": "テスト生成",
         })
 
-        # [FIX] CostGuard - Count usage when task actually executes (not just at API layer)
+        # CostGuard
         if not usage_reserved and cost_guard_id:
-            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode)
+            allowed, _meta = await cost_guard.guard_can_consume(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode, user_id=final_user_id)
             if not allowed:
                 logger.warning(f"[CostGuard] BLOCKED quiz {session_id} for {cost_guard_id}. Monthly limit exceeded.")
                 err_msg = "Monthly quiz limit exceeded"
@@ -529,53 +860,100 @@ async def _handle_quiz_task_core(request: Request):
                 return {"status": "blocked", "error": err_msg}
             has_consumed = True
             logger.info(f"[CostGuard] Reserved quiz_generated for {cost_guard_id} ({cost_guard_mode})")
+        elif usage_reserved and cost_guard_id:
+            has_consumed = True
 
-        # ops_logger: job started
+        # AI Credits: consume 2 credits for quiz
+        # Skip when already reserved via credits_reservations.reserve() (finalize v2).
+        if cost_guard_id and not usage_reserved:
+            _credit_cost = estimate_cost("quiz_generated")
+            _ok, _info = ai_credits.consume(cost_guard_id, _credit_cost, "quiz_generated")
+            if _ok:
+                credits_consumed = _credit_cost
+            else:
+                logger.warning(
+                    f"[AICredits] consume skipped for quiz {cost_guard_id}: {(_info or {}).get('reason')}"
+                )
+
         log_job_transition(session_id, "quiz", "started", uid=final_user_id, job_id=job_id)
 
-        quiz_raw = await generate_quiz(transcript, mode=mode, count=count)
+        # ── Generate quiz (single-shot JSON) ──
+        from app.services.llm import get_user_custom_prompts
+        _, quiz_instruction = get_user_custom_prompts(final_user_id)
+        quiz_data = await generate_quiz_json(
+            source_text=transcript,
+            facts=facts if facts else None,
+            mode=mode,
+            count=count,
+            custom_instruction=quiz_instruction,
+        )
 
-        # ops_logger: LLM call completed
-        log_llm_event(session_id, "quiz", "completed", uid=final_user_id, model="gemini-1.5-flash")
-        quiz_md = clean_quiz_markdown(quiz_raw)
-        
-        doc_ref.update({
+        if not quiz_data or not quiz_data.get("questions"):
+            # JSON生成失敗時: レガシーMarkdown方式にフォールバック
+            logger.warning(f"[Quiz] JSON generation failed for {session_id}, falling back to legacy")
+            if facts:
+                quiz_md = await generate_quiz_batch(
+                    facts=facts, mode=mode, count=count, batch_index=0, total_batches=1,
+                )
+            else:
+                quiz_raw = await generate_quiz(transcript, mode=mode, count=count)
+                quiz_md = clean_quiz_markdown(quiz_raw)
+            quiz_json_str = None
+        else:
+            quiz_md = quiz_json_to_markdown(quiz_data)
+            quiz_json_str = json.dumps(quiz_data, ensure_ascii=False)
+
+        log_llm_event(session_id, "quiz", "completed", uid=final_user_id, model=GEMINI_MODEL_NAME)
+
+        # ── Save results ──
+        update_fields = {
             "quizStatus": "completed",
             "quizMarkdown": quiz_md,
             "quizUpdatedAt": datetime.now(timezone.utc),
             "quizError": None,
             "status": "テスト完了",
-        })
+        }
+        if quiz_json_str:
+            update_fields["quizJson"] = quiz_json_str
+        doc_ref.update(update_fields)
+
+        derived_result = {"markdown": quiz_md, "count": len(quiz_data.get("questions", [])) if quiz_data else count}
+        if quiz_json_str:
+            derived_result["json"] = quiz_data  # ★ FIX: Store as dict, not JSON string (iOS expects [String: JSONValue])
         derived_ref.set({
             "status": "succeeded",
-            "result": {"markdown": quiz_md, "count": count},
+            "result": derived_result,
             "modelInfo": {"provider": "vertexai"},
             "updatedAt": datetime.now(timezone.utc),
             "errorReason": None,
             "idempotencyKey": idempotency_key,
         }, merge=True)
+
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
-        # ops_logger: job completed
         log_job_transition(session_id, "quiz", "completed", uid=final_user_id, job_id=job_id)
-        # Log usage success
         await usage_logger.log(user_id=final_user_id, feature="quiz", event_type="success", session_id=session_id)
-        
+        if cost_guard_id:
+            await cost_guard.record_success(cost_guard_id, "quiz_generated", mode=cost_guard_mode)
+
         await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
         return {"status": "completed"}
 
     except Exception as e:
-        # [FIX] Refund quota on failure
+        # Refund quota on failure
         if has_consumed and cost_guard_id:
             await cost_guard.refund_consumption(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode)
             logger.info(f"[CostGuard] Refunded quiz_generated for {cost_guard_id} due to failure")
+        if credits_consumed and cost_guard_id:
+            try:
+                ai_credits.refund(cost_guard_id, credits_consumed, "quiz_generated")
+            except Exception as refund_err:
+                logger.warning(f"[AICredits] Refund failed for quiz {cost_guard_id}: {refund_err}")
 
         logger.exception(f"Quiz generation failed for session {session_id}")
 
-        # ops_logger: LLM/job failed
         log_llm_event(session_id, "quiz", "failed", uid=final_user_id, error_code=ErrorCode.VERTEX_SCHEMA_PARSE_ERROR, error_message=str(e))
-        # Log usage error
         if final_user_id:
             await usage_logger.log(user_id=final_user_id, feature="quiz", event_type="error", session_id=session_id)
         error_str = str(e)
@@ -600,14 +978,11 @@ async def _handle_quiz_task_core(request: Request):
         except Exception as db_err:
             logger.warning(f"[quiz] Failed to update error status in DB: {db_err}")
 
-        # ops_logger: job failed
         log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
 
         return {"status": "failed", "error": str(e)}
 
-    # finally: removed
-
-@router.post("/internal/tasks/playlist", include_in_schema=False)
+@router.post("/internal/tasks/playlist", include_in_schema=False, dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_playlist_task(request: Request):
     """
     Cloud Tasks endpoint for Playlist Generation
@@ -649,7 +1024,7 @@ async def _handle_playlist_task_core(request: Request):
         if not final_user_id:
              final_user_id = data.get("ownerUserId") or data.get("userId")
 
-        transcript = resolve_transcript_text(session_id, data)
+        transcript = await resolve_transcript_text_async(session_id, data)
         if not transcript:
              logger.error("Empty transcript for playlist")
              return {"status": "failed", "reason": "empty_transcript"}
@@ -668,15 +1043,28 @@ async def _handle_playlist_task_core(request: Request):
         # Generate
         segments = data.get("diarizedSegments")
         duration = data.get("durationSec")
+        logger.info(f"[Playlist] Generating for {session_id}, transcript={len(transcript)}chars, segments={'yes' if segments else 'no'}, duration={duration}")
         playlist_json_str = await generate_playlist_timeline(transcript, segments=segments, duration_sec=duration)
+        logger.info(f"[Playlist] LLM raw response for {session_id}: len={len(playlist_json_str)}, preview={playlist_json_str[:300]}")
 
         try:
             raw_items = json.loads(playlist_json_str)
-        except:
+        except Exception as parse_err:
+            logger.warning(f"[Playlist] JSON parse error for {session_id}: {parse_err}, raw={playlist_json_str[:200]}")
             raw_items = []
+
+        logger.info(f"[Playlist] raw_items={len(raw_items)} for {session_id}")
 
         # [NEW] Normalize: ms/sec detection, duration clamp, validation
         items = normalize_playlist_items(raw_items, segments=segments, duration_sec=duration)
+        logger.info(f"[Playlist] After normalize: items={len(items)} for {session_id}")
+
+        if not items:
+            logger.warning(f"[Playlist] Empty after normalize for {session_id}, raw_items={len(raw_items)}, marking as failed")
+            ts = datetime.now(timezone.utc)
+            doc_ref.update({"playlistStatus": "failed", "playlistError": "Empty playlist from LLM", "playlistUpdatedAt": ts})
+            derived_ref.set({"status": "failed", "errorReason": "empty_result", "updatedAt": ts, "jobId": job_id}, merge=True)
+            return {"status": "failed", "reason": "empty_playlist"}
 
         # Success
         ts = datetime.now(timezone.utc)
@@ -726,7 +1114,7 @@ async def _handle_playlist_task_core(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/highlights")
+@router.post("/internal/tasks/highlights", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_generate_highlights(request: Request):
     """
     Cloud Tasks から呼び出される Worker エンドポイント。
@@ -757,7 +1145,7 @@ async def handle_generate_highlights(request: Request):
     return {"status": "failed", "reason": "deprecated"}
 
 
-@router.post("/internal/tasks/summary_v2")
+@router.post("/internal/tasks/summary_v2", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_summary_v2_task(request: Request):
     """
     Cloud Tasks endpoint for SummaryV2 (Evidence-based Structured Summary) Generation.
@@ -789,7 +1177,7 @@ async def handle_summary_v2_task(request: Request):
             return {"status": "skipped", "reason": "not_found"}
 
         data = doc.to_dict()
-        transcript = resolve_transcript_text(session_id, data)
+        transcript = await resolve_transcript_text_async(session_id, data)
         if not transcript:
             logger.error(f"[summary_v2] Empty transcript for {session_id}")
             return {"status": "failed", "reason": "empty_transcript"}
@@ -854,7 +1242,177 @@ async def handle_summary_v2_task(request: Request):
 # FastAPI registers routes in order, and having two handlers for the same path
 # causes the second one to override the first.
 
-@router.post("/internal/tasks/audio-cleanup")
+# =============================================================================
+# PR E — Derived Finalize Worker
+# =============================================================================
+# /internal/tasks/derived/finalize は finalize v2 (PR D) の per-feature 派生ジョブ
+# ディスパッチャ。`enqueue_derived_finalize_task` (app/task_queue.py) から投入される。
+#
+# 役割:
+#   1. payload {sessionId, feature, reservationId, ...} を読む
+#   2. feature ごとに既存 legacy enqueue 関数 (summarize / quiz_batch / highlights) を呼ぶ
+#   3. dispatch 成功時に credits_reservations.commit(feature)
+#   4. dispatch 失敗時に credits_reservations.release(feature, reason)
+#
+# ⚠️  PR E は thin dispatcher (Option A)。
+#     commit は legacy worker への enqueue 成功時点で行うため、legacy worker が
+#     最終的に失敗しても credits は refund されない楽観的会計になる。
+#     PR F で各 legacy worker が成功 / 失敗時に commit / release を直接呼ぶよう
+#     refactor することで完全な credits 整合性を獲得する想定。
+
+@router.post("/internal/tasks/derived/finalize", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_derived_finalize_task(request: Request):
+    """PR E: per-feature derived worker dispatcher.
+
+    Idempotency:
+        Cloud Tasks の retry に対しては、各 legacy enqueue 関数が自前の
+        idempotency_key (= reservation_id ベース) で重複を抑止する。
+        commit/release も冪等に書けるよう credits_reservations 側で保証されている。
+    """
+    from app.services import credits_reservations
+    from app.services.audit import emit as audit_emit
+    from app.task_queue import (
+        enqueue_summarize_task,
+        enqueue_quiz_batch_tasks,
+        enqueue_generate_highlights_task,
+    )
+
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid json: {exc}")
+
+    session_id = body.get("sessionId")
+    feature = body.get("feature")
+    reservation_id = body.get("reservationId")
+    user_id = body.get("userId")
+    operation_id = body.get("operationId")
+    client_request_id = body.get("clientRequestId") or reservation_id
+
+    if not session_id or not feature or not reservation_id:
+        raise HTTPException(
+            status_code=400,
+            detail="sessionId, feature, reservationId are required",
+        )
+
+    audit_emit(
+        f"{feature}.job.dispatch_requested",
+        session_id=session_id,
+        uid=user_id,
+        operation_id=operation_id,
+        request_id=client_request_id,
+        reservationId=reservation_id,
+        feature=feature,
+    )
+
+    idem_key = f"derived:{reservation_id}:{feature}"
+
+    try:
+        if feature == "summary":
+            enqueue_summarize_task(
+                session_id,
+                user_id=user_id,
+                idempotency_key=idem_key,
+                usage_reserved=True,
+            )
+        elif feature == "quiz":
+            enqueue_quiz_batch_tasks(
+                session_id,
+                user_id=user_id,
+                usage_reserved=True,
+            )
+        elif feature == "highlights":
+            enqueue_generate_highlights_task(
+                session_id,
+                user_id=user_id,
+            )
+        else:
+            # 未知 feature: reservation を release してエラー応答
+            credits_reservations.release(
+                session_id=session_id,
+                reservation_id=reservation_id,
+                feature=feature,
+                reason=f"unknown_feature:{feature}",
+            )
+            audit_emit(
+                f"{feature}.job.unknown_feature",
+                severity="ERROR",
+                session_id=session_id,
+                uid=user_id,
+                operation_id=operation_id,
+                request_id=client_request_id,
+                feature=feature,
+            )
+            raise HTTPException(status_code=400, detail=f"unknown feature: {feature}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            f"[derived_finalize] dispatch failed session={session_id} feature={feature}"
+        )
+        try:
+            credits_reservations.release(
+                session_id=session_id,
+                reservation_id=reservation_id,
+                feature=feature,
+                reason=f"dispatch_error:{type(exc).__name__}",
+            )
+        except Exception:
+            logger.exception("[derived_finalize] release after dispatch failure also failed")
+        audit_emit(
+            f"{feature}.job.dispatch_failed",
+            severity="ERROR",
+            session_id=session_id,
+            uid=user_id,
+            operation_id=operation_id,
+            request_id=client_request_id,
+            error=str(exc),
+        )
+        # Cloud Tasks に retry を促すため 500 を返す
+        raise HTTPException(status_code=500, detail=f"dispatch failed: {exc}")
+
+    # dispatch 成功 → optimistic commit
+    try:
+        credits_reservations.commit(
+            session_id=session_id,
+            reservation_id=reservation_id,
+            feature=feature,
+        )
+    except Exception as exc:
+        # commit 失敗は致命ではない (reservation は reserved のまま残る) が監査する
+        logger.warning(
+            f"[derived_finalize] commit failed session={session_id} feature={feature}: {exc}"
+        )
+        audit_emit(
+            f"{feature}.job.commit_failed",
+            severity="WARN",
+            session_id=session_id,
+            uid=user_id,
+            operation_id=operation_id,
+            request_id=client_request_id,
+            error=str(exc),
+        )
+
+    audit_emit(
+        f"{feature}.job.dispatched",
+        session_id=session_id,
+        uid=user_id,
+        operation_id=operation_id,
+        request_id=client_request_id,
+        reservationId=reservation_id,
+        feature=feature,
+    )
+
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "feature": feature,
+        "reservationId": reservation_id,
+        "status": "dispatched",
+    }
+
+
+@router.post("/internal/tasks/audio-cleanup", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_audio_cleanup_task():
     """
     Cloud Scheduler から呼び出される Audio Cleanup Worker エンドポイント。
@@ -868,7 +1426,7 @@ async def handle_audio_cleanup_task():
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/merge_migration")
+@router.post("/internal/tasks/merge_migration", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_merge_migration_task(request: Request):
     """
     Cloud Tasks worker for Account Merge Migration.
@@ -913,7 +1471,7 @@ async def _run_local_merge_migration(merge_id: str):
         logger.error(f"Local merge migration failed: {e}")
 
 
-@router.post("/internal/tasks/account_migration")
+@router.post("/internal/tasks/account_migration", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_account_migration_task(request: Request):
     """
     Cloud Tasks worker for Account Migration (triggered by phone verification merge).
@@ -975,7 +1533,71 @@ async def handle_account_migration_task(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/daily-usage-aggregation")
+@router.post("/internal/tasks/todo_extraction", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_todo_extraction_task(request: Request):
+    """
+    [NEW 2026-02] 非同期TODO抽出タスクハンドラ。
+    要約完了後にCloud Tasksから呼び出される。
+    """
+    from app.services.todo_extractor import update_todos_from_summary
+    from app.firebase import db
+
+    try:
+        payload = await request.json()
+        session_id = payload.get("sessionId")
+        account_id = payload.get("accountId")
+        source_key = payload.get("sourceKey")
+        summary_text = payload.get("summaryText", "")
+        transcript_text = payload.get("transcriptText", "")
+        mode = payload.get("mode", "lecture")
+
+        if not session_id or not account_id or not summary_text:
+            return {"status": "skipped", "reason": "missing_required_fields"}
+
+        # Update status to processing
+        doc_ref = db.collection("sessions").document(session_id)
+        doc_ref.update({
+            "todoStatus": "processing",
+            "todoUpdatedAt": datetime.now(timezone.utc),
+        })
+
+        # Extract TODOs
+        todo_stats = await update_todos_from_summary(
+            session_id=session_id,
+            account_id=account_id,
+            source_key=source_key,
+            summary_text=summary_text,
+            transcript_text=transcript_text,
+            mode=mode,
+        )
+
+        # Update session with results
+        doc_ref.update({
+            "todoStatus": "completed",
+            "todoUpdatedAt": datetime.now(timezone.utc),
+            "todoStats": todo_stats,
+        })
+
+        logger.info(f"[TODO] Async extraction completed for {session_id}: created={todo_stats.get('created')}")
+        return {"status": "completed", "stats": todo_stats}
+
+    except Exception as e:
+        logger.exception(f"[TODO] Async extraction failed for session")
+        # Mark as failed but don't cause retry (return 200)
+        try:
+            if session_id:
+                doc_ref = db.collection("sessions").document(session_id)
+                doc_ref.update({
+                    "todoStatus": "failed",
+                    "todoError": str(e)[:200],
+                    "todoUpdatedAt": datetime.now(timezone.utc),
+                })
+        except Exception:
+            pass
+        return {"status": "failed", "error": str(e)[:200]}
+
+
+@router.post("/internal/tasks/daily-usage-aggregation", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_daily_usage_aggregation(request: Request):
     """
     Cloud Scheduler から呼び出される Daily Aggregation Worker エンドポイント。
@@ -996,7 +1618,7 @@ async def handle_daily_usage_aggregation(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/account-deletion-sweep")
+@router.post("/internal/tasks/account-deletion-sweep", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_account_deletion_sweep():
     """
     Cloud Scheduler から呼び出される Account Deletion Sweep.
@@ -1047,7 +1669,7 @@ def _delete_collection(coll_ref, batch_size=50):
 
 
 
-@router.post("/internal/tasks/qa")
+@router.post("/internal/tasks/qa", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_qa_task(request: Request):
     """
     Cloud Tasks から呼び出される QA Worker エンドポイント。
@@ -1097,7 +1719,7 @@ async def handle_qa_task(request: Request):
         cost_guard_id = owner_account_id or final_user_id
         cost_guard_mode = "account" if owner_account_id else "user"
 
-        transcript = resolve_transcript_text(session_id, data) or ""
+        transcript = await resolve_transcript_text_async(session_id, data) or ""
 
         if not transcript:
             qa_ref.set({"status": "failed", "error": "Transcript empty", "updatedAt": datetime.now(timezone.utc)})
@@ -1154,7 +1776,7 @@ async def handle_qa_task(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/translate")
+@router.post("/internal/tasks/translate", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_translate_task(request: Request):
     """
     Cloud Tasks から呼び出される Translate Worker エンドポイント。
@@ -1197,8 +1819,8 @@ async def handle_translate_task(request: Request):
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
 
-        transcript = resolve_transcript_text(session_id, data) or ""
-        
+        transcript = await resolve_transcript_text_async(session_id, data) or ""
+
         if not transcript:
             trans_ref.set({"status": "failed", "error": "Transcript empty", "updatedAt": datetime.now(timezone.utc)})
             return {"status": "failed", "error": "Transcript empty"}
@@ -1246,7 +1868,7 @@ async def handle_translate_task(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
-@router.post("/internal/tasks/transcribe")
+@router.post("/internal/tasks/transcribe", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_transcribe_task(request: Request):
     try:
         payload = await request.json()
@@ -1315,26 +1937,24 @@ async def _handle_transcribe_task_core(request: Request):
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
 
-        # Check if already processed (Idempotency) - though typically transcribe is expensive so we might rely on status check too
-        if idempotency_key and job_ref:
-            # Check existing job status? 
-            # Simplified: Proceed for now mostly.
-            pass
+        # [FIX] STT Idempotency: Skip if batch STT already completed (prevents re-billing on retries)
+        if data.get("batchRetranscribeUsed") and not force:
+            logger.info(f"[Transcribe] SKIPPED for session {session_id}: batchRetranscribeUsed=True (already processed, idempotency guard)")
+            if job_ref:
+                job_ref.set({
+                    "status": "completed",
+                    "result": "skipped_already_processed",
+                    "reason": "Batch STT already completed (idempotency)",
+                    "completedAt": datetime.now(timezone.utc)
+                }, merge=True)
+            return {"status": "skipped", "reason": "already_processed"}
 
-        # [POLICY] STRICT Transcription Mode Enforcement
-        # - Cloud Mode (cloud_google): ONLY use Google STT V2 Streaming. NEVER batch transcribe.
-        # - On-Device Mode: ONLY use SFSpeechRecognizer/sherpa-onnx. No cloud.
         transcription_mode = data.get("transcriptionMode") or ""
         transcript_source = data.get("transcriptSource") or ""
         existing_transcript = data.get("transcriptText") or ""
-        
-        # [FIX] Policy removed: now cloud_google sessions are allowed to perform batch transcription
-        # Cloud mode: Streaming is preferred, but batch is allowed for re-processing or uploaded audio
-        pass
-        
-        # On-Device mode: This job should not be queued in the first place.
-        # But if it is, reject it since on-device doesn't use cloud batch.
-        if transcription_mode in ["on_device", "local", "offline"]:
+
+        # On-Device / device_sherpa mode: Skip batch STT (uses local transcription only)
+        if transcription_mode in ["on_device", "local", "offline", "device_sherpa"]:
             logger.info(f"[Transcribe] SKIPPED for session {session_id}: On-Device mode does not use cloud batch (policy).")
             if job_ref:
                 job_ref.set({
@@ -1464,91 +2084,74 @@ async def _handle_transcribe_task_core(request: Request):
              if segments:
                  updates["segments"] = segments
 
-        # LOG USAGE for Billing
-        try:
-            # Determine duration
-            usage_sec = float(data.get("durationSec") or 0.0)
-            if usage_sec == 0.0 and segments:
-                # Try to get from last segment
-                last = segments[-1]
-                usage_sec = float(last.get("end", 0.0) or last.get("endSec", 0.0))
-            
-            if usage_sec > 0:
-                # Check for ownerUid or userId
-                uid = data.get("ownerUserId") or data.get("userId") or "unknown_task_user"
-                if not final_user_id: final_user_id = uid # Resolve if missing
-                
-                # app.services.usage is already imported
-                await usage_logger.log(
-                    user_id=uid,
-                    session_id=session_id,
-                    feature="transcribe",
-                    event_type="success",
-                    payload={
-                        "recording_sec": usage_sec,
-                        "type": "cloud",
-                        "mode": data.get("mode"),
-                        "engine": engine
-                    }
-                )
-        except Exception as e:
-            logger.error(f"Failed to log usage for session {session_id}: {e}")
-        
-        doc_ref.update(updates)
-        if job_ref: job_ref.set({"status": "completed"}, merge=True)
-        
-        logger.info(f"Transcription Success for {session_id}")
-
-        # ops_logger: job completed
-        log_job_transition(session_id, "transcribe", "completed", uid=final_user_id, job_id=job_id)
-
-        # [NEW] Free Plan: Auto-trigger Summary and Quiz
-        # "Free 1 time = Cloud STT + Summary + Quiz"
-        # Since they consumed their 1 credit to start this Cloud STT, we maximize their value.
-        uid = data.get("ownerUserId") or data.get("userId")
-        if uid:
+        # LOG USAGE for Billing (with idempotency guard)
+        # [FIX] Only log once per session — prevents inflation from Cloud Tasks retries
+        if not data.get("transcribeUsageLogged"):
             try:
-                # Check plan
-                user_doc = db.collection("users").document(uid).get()
-                if user_doc.exists and user_doc.to_dict().get("plan", "free") == "free":
-                    from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
+                usage_sec = float(data.get("durationSec") or 0.0)
+                if usage_sec == 0.0 and segments:
+                    last = segments[-1]
+                    usage_sec = float(last.get("end", 0.0) or last.get("endSec", 0.0))
 
-                    # [FIX] Use session-based idempotency key to prevent duplicate consumption
-                    logger.info(f"[FreePlan] Auto-triggering Summary/Quiz for {session_id}")
-                    enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
-                    enqueue_quiz_task(session_id, count=3, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
-            except Exception as e:
-                logger.error(f"[FreePlan] Auto-trigger failed: {e}")
+                if usage_sec > 0:
+                    uid = data.get("ownerUserId") or data.get("userId") or "unknown_task_user"
+                    if not final_user_id: final_user_id = uid
 
-        # [NEW] Log Usage for Cloud STT
-        # NOTE: usage_logger is imported at file level (line 15)
-        try:
-             duration_sec = data.get("durationSec")
-             if not duration_sec and audio_info.get("durationSec"):
-                 duration_sec = audio_info.get("durationSec")
+                    # [FIX] Determine type from actual transcriptionMode, not hardcoded "cloud"
+                    usage_type = "cloud" if transcription_mode == "cloud_google" else "on_device"
 
-             if duration_sec:
-                 uid = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
-                 if uid:
-                     await usage_logger.log(
+                    await usage_logger.log(
                         user_id=uid,
                         session_id=session_id,
                         feature="transcribe",
                         event_type="success",
                         payload={
-                            "recording_sec": float(duration_sec),
-                            "type": "cloud"
+                            "recording_sec": usage_sec,
+                            "type": usage_type,
+                            "mode": data.get("mode"),
+                            "engine": engine
                         }
-                     )
-        except Exception as e:
-            logger.warning(f"Failed to log usage for transcribe task {session_id}: {e}")
+                    )
+                    # Mark as logged to prevent duplicate on retry
+                    updates["transcribeUsageLogged"] = True
+            except Exception as e:
+                logger.error(f"Failed to log usage for session {session_id}: {e}")
+        else:
+            logger.info(f"[transcribe] Skipping usage log for {session_id} — already logged")
 
-        # Trigger downstream
-        # [FIX] Use session-based idempotency key to prevent duplicate consumption
-        if should_update_main and transcript_text:
-             from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-             enqueue_summarize_task(session_id, user_id=final_user_id, idempotency_key=f"auto_summary:{session_id}")
-             enqueue_quiz_task(session_id, user_id=final_user_id, idempotency_key=f"auto_quiz:{session_id}")
+        doc_ref.update(updates)
+        if job_ref: job_ref.set({"status": "completed"}, merge=True)
+
+        logger.info(f"Transcription Success for {session_id}")
+
+        # ops_logger: job completed
+        log_job_transition(session_id, "transcribe", "completed", uid=final_user_id, job_id=job_id)
+
+        # [finalize v2 Step 1] canonical import 完了を記録。
+        # batchRetranscribeUsed guard により二重書き込みは起きない(MEMORY.md 記載の idempotency)。
+        try:
+            server_chunk_count = count_transcript_chunks(session_id)
+            mark_import_completed(
+                session_id,
+                chunk_count=server_chunk_count,
+                last_chunk_index=None,
+                source="cloud",
+            )
+            audit_emit(
+                "import_state.completed",
+                session_id=session_id,
+                uid=final_user_id,
+                source="cloud",
+                chunkCount=server_chunk_count,
+                via="transcribe_worker",
+            )
+        except Exception as exc:
+            logger.warning(f"[finalize_v2] mark_import_completed failed for {session_id}: {exc}")
+
+        # [NEW] Free Plan: Auto-trigger Summary and Quiz
+        # "Free 1 time = Cloud STT + Summary + Quiz"
+        # Since they consumed their 1 credit to start this Cloud STT, we maximize their value.
+        # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
 
         return {"status": "completed"}
 
@@ -1675,14 +2278,7 @@ async def handle_transcribe_task_deprecated(request: Request):
                     "transcriptText": transcript_text
                 }, merge=True)
             
-            # Trigger Auto-Summary if needed
-            # Only if we just updated the main transcript
-            # [FIX] Use session-based idempotency key to prevent duplicate consumption
-            if updates.get("transcriptText"):
-                 from app.task_queue import enqueue_summarize_task, enqueue_quiz_task
-                 uid = data.get("ownerUserId") or data.get("userId")
-                 enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
-                 enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
+            # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
 
             logger.info(f"Transcribe task completed for {session_id}, job_id={job_id}")
             return {"status": "completed", "engine": "google"}
@@ -1699,7 +2295,7 @@ async def handle_transcribe_task_deprecated(request: Request):
 
     return {"status": "skipped", "reason": f"unknown_engine: {engine}"}
 
-@router.post("/internal/tasks/cleanup_sessions")
+@router.post("/internal/tasks/cleanup_sessions", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_cleanup_sessions_task(request: Request):
     """
     [TRIPLE LOCK] Cleanup Worker.
@@ -1825,7 +2421,7 @@ async def handle_cleanup_sessions_task(request: Request):
     return {"status": "completed", "deleted": deleted_count}
 
 
-@router.post("/internal/tasks/nuke_user")
+@router.post("/internal/tasks/nuke_user", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_nuke_user_task(request: Request):
     """
     [CRITICAL] Complete account deletion worker.
@@ -1884,8 +2480,10 @@ async def handle_nuke_user_task(request: Request):
 
     logger.info(f"[NUKE] Result for {user_id}: {result}")
     return result
-@router.post("/internal/tasks/merge_migration")
-async def handle_merge_migration_task(request: Request):
+
+# NOTE: This is a DUPLICATE of line ~877. Consider consolidating.
+@router.post("/internal/tasks/merge_migration_v2", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_merge_migration_task_v2(request: Request):
     """
     Background Worker: Migrates sessions/data from Source UID to Target Account ID.
     Triggered after a successful merge commit.
@@ -1978,3 +2576,83 @@ async def handle_merge_migration_task(request: Request):
     
     logger.info(f"[Merge] Migration completed. Total sessions: {total_migrated}")
     return {"status": "completed", "migrated": total_migrated}
+
+
+@router.post("/internal/tasks/backfill-audio-urls", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_backfill_audio_urls(request: Request):
+    """
+    Backfill signedGetUrl for sessions with uploaded audio but no cached URL.
+    iOS reads signedGetUrl from Firestore directly, so this must be pre-populated.
+    """
+    from app.routes.sessions import signing_credentials, _get_signing_email
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    account_id = payload.get("accountId")
+    limit_count = payload.get("limit", 200)
+
+    sa_email = _get_signing_email()
+    if not sa_email:
+        return {"status": "failed", "error": "No signing SA configured"}
+
+    creds = signing_credentials(sa_email)
+    if not creds:
+        return {"status": "failed", "error": "Failed to create signing creds"}
+
+    now_utc = datetime.now(timezone.utc)
+    expires = now_utc + timedelta(days=7)
+
+    query = db.collection("sessions").where("audioStatus", "==", "uploaded")
+    if account_id:
+        query = query.where("ownerAccountId", "==", account_id)
+
+    updated = 0
+    skipped = 0
+    errors_list = []
+
+    def _do():
+        nonlocal updated, skipped
+        for doc_snap in query.limit(limit_count).stream():
+            data = doc_snap.to_dict()
+            cached_expires = data.get("signedGetUrlExpiresAt")
+            if cached_expires and hasattr(cached_expires, "replace"):
+                exp = cached_expires.replace(tzinfo=timezone.utc) if cached_expires.tzinfo is None else cached_expires
+                if exp > now_utc + timedelta(hours=1):
+                    skipped += 1
+                    continue
+
+            audio_info = data.get("audio") or {}
+            gcs_path = audio_info.get("gcsPath") or data.get("audioPath")
+            if not gcs_path:
+                skipped += 1
+                continue
+
+            bucket_name = AUDIO_BUCKET_NAME
+            prefix = f"gs://{bucket_name}/"
+            if gcs_path.startswith(prefix):
+                blob_name = gcs_path[len(prefix):]
+            elif gcs_path.startswith("gs://"):
+                parts = gcs_path.split("/", 3)
+                blob_name = parts[3] if len(parts) > 3 else gcs_path
+            else:
+                blob_name = gcs_path
+
+            try:
+                blob = storage_client.bucket(bucket_name).blob(blob_name)
+                url = blob.generate_signed_url(
+                    version="v4", expiration=expires, method="GET", credentials=creds,
+                )
+                doc_snap.reference.update({
+                    "signedGetUrl": url,
+                    "signedGetUrlExpiresAt": expires,
+                })
+                updated += 1
+            except Exception as e:
+                errors_list.append({"id": doc_snap.id, "err": str(e)[:80]})
+
+    await asyncio.to_thread(_do)
+    logger.info(f"[BackfillAudioURLs] updated={updated}, skipped={skipped}, errors={len(errors_list)}")
+    return {"status": "completed", "updated": updated, "skipped": skipped, "errors": errors_list[:5]}
