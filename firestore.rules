@@ -1,80 +1,393 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // =========================================================
     // Helper Functions
+    //
+    // Authorization model — account-aware
+    //
+    // Identity:
+    //   request.auth.uid              — Firebase uid
+    //   request.auth.token.accountId  — Set by backend _set_account_id_claim()
+    //                                   (may be absent on legacy tokens; we
+    //                                   always fall back to uid checks)
+    //   request.auth.token.admin      — Backend grants via custom claim
+    //
+    // Session access:
+    //   - owner:   session.ownerAccountId == token.accountId
+    //              (legacy: ownerUserId == uid, ownerUid == uid)
+    //   - shared:  account_id in session.sharedWithAccountIds
+    //              uid        in session.sharedUserIds / sharedWithUserIds
+    //              uid        in session.participantUserIds (legacy)
+    //
+    // Writes are uniformly DENIED — all mutations must go through the
+    // backend API which enforces business invariants, quotas, and idempotency.
+    // Clients may only READ via snapshot listeners (Phase 3 contract).
     // =========================================================
-    
+
     function isAuthenticated() {
       return request.auth != null;
     }
-    
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+
+    function tokenAccountId() {
+      return isAuthenticated() && 'accountId' in request.auth.token
+        ? request.auth.token.accountId
+        : null;
     }
-    
-    function isSessionParticipant(resourceData) {
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    function isSessionOwner(resourceData) {
       return isAuthenticated() && (
+        // Account-level owner (preferred)
+        (resourceData.ownerAccountId != null
+          && tokenAccountId() != null
+          && resourceData.ownerAccountId == tokenAccountId()) ||
+        // Legacy uid-only owner
         resourceData.ownerUserId == request.auth.uid ||
-        (resourceData.participantUserIds is list && request.auth.uid in resourceData.participantUserIds) ||
-        // Legacy support
-        (resourceData.ownerUid == request.auth.uid)
+        resourceData.ownerUid == request.auth.uid
       );
     }
 
-    // =========================================================
-    // Collections
-    // =========================================================
+    function isSessionSharedViewer(resourceData) {
+      return isAuthenticated() && (
+        (resourceData.sharedWithAccountIds is list
+          && tokenAccountId() != null
+          && tokenAccountId() in resourceData.sharedWithAccountIds) ||
+        (resourceData.sharedUserIds is list
+          && request.auth.uid in resourceData.sharedUserIds) ||
+        (resourceData.sharedWithUserIds is list
+          && request.auth.uid in resourceData.sharedWithUserIds) ||
+        (resourceData.participantUserIds is list
+          && request.auth.uid in resourceData.participantUserIds)
+      );
+    }
 
-    // Users Collection
-    // Read: Owner only
-    // Write: Deny (Use Backend API PATCH /users/me)
+    function canReadSession(resourceData) {
+      return isAdmin()
+        || isSessionOwner(resourceData)
+        || isSessionSharedViewer(resourceData);
+    }
+
+    // =========================================================
+    // /accounts/{accountId}
+    //
+    // Readable by any member uid (memberUids contains auth.uid) OR an admin.
+    // This enables client-side discovery of the user's own account and
+    // planExpiresAt / plan changes in real time.
+    // =========================================================
+    match /accounts/{accountId} {
+      allow read: if isAdmin() || (
+        isAuthenticated()
+          && resource.data.memberUids is list
+          && request.auth.uid in resource.data.memberUids
+      );
+      allow write: if false;
+    }
+
+    // =========================================================
+    // /uid_links/{uid}
+    //
+    // Read own link doc only. Writes are server-only (account merge logic).
+    // =========================================================
+    match /uid_links/{uid} {
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // =========================================================
+    // /users/{userId}
+    //
+    // Read own doc only. NO write permission for clients (the backend sets
+    // isAdmin / plan / accountId etc.).
+    // =========================================================
     match /users/{userId} {
-      allow read: if isOwner(userId);
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
       allow write: if false;
 
-      // User Subcollections (e.g. sessionMeta)
+      // /users/{uid}/sessionMeta/{sessionId} — legacy folder org location
       match /sessionMeta/{sessionId} {
-        allow read: if isOwner(userId);
+        allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+        allow write: if false;
+      }
+
+      // /users/{uid}/folders/{folderId}
+      //
+      // Post-Phase-1 (account-aware) clients should list folders via
+      // backend /v1 endpoints. Direct read here is allowed only for the
+      // caller's own uid so legacy flows keep working during migration.
+      match /folders/{folderId} {
+        allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
+        allow write: if false;
+      }
+
+      // /users/{uid}/monthly_usage/{monthKey}
+      match /monthly_usage/{monthKey} {
+        allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
         allow write: if false;
       }
     }
 
-    // Sessions Collection
-    // Read: Owner or Participant
-    // Write: Deny (Use Backend API for all session modifications)
+    // =========================================================
+    // /sessions/{sessionId}
+    //
+    // Phase 3 realtime contract:
+    //   Clients (iOS / Desktop) subscribe to snapshot listeners on:
+    //     - /sessions/{sessionId}
+    //     - /sessions/{sessionId}/derived/{artifact}   (summary, quiz,
+    //                                                    playlist, facts, etc.)
+    //     - /sessions/{sessionId}/jobs/{jobId}
+    //     - /sessions/{sessionId}/members/{memberId}
+    //     - /sessions/{sessionId}/conversations/{conversationId}
+    //     - /sessions/{sessionId}/transcript_chunks/{chunkIndex}
+    //
+    //   All writes flow through backend /v1 endpoints.
+    // =========================================================
     match /sessions/{sessionId} {
-      allow read: if isSessionParticipant(resource.data);
+      allow read: if canReadSession(resource.data);
       allow write: if false;
 
-      // Session Subcollections
+      // Derived artifacts (summary / quiz / playlist / facts / progress)
+      match /derived/{artifactId} {
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
+        allow write: if false;
+      }
+
+      // Jobs (summary / quiz / transcribe / playlist / todo progression)
+      match /jobs/{jobId} {
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
+        allow write: if false;
+      }
+
+      // Session members (role / joinedAt)
+      match /members/{memberId} {
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
+        allow write: if false;
+      }
+
+      // AI Chat conversations (Phase 7)
+      //
+      // Owner and shared viewers can read conversations of the session.
+      // Only the conversation creator's uid should see the replay to avoid
+      // leaking one member's chat into another's view — enforced server-side
+      // by the /v1/chat handler which scopes conversationId per caller.
+      match /conversations/{conversationId} {
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
+        allow write: if false;
+
+        // Sub-collection form (Phase 7.3)
+        match /messages/{messageId} {
+          allow read: if canReadSession(
+            get(/databases/$(database)/documents/sessions/$(sessionId)).data
+          );
+          allow write: if false;
+        }
+      }
+
+      // Transcript chunks  (heavy — listen only when transcript tab is open)
+      match /transcript_chunks/{chunkIndex} {
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
+        allow write: if false;
+      }
+
+      // Credits reservations (server-only)
+      match /credits_reservations/{reservationId} {
+        allow read, write: if false;
+      }
+
+      // Quiz attempts — own attempts only
+      match /quiz_attempts/{attemptId} {
+        allow read: if isAuthenticated() && (
+          isAdmin() ||
+          resource.data.userId == request.auth.uid ||
+          (resource.data.accountId != null
+            && tokenAccountId() != null
+            && resource.data.accountId == tokenAccountId())
+        );
+        allow write: if false;
+      }
+
+      // Catch-all for any future sub-collection we haven't explicitly listed.
+      // Default to canReadSession to avoid missing realtime updates for new
+      // artifact types, but NEVER allow writes.
       match /{subcollection=**} {
-        allow read: if isSessionParticipant(get(/databases/$(database)/documents/sessions/$(sessionId)).data);
+        allow read: if canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        );
         allow write: if false;
       }
     }
 
-    // Admin-only Collections
-    // usage_logs, user_daily_usage, system_stats, pricing_config
-    // These should only be accessed by Backend (Admin SDK)
-    match /usage_logs/{document=**} {
-      allow read, write: if false;
+    // =========================================================
+    // /accounts/{accountId}/conversations/{conversationId}  (general-scope chat)
+    //
+    // Phase 7 stores non-session AI chat under the account. Only members of
+    // the account can read their own conversations.
+    // =========================================================
+    match /accounts/{accountId}/conversations/{conversationId} {
+      allow read: if isAdmin() || (
+        isAuthenticated()
+          && tokenAccountId() == accountId
+      );
+      allow write: if false;
+
+      match /messages/{messageId} {
+        allow read: if isAdmin() || (
+          isAuthenticated()
+            && tokenAccountId() == accountId
+        );
+        allow write: if false;
+      }
     }
-    
-    match /user_daily_usage/{document=**} {
-      allow read, write: if false;
+
+    // =========================================================
+    // /accounts/{accountId}/folders/{folderId}  (Phase 2 target location)
+    //
+    // Not in use yet (folders still live under /users/{uid}/folders/*),
+    // but we allow reads in advance so the client can migrate without
+    // a second rules deploy.
+    // =========================================================
+    match /accounts/{accountId}/folders/{folderId} {
+      allow read: if isAdmin() || (
+        isAuthenticated()
+          && tokenAccountId() == accountId
+      );
+      allow write: if false;
     }
-    
-    match /system_stats/{document=**} {
-      allow read, write: if false;
-    }
-    
-    match /pricing_config/{document=**} {
+
+    // =========================================================
+    // /shareLinks/{token}
+    //
+    // Share link documents — server-side minted, clients don't need direct
+    // Firestore access. Revocation flows via backend API.
+    // =========================================================
+    match /shareLinks/{token} {
       allow read, write: if false;
     }
 
+    // =========================================================
+    // /ops_events/{eventId}
+    // /idempotency_locks/{key}
+    // /apple_transactions/{otid}
+    // /entitlements/{eid}
+    // /phone_numbers/{phone}
+    // /apple_app_account_tokens/{token}
+    // /config/{document=**}
+    //
+    // Backend-only. Clients must not read or write.
+    // =========================================================
+    match /ops_events/{eventId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /idempotency_locks/{key} {
+      allow read, write: if false;
+    }
+
+    match /apple_transactions/{otid} {
+      allow read, write: if false;
+    }
+
+    match /entitlements/{eid} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /phone_numbers/{phone} {
+      allow read, write: if false;
+    }
+
+    match /apple_app_account_tokens/{token} {
+      allow read, write: if false;
+    }
+
+    match /config/{document=**} {
+      allow read: if isAuthenticated();   // orb_theme など client 側が読む config のみ
+      allow write: if false;
+    }
+
+    match /orb_themes/{themeId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    match /orb_overrides/{uid} {
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // =========================================================
+    // /todos/{todoId}
+    //
+    // Each user's own TODOs (scoped by accountId). Read-only for clients.
+    // =========================================================
+    match /todos/{todoId} {
+      allow read: if isAdmin() || (
+        isAuthenticated()
+          && resource.data.accountId != null
+          && tokenAccountId() == resource.data.accountId
+      );
+      allow write: if false;
+    }
+
+    // =========================================================
+    // /translations/{sessionId}
+    // =========================================================
+    match /translations/{sessionId} {
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        canReadSession(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data
+        )
+      );
+      allow write: if false;
+    }
+
+    // =========================================================
+    // Admin-only legacy collections (backend writes via Admin SDK only)
+    // =========================================================
+    match /usage_logs/{document=**} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /user_daily_usage/{document=**} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /system_stats/{document=**} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /pricing_config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    match /ads_config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // =========================================================
     // Default Deny All
+    // =========================================================
     match /{document=**} {
       allow read, write: if false;
     }
