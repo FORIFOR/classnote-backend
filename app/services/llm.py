@@ -4,7 +4,7 @@ import json
 import math
 import random
 import time
-from typing import List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 from app.services.profiling import get_profiler, Phase, PROFILING_ENABLED
 
@@ -1905,9 +1905,21 @@ async def _map_extract_chunk(chunk: str, mode: str, chunk_index: int) -> dict:
         return {}
 
 
-async def _reduce_synthesize(extracted: List[dict], mode: str, source_len: int, custom_instruction: str = "") -> dict:
+async def _reduce_synthesize(
+    extracted: List[dict],
+    mode: str,
+    source_len: int,
+    custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
+) -> dict:
     """
     Reduce phase: Synthesize all extracted points into structured JSON.
+
+    segments (Phase 7.11): transcript segments/chunks with id+time. When
+    provided, the reduce prompt is appended with a segment-id-tagged
+    transcript and the LLM is asked to include `sourceSegmentIds` on each
+    produced bullet. Falls back to text-matching anchor_resolver (existing
+    behavior) when the LLM doesn't ground a bullet.
     """
     from vertexai.generative_models import GenerationConfig
 
@@ -1922,6 +1934,13 @@ async def _reduce_synthesize(extracted: List[dict], mode: str, source_len: int, 
 
     prompt_template = _REDUCE_PROMPT_LECTURE if mode == "lecture" else _REDUCE_PROMPT_MEETING
     prompt = prompt_template.format(extracted_points=combined)
+
+    # Phase 7.11: segment-id citation suffix. Shares the same contract as
+    # the single-path forward-path implementation (Phase 7.10) so the
+    # downstream _hydrate_source_segment_ids step handles both paths
+    # uniformly.
+    if segments:
+        prompt += _build_segment_citation_suffix(segments)
 
     # Inject user custom instruction
     if custom_instruction:
@@ -2027,9 +2046,19 @@ async def _generate_summary_hierarchical(
     mode: str,
     progress_callback=None,
     custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
 ) -> dict:
     """
     Hierarchical Map→Reduce summarization with optimised chunking.
+
+    segments (Phase 7.11): transcript segment list with {id, text, startMs,
+    endMs, speaker?}. Threaded into the FINAL reduce pass only — the
+    per-chunk map phase and per-group intermediate reduces keep their
+    current lean prompts. The final reduce appends a segment-id-tagged
+    transcript and asks the LLM to return `sourceSegmentIds` on each
+    bullet; downstream `_hydrate_source_segment_ids` validates and
+    attaches startSec/endSec. Bullets the LLM didn't ground still fall
+    back to anchor_resolver text matching.
 
     Key optimisations vs previous version:
     - MAP_CHUNK_SIZE (12K) instead of CHUNK_SIZE (80K) → many small, fast map calls
@@ -2104,9 +2133,15 @@ async def _generate_summary_hierarchical(
     logger.info(f"[Hierarchical] Combined extracted size: {combined_size} chars")
 
     if combined_size > REDUCE_BATCH_LIMIT and len(extracted) > 6:
-        result = await _multi_level_reduce(extracted, mode, source_len=len(text), custom_instruction=custom_instruction)
+        result = await _multi_level_reduce(
+            extracted, mode, source_len=len(text),
+            custom_instruction=custom_instruction, segments=segments,
+        )
     else:
-        result = await _reduce_synthesize(extracted, mode, source_len=len(text), custom_instruction=custom_instruction)
+        result = await _reduce_synthesize(
+            extracted, mode, source_len=len(text),
+            custom_instruction=custom_instruction, segments=segments,
+        )
 
     reduce_time = time_module.perf_counter() - reduce_start
     logger.info(f"[Hierarchical] Reduce phase completed in {reduce_time:.2f}s")
@@ -2168,10 +2203,22 @@ async def _generate_summary_hierarchical(
     return final_result
 
 
-async def _multi_level_reduce(extracted: List[dict], mode: str, source_len: int, custom_instruction: str = "") -> dict:
+async def _multi_level_reduce(
+    extracted: List[dict],
+    mode: str,
+    source_len: int,
+    custom_instruction: str = "",
+    segments: Optional[List[dict]] = None,
+) -> dict:
     """
     Multi-level reduce for large numbers of map results.
     Groups extracted data → parallel partial reduces → final reduce.
+
+    Phase 7.11: segments flow only through the FINAL reduce pass.
+    Intermediate group-level reduces don't get the segment-id transcript
+    to keep their prompts small; they just collapse extracted facts into
+    extraction-format, which the final reduce then grounds against the
+    real transcript via sourceSegmentIds.
     """
     GROUP_SIZE = 6  # chunks per reduce group
 
@@ -2224,9 +2271,15 @@ async def _multi_level_reduce(extracted: List[dict], mode: str, source_len: int,
     if not intermediate:
         raise ValueError("All reduce groups failed")
 
-    # Final reduce (apply custom instruction only on the final pass)
+    # Final reduce (apply custom instruction + segment-id citation only here)
     logger.info(f"[Hierarchical] Final reduce from {len(intermediate)} intermediate results")
-    final = await _reduce_synthesize(intermediate, mode, source_len=source_len, custom_instruction=custom_instruction)
+    final = await _reduce_synthesize(
+        intermediate,
+        mode,
+        source_len=source_len,
+        custom_instruction=custom_instruction,
+        segments=segments,
+    )
     if not final.get("tags") and fallback_tags:
         final["tags"] = fallback_tags
     return final
@@ -2546,7 +2599,15 @@ async def generate_summary_and_tags(
     if use_hierarchical:
         if USE_HIERARCHICAL_SUMMARY:
             logger.info("[Hierarchical] Using Map→Reduce summarization")
-            result = await _generate_summary_hierarchical(text, mode, progress_callback=progress_callback, custom_instruction=custom_instruction)
+            # Phase 7.11: segments flow through to the FINAL reduce so long
+            # sessions also get forward-path citation (sourceSegmentIds).
+            result = await _generate_summary_hierarchical(
+                text,
+                mode,
+                progress_callback=progress_callback,
+                custom_instruction=custom_instruction,
+                segments=segments,
+            )
         else:
             logger.info("Using traditional chunked summarization")
             result = await _generate_summary_chunked(text, mode, custom_instruction=custom_instruction)
