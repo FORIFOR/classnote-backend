@@ -1486,17 +1486,40 @@ async def list_sessions(
     
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
+    # [Fix 2026-04-18] account-aware: sessionMeta may live under any
+    # member uid of the caller's account (writers target the uid that
+    # already owns meta). A caller on uid B must still see folderId
+    # set by uid A in the same account. We walk every member uid and
+    # keep the first non-empty meta per session id.
     meta_map = {}
     if unique_docs:
         try:
-            meta_refs = [
-                db.collection("users").document(target_user_id).collection("sessionMeta").document(d.id)
-                for d in unique_docs
-            ]
+            from app.services import project_folders
+            reader_uids: list[str] = []
+            if account_id:
+                try:
+                    reader_uids = list(project_folders.resolve_member_uids(target_user_id, account_id))
+                except Exception as exc:
+                    logger.warning(f"[list_sessions] resolve_member_uids failed: {exc}")
+                    reader_uids = []
+            if target_user_id not in reader_uids:
+                reader_uids.insert(0, target_user_id)
+
             def _fetch_meta():
-                _m = {}
-                for snap in db.get_all(meta_refs):
-                    if snap.exists:
+                _m: dict = {}
+                for candidate_uid in reader_uids:
+                    meta_refs = [
+                        db.collection("users")
+                        .document(candidate_uid)
+                        .collection("sessionMeta")
+                        .document(d.id)
+                        for d in unique_docs
+                    ]
+                    for snap in db.get_all(meta_refs):
+                        if not snap.exists:
+                            continue
+                        if snap.id in _m:
+                            continue  # first non-empty winner
                         _m[snap.id] = snap.to_dict()
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
@@ -1868,17 +1891,40 @@ async def import_session_audio(
     
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
+    # [Fix 2026-04-18] account-aware: sessionMeta may live under any
+    # member uid of the caller's account (writers target the uid that
+    # already owns meta). A caller on uid B must still see folderId
+    # set by uid A in the same account. We walk every member uid and
+    # keep the first non-empty meta per session id.
     meta_map = {}
     if unique_docs:
         try:
-            meta_refs = [
-                db.collection("users").document(target_user_id).collection("sessionMeta").document(d.id)
-                for d in unique_docs
-            ]
+            from app.services import project_folders
+            reader_uids: list[str] = []
+            if account_id:
+                try:
+                    reader_uids = list(project_folders.resolve_member_uids(target_user_id, account_id))
+                except Exception as exc:
+                    logger.warning(f"[list_sessions] resolve_member_uids failed: {exc}")
+                    reader_uids = []
+            if target_user_id not in reader_uids:
+                reader_uids.insert(0, target_user_id)
+
             def _fetch_meta():
-                _m = {}
-                for snap in db.get_all(meta_refs):
-                    if snap.exists:
+                _m: dict = {}
+                for candidate_uid in reader_uids:
+                    meta_refs = [
+                        db.collection("users")
+                        .document(candidate_uid)
+                        .collection("sessionMeta")
+                        .document(d.id)
+                        for d in unique_docs
+                    ]
+                    for snap in db.get_all(meta_refs):
+                        if not snap.exists:
+                            continue
+                        if snap.id in _m:
+                            continue  # first non-empty winner
                         _m[snap.id] = snap.to_dict()
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
@@ -1973,10 +2019,37 @@ async def import_session_audio(
 
 
 # ★ Helper functions for parallel fetching in GET /sessions/{session_id}
-def _fetch_session_meta_sync(uid: str, session_id: str) -> dict:
-    """Fetch user's sessionMeta (pinned, archived, lastOpened)."""
+def _fetch_session_meta_sync(uid: str, session_id: str, account_id: Optional[str] = None) -> dict:
+    """Fetch user's sessionMeta (pinned, archived, lastOpened, folderId).
+
+    Fix (2026-04-18): account-aware read. `set_session_organization`
+    writes the meta doc under whichever member uid already holds one,
+    falling back to the caller's uid. Previously this reader only
+    checked the caller's own uid, so on cross-device / cross-uid
+    scenarios (e.g. iOS uid A set the folder, Desktop uid B reads it)
+    the meta was invisible and the UI showed no folder. We now use
+    `project_folders.find_session_meta_uid` — the same resolver the
+    writer uses — so read/write are symmetric across all member uids.
+
+    Falls back to the caller's uid when no meta doc exists anywhere in
+    the account, which keeps the first-ever read path unchanged.
+    """
     try:
-        meta_ref = db.collection("users").document(uid).collection("sessionMeta").document(session_id)
+        from app.services import project_folders
+        # Prefer the uid that already owns a meta doc for this session
+        # (writers target the same uid). Fall back to the caller's uid
+        # when no prior meta exists yet.
+        resolved_uid = (
+            project_folders.find_session_meta_uid(uid, account_id, session_id)
+            if account_id
+            else None
+        ) or uid
+        meta_ref = (
+            db.collection("users")
+            .document(resolved_uid)
+            .collection("sessionMeta")
+            .document(session_id)
+        )
         meta_snap = meta_ref.get()
         if meta_snap.exists:
             meta = meta_snap.to_dict()
@@ -2070,7 +2143,7 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     image_notes_raw = data.get("imageNotes") or []
     chunk_count, meta, image_notes_resolved, members_list = await asyncio.gather(
         asyncio.to_thread(count_transcript_chunks, resolved_id),
-        asyncio.to_thread(_fetch_session_meta_sync, current_user.uid, session_id),
+        asyncio.to_thread(_fetch_session_meta_sync, current_user.uid, session_id, current_user.account_id),
         asyncio.to_thread(_resolve_image_notes_with_urls, image_notes_raw),
         asyncio.to_thread(_fetch_members_sync, resolved_id),
     )
