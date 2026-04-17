@@ -1487,10 +1487,13 @@ async def list_sessions(
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
     # [Fix 2026-04-18] account-aware: sessionMeta may live under any
-    # member uid of the caller's account (writers target the uid that
-    # already owns meta). A caller on uid B must still see folderId
-    # set by uid A in the same account. We walk every member uid and
-    # keep the first non-empty meta per session id.
+    # member uid of the caller's account. We now shallow-merge fields
+    # across every member uid (caller's uid wins on conflicts) so
+    # legacy split state — e.g. folderId on uid A written by
+    # set_session_organization AND isPinned on uid B written by the
+    # old update_session_meta — still surfaces together on reads. The
+    # writer is being unified separately; this merge keeps already-
+    # fragmented accounts consistent in the meantime.
     meta_map = {}
     if unique_docs:
         try:
@@ -1507,6 +1510,9 @@ async def list_sessions(
 
             def _fetch_meta():
                 _m: dict = {}
+                # reader_uids is ordered caller-first; later uids only
+                # fill in missing keys, so the caller's own state wins
+                # on conflicts (last-writer-wins in single-uid mode).
                 for candidate_uid in reader_uids:
                     meta_refs = [
                         db.collection("users")
@@ -1518,9 +1524,11 @@ async def list_sessions(
                     for snap in db.get_all(meta_refs):
                         if not snap.exists:
                             continue
-                        if snap.id in _m:
-                            continue  # first non-empty winner
-                        _m[snap.id] = snap.to_dict()
+                        existing = _m.get(snap.id) or {}
+                        incoming = snap.to_dict() or {}
+                        merged = dict(incoming)
+                        merged.update(existing)  # earlier uid (caller) wins
+                        _m[snap.id] = merged
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
         except Exception as e:
@@ -1892,10 +1900,13 @@ async def import_session_audio(
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
     # [Fix 2026-04-18] account-aware: sessionMeta may live under any
-    # member uid of the caller's account (writers target the uid that
-    # already owns meta). A caller on uid B must still see folderId
-    # set by uid A in the same account. We walk every member uid and
-    # keep the first non-empty meta per session id.
+    # member uid of the caller's account. We now shallow-merge fields
+    # across every member uid (caller's uid wins on conflicts) so
+    # legacy split state — e.g. folderId on uid A written by
+    # set_session_organization AND isPinned on uid B written by the
+    # old update_session_meta — still surfaces together on reads. The
+    # writer is being unified separately; this merge keeps already-
+    # fragmented accounts consistent in the meantime.
     meta_map = {}
     if unique_docs:
         try:
@@ -1912,6 +1923,9 @@ async def import_session_audio(
 
             def _fetch_meta():
                 _m: dict = {}
+                # reader_uids is ordered caller-first; later uids only
+                # fill in missing keys, so the caller's own state wins
+                # on conflicts (last-writer-wins in single-uid mode).
                 for candidate_uid in reader_uids:
                     meta_refs = [
                         db.collection("users")
@@ -1923,9 +1937,11 @@ async def import_session_audio(
                     for snap in db.get_all(meta_refs):
                         if not snap.exists:
                             continue
-                        if snap.id in _m:
-                            continue  # first non-empty winner
-                        _m[snap.id] = snap.to_dict()
+                        existing = _m.get(snap.id) or {}
+                        incoming = snap.to_dict() or {}
+                        merged = dict(incoming)
+                        merged.update(existing)  # earlier uid (caller) wins
+                        _m[snap.id] = merged
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
         except Exception as e:
@@ -2022,42 +2038,55 @@ async def import_session_audio(
 def _fetch_session_meta_sync(uid: str, session_id: str, account_id: Optional[str] = None) -> dict:
     """Fetch user's sessionMeta (pinned, archived, lastOpened, folderId).
 
-    Fix (2026-04-18): account-aware read. `set_session_organization`
-    writes the meta doc under whichever member uid already holds one,
-    falling back to the caller's uid. Previously this reader only
-    checked the caller's own uid, so on cross-device / cross-uid
-    scenarios (e.g. iOS uid A set the folder, Desktop uid B reads it)
-    the meta was invisible and the UI showed no folder. We now use
-    `project_folders.find_session_meta_uid` — the same resolver the
-    writer uses — so read/write are symmetric across all member uids.
+    Fix (2026-04-18): account-aware shallow-merge read.
 
-    Falls back to the caller's uid when no meta doc exists anywhere in
-    the account, which keeps the first-ever read path unchanged.
+    Writers targeting the sessionMeta doc have drifted over time:
+      - `set_session_organization` writes folderId on whichever member
+        uid already holds meta (fallback: owner uid).
+      - The old `update_session_meta` unconditionally wrote
+        isPinned / isArchived / lastOpenedAt on the caller's uid.
+      - Session creation writes a bootstrap doc on the owner uid.
+
+    So on multi-uid accounts (iOS uid A + Desktop uid B) the fields
+    can legitimately be split across two docs. We now walk every
+    member uid (caller first) and shallow-merge the docs — the
+    caller's own uid wins on conflicts, mirroring last-writer-wins
+    semantics on single-uid accounts.
     """
     try:
         from app.services import project_folders
-        # Prefer the uid that already owns a meta doc for this session
-        # (writers target the same uid). Fall back to the caller's uid
-        # when no prior meta exists yet.
-        resolved_uid = (
-            project_folders.find_session_meta_uid(uid, account_id, session_id)
-            if account_id
-            else None
-        ) or uid
-        meta_ref = (
-            db.collection("users")
-            .document(resolved_uid)
-            .collection("sessionMeta")
-            .document(session_id)
-        )
-        meta_snap = meta_ref.get()
-        if meta_snap.exists:
-            meta = meta_snap.to_dict()
+        reader_uids: list[str] = []
+        if account_id:
+            try:
+                reader_uids = list(project_folders.resolve_member_uids(uid, account_id))
+            except Exception as exc:
+                logger.warning(f"[sessionMeta] resolve_member_uids failed: {exc}")
+                reader_uids = []
+        if uid not in reader_uids:
+            reader_uids.insert(0, uid)
+
+        merged: dict = {}
+        for candidate_uid in reader_uids:
+            meta_ref = (
+                db.collection("users")
+                .document(candidate_uid)
+                .collection("sessionMeta")
+                .document(session_id)
+            )
+            meta_snap = meta_ref.get()
+            if not meta_snap.exists:
+                continue
+            incoming = meta_snap.to_dict() or {}
+            for key, value in incoming.items():
+                if key not in merged:
+                    merged[key] = value
+
+        if merged:
             return {
-                "isPinned": meta.get("isPinned", False),
-                "isArchived": meta.get("isArchived", False),
-                "lastOpenedAt": meta.get("lastOpenedAt"),
-                "folderId": meta.get("folderId"),
+                "isPinned": merged.get("isPinned", False),
+                "isArchived": merged.get("isArchived", False),
+                "lastOpenedAt": merged.get("lastOpenedAt"),
+                "folderId": merged.get("folderId"),
             }
     except Exception as e:
         logger.warning(f"Failed to fetch sessionMeta for detail: {e}")
@@ -3094,9 +3123,22 @@ async def update_session_meta(
     # Access check
     session_data = session_snap.to_dict()
     ensure_can_view(session_data, current_user, session_id)
-    
-    # Meta Doc Ref
-    meta_ref = db.collection("users").document(current_user.uid).collection("sessionMeta").document(session_id)
+
+    # [Fix 2026-04-18] account-aware writer.
+    # Previously this wrote isPinned/isArchived/lastOpenedAt unconditionally
+    # to the caller's own uid, but set_session_organization (folder assign)
+    # writes folderId to the uid that *already* holds sessionMeta. On
+    # multi-uid accounts (iOS uid A + Desktop uid B) that split fields
+    # across two docs and the UI saw stale state. Prefer the uid that
+    # already owns the meta doc so all fields stay on ONE doc per account.
+    from app.services import project_folders
+    target_uid = (
+        project_folders.find_session_meta_uid(
+            current_user.uid, current_user.account_id, session_id
+        )
+        or current_user.uid
+    )
+    meta_ref = db.collection("users").document(target_uid).collection("sessionMeta").document(session_id)
     
     update_data = {}
     if body.isPinned is not None:
