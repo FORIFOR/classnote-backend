@@ -1618,6 +1618,58 @@ async def handle_daily_usage_aggregation(request: Request):
         return {"status": "failed", "error": str(e)}
 
 
+@router.post("/internal/tasks/build_transcript_chunk_index", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_build_transcript_chunk_index(request: Request):
+    """Phase 7.6 prep — rebuild /transcript_chunks index for a single session.
+
+    Payload: {"sessionId": "...", "transcriptVersion"?: number}
+
+    Idempotent: replaces any previous rows keyed by sessionId. Safe to retry
+    (Cloud Tasks native retry semantics apply).
+    """
+    from app.jobs.build_transcript_chunk_index import build_transcript_chunk_index_for_session
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    session_id = payload.get("sessionId")
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+    try:
+        return build_transcript_chunk_index_for_session(
+            session_id,
+            transcript_version=payload.get("transcriptVersion"),
+        )
+    except Exception as e:
+        logger.exception(f"build_transcript_chunk_index failed for {session_id}")
+        return {"status": "failed", "error": str(e)[:300]}
+
+
+@router.post("/internal/tasks/build_summary_evidence_index", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_build_summary_evidence_index(request: Request):
+    """Phase 7.6 prep — backfill /summary_evidence_index for a session.
+
+    Payload: {"sessionId": "..."}
+
+    Reads `sessions/{id}/derived/summary.result.json` (canonical) or legacy
+    `derived/summary_v2`, flattens every bullet into /summary_evidence_index.
+    Idempotent.
+    """
+    from app.jobs.build_summary_evidence_index import backfill_summary_evidence_for_session
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    session_id = payload.get("sessionId")
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+    try:
+        return backfill_summary_evidence_for_session(session_id)
+    except Exception as e:
+        logger.exception(f"build_summary_evidence_index failed for {session_id}")
+        return {"status": "failed", "error": str(e)[:300]}
+
+
 @router.post("/internal/tasks/account-deletion-sweep", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_account_deletion_sweep():
     """
