@@ -216,6 +216,116 @@ async def list_chat_presets(
 
 
 # ---------------------------------------------------------------------------
+# Conversation history retrieval  (Phase 7.3 — sub-collection backed)
+# ---------------------------------------------------------------------------
+
+
+class ConversationMessage(BaseModel):
+    messageId: str
+    role: Literal["user", "assistant"]
+    text: Optional[str] = None
+    citations: List[Citation] = []
+    mode: Optional[str] = None
+    usedModel: Optional[str] = None
+    clientSortKey: Optional[int] = None
+    createdAt: Optional[str] = None
+
+
+class ConversationMessagesResponse(BaseModel):
+    conversationId: str
+    scope: Dict[str, Any]
+    messages: List[ConversationMessage]
+    nextCursor: Optional[int] = None
+
+
+async def _fetch_messages(
+    ctx: ChatContext,
+    conversation_id: str,
+    limit: int,
+    before: Optional[int],
+) -> List[ConversationMessage]:
+    import asyncio as _asyncio
+
+    raw = await _asyncio.to_thread(
+        session_chat.fetch_conversation_messages,
+        ctx,
+        conversation_id,
+        limit,
+        before,
+    )
+    return [
+        ConversationMessage(
+            messageId=m["messageId"],
+            role=m["role"],
+            text=m.get("text"),
+            citations=[Citation(**c) for c in (m.get("citations") or [])],
+            mode=m.get("mode"),
+            usedModel=m.get("usedModel"),
+            clientSortKey=m.get("clientSortKey"),
+            createdAt=m.get("createdAt"),
+        )
+        for m in raw
+        if m.get("role") in ("user", "assistant")
+    ]
+
+
+@router.get(
+    "/sessions/{session_id}/chat/conversations/{conversation_id}/messages",
+    response_model=ConversationMessagesResponse,
+)
+async def list_session_conversation_messages(
+    session_id: str,
+    conversation_id: str,
+    limit: int = 50,
+    before: Optional[int] = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Fetch messages of a session-scoped conversation (paginated)."""
+    ctx = ChatContext(
+        user=current_user,
+        scope={"type": "session", "sessionId": session_id},
+        message="",
+    )
+    try:
+        session_chat._load_session(ctx)  # permission gate
+    except Exception as e:  # noqa: BLE001
+        raise _map_error(e)
+
+    msgs = await _fetch_messages(ctx, conversation_id, limit, before)
+    return ConversationMessagesResponse(
+        conversationId=conversation_id,
+        scope=ctx.scope,
+        messages=msgs,
+        nextCursor=msgs[-1].clientSortKey if msgs and len(msgs) == limit else None,
+    )
+
+
+@router.get(
+    "/chat/conversations/{conversation_id}/messages",
+    response_model=ConversationMessagesResponse,
+)
+async def list_general_conversation_messages(
+    conversation_id: str,
+    limit: int = 50,
+    before: Optional[int] = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Fetch messages of a general-scoped (account-level) conversation."""
+    ctx = ChatContext(
+        user=current_user,
+        scope={"type": "general"},
+        message="",
+    )
+    msgs = await _fetch_messages(ctx, conversation_id, limit, before)
+    return ConversationMessagesResponse(
+        conversationId=conversation_id,
+        scope=ctx.scope,
+        messages=msgs,
+        nextCursor=msgs[-1].clientSortKey if msgs and len(msgs) == limit else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming variant (Phase 7.2)
 # ---------------------------------------------------------------------------
 

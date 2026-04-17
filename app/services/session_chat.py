@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
+from google.cloud import firestore
+
 from app.firebase import db
 from app.services import chat_router, context_builder
 from app.services.ai_credits import ai_credits, estimate_cost
@@ -240,10 +242,23 @@ def _load_transcript_chunks(session_id: str, limit: int = 500) -> List[Dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Conversation persistence
-#   sessions/{sid}/conversations/{conversationId}
-#   accounts/{accountId}/conversations/{conversationId}   (general scope)
+# Conversation persistence  (Phase 7.3: sub-collection form)
+#
+# Layout:
+#   sessions/{sid}/conversations/{conversationId}/messages/{messageId}
+#   accounts/{accountId}/conversations/{conversationId}/messages/{messageId}
+#
+# Each message is its own Firestore document, so concurrent turns from
+# multiple tabs / devices never clobber each other. The parent conversation
+# doc only holds metadata (scope / createdAt / updatedAt / lastMessageAt /
+# messageCount), never the message array itself.
+#
+# Reads for prompt context always go through `order_by(createdAt DESC) +
+# limit(MAX_HISTORY)`, so old messages are ignored automatically.
 # ---------------------------------------------------------------------------
+
+
+MAX_HISTORY_TURNS = 12
 
 
 def _conversation_ref(ctx: ChatContext, conversation_id: str):
@@ -263,30 +278,46 @@ def _conversation_ref(ctx: ChatContext, conversation_id: str):
     )
 
 
+def _messages_ref(ctx: ChatContext, conversation_id: str):
+    return _conversation_ref(ctx, conversation_id).collection("messages")
+
+
 def _load_conversation(ctx: ChatContext) -> tuple[str, List[Dict[str, str]]]:
-    """Return (conversation_id, history). Creates a new conversation if needed."""
+    """Return (conversation_id, history).
+
+    Loads up to MAX_HISTORY_TURNS most-recent messages from the sub-collection
+    in chronological order. If the client supplied explicit history and no
+    prior messages exist, use that as the initial context (useful for fresh
+    conversations that were kept client-side only).
+    """
     conversation_id = ctx.conversation_id
     history: List[Dict[str, str]] = []
     if conversation_id:
         try:
-            snap = _conversation_ref(ctx, conversation_id).get()
-            if snap.exists:
-                data = snap.to_dict() or {}
-                msgs = data.get("messages") or []
-                for m in msgs[-12:]:  # cap context
-                    role = m.get("role")
-                    text = m.get("text")
-                    if role in ("user", "assistant") and isinstance(text, str):
-                        history.append({"role": role, "text": text})
+            docs = list(
+                _messages_ref(ctx, conversation_id)
+                .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                .limit(MAX_HISTORY_TURNS)
+                .stream()
+            )
+            # Reverse to chronological order before feeding to the LLM
+            for doc in reversed(docs):
+                m = doc.to_dict() or {}
+                role = m.get("role")
+                text = m.get("text")
+                if role in ("user", "assistant") and isinstance(text, str) and text:
+                    history.append({"role": role, "text": text})
         except Exception as e:
-            logger.warning(f"[session_chat] conversation load failed: {e}")
+            logger.warning(f"[session_chat] conversation messages load failed: {e}")
     else:
         conversation_id = f"conv_{uuid.uuid4().hex[:16]}"
-    # history from explicit request overrides on first turn
+    # history from explicit request overrides on first turn only
     if ctx.history and not history:
-        for h in ctx.history[-12:]:
+        for h in ctx.history[-MAX_HISTORY_TURNS:]:
             if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
-                history.append({"role": h["role"], "text": str(h.get("text") or "")})
+                text = str(h.get("text") or "")
+                if text:
+                    history.append({"role": h["role"], "text": text})
     return conversation_id, history
 
 
@@ -299,42 +330,113 @@ def _save_turn(
     mode: str,
     used_model: Optional[str],
 ) -> None:
+    """Persist one user+assistant turn as two independent message docs.
+
+    Uses a Firestore batched write so both messages land atomically. The
+    parent conversation doc is set with merge=True to update the metadata
+    without touching any other fields.
+    """
     try:
-        ref = _conversation_ref(ctx, conversation_id)
-        now = datetime.now(timezone.utc)
-        ref.set(
+        conv_ref = _conversation_ref(ctx, conversation_id)
+        messages_ref = conv_ref.collection("messages")
+        now_ms = int(time.time() * 1000)
+
+        batch = db.batch()
+
+        # Parent conversation metadata (never stores message bodies)
+        batch.set(
+            conv_ref,
             {
                 "conversationId": conversation_id,
                 "scope": ctx.scope,
                 "ownerAccountId": ctx.user.account_id,
-                "createdAt": now,
-                "updatedAt": now,
+                "createdAt": firestore.SERVER_TIMESTAMP,  # no-op on merge if already set
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "lastMessageAt": firestore.SERVER_TIMESTAMP,
+                "messageCount": firestore.Increment(2),
+                "schemaVersion": 2,   # sub-collection form
             },
             merge=True,
         )
-        # append messages
-        ref.set(
+
+        # User message
+        user_doc = messages_ref.document()
+        batch.set(
+            user_doc,
             {
-                "updatedAt": now,
-                "messages": [
-                    *(
-                        (ref.get().to_dict() or {}).get("messages") or []
-                    ),  # naive append — for MVP (no concurrency)
-                    {"role": "user", "text": user_message, "at": now},
-                    {
-                        "role": "assistant",
-                        "text": assistant_answer,
-                        "citations": citations,
-                        "mode": mode,
-                        "usedModel": used_model,
-                        "at": now,
-                    },
-                ],
+                "messageId": user_doc.id,
+                "conversationId": conversation_id,
+                "role": "user",
+                "text": user_message,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "clientSortKey": now_ms,           # tie-breaker before serverTs resolves
+                "authorUid": ctx.user.uid,
+                "authorAccountId": ctx.user.account_id,
             },
-            merge=True,
         )
+
+        # Assistant message (delay sort key by 1ms so chronological order is stable
+        # even if the server timestamps land identically)
+        asst_doc = messages_ref.document()
+        batch.set(
+            asst_doc,
+            {
+                "messageId": asst_doc.id,
+                "conversationId": conversation_id,
+                "role": "assistant",
+                "text": assistant_answer,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "clientSortKey": now_ms + 1,
+                "citations": citations,
+                "mode": mode,
+                "usedModel": used_model,
+            },
+        )
+
+        batch.commit()
     except Exception as e:
         logger.warning(f"[session_chat] conversation save failed: {e}")
+
+
+def fetch_conversation_messages(
+    ctx: ChatContext,
+    conversation_id: str,
+    limit: int = 50,
+    before_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Paginated message fetch for conversation history UI.
+
+    Returns messages in reverse-chronological order. Use `before_ms` (the
+    clientSortKey of the oldest message in the previous page) to paginate
+    backwards.
+    """
+    try:
+        q = _messages_ref(ctx, conversation_id).order_by(
+            "clientSortKey", direction=firestore.Query.DESCENDING
+        )
+        if before_ms is not None:
+            q = q.start_after({"clientSortKey": before_ms})
+        docs = list(q.limit(max(1, min(limit, 200))).stream())
+    except Exception as e:
+        logger.warning(f"[session_chat] conversation fetch failed: {e}")
+        return []
+    out: List[Dict[str, Any]] = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        created = d.get("createdAt")
+        out.append(
+            {
+                "messageId": doc.id,
+                "role": d.get("role"),
+                "text": d.get("text"),
+                "citations": d.get("citations") or [],
+                "mode": d.get("mode"),
+                "usedModel": d.get("usedModel"),
+                "clientSortKey": d.get("clientSortKey"),
+                "createdAt": created.isoformat() if created and hasattr(created, "isoformat") else None,
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
