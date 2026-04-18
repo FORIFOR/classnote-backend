@@ -2634,6 +2634,16 @@ async def generate_summary_and_tags(
         except Exception as e:
             logger.warning(f"[summary] anchor enrichment failed (non-fatal): {e}")
 
+    # [FIX] Post-process summaryJson to fill UX gaps the LLM may leave behind:
+    # empty overview, missing timeline, decisions/todos without UI hints.
+    # Pure mutation; safe when segments is None; failures are non-fatal.
+    if isinstance(result, dict) and isinstance(result.get("summaryJson"), dict):
+        try:
+            from app.services.summary_postprocess import finalize_summary_json
+            finalize_summary_json(result["summaryJson"], segments=segments)
+        except Exception as e:
+            logger.warning(f"[summary] postprocess failed (non-fatal): {e}")
+
     return result
 
 
