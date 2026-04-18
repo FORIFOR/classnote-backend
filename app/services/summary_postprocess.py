@@ -15,16 +15,24 @@ Entry point: finalize_summary_json(summary_json, segments=...)
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional
+import re
+from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 logger = logging.getLogger("app.summary_postprocess")
 
 _OVERVIEW_MIN_LEN = 200
 _TIMELINE_CAP = 8
-_TIMELINE_SUMMARY_CAP = 60
+_TIMELINE_TITLE_CAP = 20
+_TIMELINE_SUMMARY_CAP = 100
+_TIMELINE_MIN_SENTENCE_LEN = 5
+_TIMELINE_QUALITY_MIN_SUMMARY = 10
 _FALLBACK_OVERVIEW_PLACEHOLDER = "(要確認: 本文が十分に生成されませんでした)"
 _UNKNOWN_OWNER_TOKENS = {"", "不明", "未定", "unknown", "unassigned"}
 _UNKNOWN_DUE_TOKENS = {"", "期限不明", "未定", "unknown"}
+
+_FILLER_PREFIX = re.compile(r"^(?:えー(?:っと|と)?|あー|あのー?|あの、|まあ|はい(?:はい)?[、,]?|ええと|まず)+")
+_LEADING_PUNCT = re.compile(r"^[、。，,.\s　]+")
+_SENTENCE_SPLIT = re.compile(r"[。！？\n]+")
 
 
 # --- #1 overview -----------------------------------------------------------
@@ -68,7 +76,7 @@ def fallback_timeline(
     segments: Optional[Iterable[Any]],
 ) -> None:
     existing = _coerce_list(summary_json.get("timeline"))
-    if existing:
+    if _timeline_quality_ok(existing):
         return
     if not segments:
         return
@@ -80,12 +88,15 @@ def fallback_timeline(
         text = _seg_str(seg, "text")
         if not text:
             continue
-        trimmed = text.strip()
-        summary_text = trimmed[:_TIMELINE_SUMMARY_CAP] + ("…" if len(trimmed) > _TIMELINE_SUMMARY_CAP else "")
+        title, summary_text = _summarize_chunk_for_timeline(text)
+        if not summary_text:
+            continue
         items.append({
             "startSec": int((start_ms or 0) / 1000),
             "endSec": int((end_ms or 0) / 1000),
+            "title": title,
             "summary": summary_text,
+            "topicChange": False,
             "fallback": True,
         })
         if len(items) >= _TIMELINE_CAP:
@@ -93,6 +104,60 @@ def fallback_timeline(
 
     if items:
         summary_json["timeline"] = items
+
+
+def _timeline_quality_ok(items: List[Any]) -> bool:
+    """True if the existing LLM-provided timeline is trustworthy enough to keep."""
+    if not items:
+        return False
+    meaningful = 0
+    for it in items:
+        if not isinstance(it, Mapping):
+            continue
+        summary = (it.get("summary") or "").strip()
+        if len(summary) >= _TIMELINE_QUALITY_MIN_SUMMARY:
+            meaningful += 1
+    # Require majority of items to have meaningful summary text.
+    return meaningful >= max(1, len(items) // 2 + (1 if len(items) % 2 else 0))
+
+
+def _summarize_chunk_for_timeline(text: str) -> Tuple[str, str]:
+    """Derive (title, summary) from a raw transcript chunk.
+
+    Drops filler prefixes, splits into sentences, keeps only sentences above
+    _TIMELINE_MIN_SENTENCE_LEN, and uses the first 1-2 as summary. Title is the
+    first meaningful sentence truncated to _TIMELINE_TITLE_CAP.
+    """
+    cleaned = _FILLER_PREFIX.sub("", text.strip()).strip()
+    cleaned = _LEADING_PUNCT.sub("", cleaned)
+    if not cleaned:
+        trimmed = text.strip()
+        return (trimmed[:_TIMELINE_TITLE_CAP] or "(断片)", trimmed[:_TIMELINE_SUMMARY_CAP])
+
+    raw_sentences = [s.strip() for s in _SENTENCE_SPLIT.split(cleaned) if s.strip()]
+    sentences = [s for s in raw_sentences if len(s) >= _TIMELINE_MIN_SENTENCE_LEN]
+    if not sentences and raw_sentences:
+        sentences = raw_sentences  # fallback: accept even short sentences
+
+    if not sentences:
+        return (cleaned[:_TIMELINE_TITLE_CAP], cleaned[:_TIMELINE_SUMMARY_CAP])
+
+    first = sentences[0]
+    if len(first) < _TIMELINE_TITLE_CAP // 2 and len(sentences) > 1:
+        title_src = first + "、" + sentences[1]
+    else:
+        title_src = first
+    title = title_src[:_TIMELINE_TITLE_CAP]
+    if len(title_src) > _TIMELINE_TITLE_CAP:
+        title = title.rstrip("、, ") + "…"
+
+    joined = "。".join(sentences[:2])
+    if not joined.endswith("。"):
+        joined += "。"
+    if len(joined) > _TIMELINE_SUMMARY_CAP:
+        joined = joined[: _TIMELINE_SUMMARY_CAP - 1].rstrip("、, ") + "…"
+
+    return (title, joined)
 
 
 # --- #4 UI decoration ------------------------------------------------------
