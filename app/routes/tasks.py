@@ -584,6 +584,22 @@ async def _handle_summarize_task_core(request: Request):
         if cost_guard_id:
             await cost_guard.record_success(cost_guard_id, "summary_generated", mode=cost_guard_mode)
 
+        # [FIX] summary_progress watchdog: unconditionally close the progress doc on success.
+        # Without this, derived/summary_progress stays at phase=preparing even when derived/summary
+        # has already succeeded (observed on master session fe21722a-... on 2026-04-18).
+        # Writes "completed" because _map_derived_status has no entry for "done" (→ falls back to "pending").
+        try:
+            progress_ref.set({
+                "status": "completed",
+                "phase": "completed",
+                "percent": 100,
+                "message": "要約が完成しました",
+                "updatedAt": datetime.now(timezone.utc),
+            }, merge=True)
+            await publish_session_event(session_id, "assets.updated", {"fields": ["summary_progress"]})
+        except Exception as prog_err:
+            logger.warning(f"[summary_progress] final update failed (non-blocking): {prog_err}")
+
         await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
         return {"status": "completed"}
 
@@ -631,7 +647,16 @@ async def _handle_summarize_task_core(request: Request):
                  "updatedAt": datetime.now(timezone.utc),
                  "idempotencyKey": idempotency_key,
              }, merge=True)
-             await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
+             # [FIX] summary_progress watchdog: close progress doc on failure too.
+             progress_ref.set({
+                 "status": "failed",
+                 "phase": "failed",
+                 "percent": 0,
+                 "message": "要約の生成に失敗しました",
+                 "errorReason": str(e)[:300],
+                 "updatedAt": datetime.now(timezone.utc),
+             }, merge=True)
+             await publish_session_event(session_id, "assets.updated", {"fields": ["summary", "summary_progress"]})
         except Exception as db_err:
             logger.warning(f"[summarize] Failed to update error status in DB: {db_err}")
 
