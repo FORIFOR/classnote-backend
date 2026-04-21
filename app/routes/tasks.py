@@ -178,12 +178,12 @@ async def handle_summarize_quick_task(request: Request):
         transcript = await resolve_transcript_text_async(session_id, data) or ""
         mode = data.get("mode", "lecture")
 
-        # ★ Translation sessions: normalize mode
+        # ★ Translation sessions: route to translate-specific summary path.
+        # Prior behavior (translate→lecture) was a fallback; now translate is a
+        # first-class mode. The full ===ORIGINAL===/===TRANSLATION=== transcript
+        # is passed through so the LLM can see both sides.
         if mode == "translate" or data.get("importType") == "translate":
-            if "===ORIGINAL===" in transcript:
-                original_part = transcript.split("\n===TRANSLATION===")[0]
-                transcript = original_part.replace("===ORIGINAL===\n", "").strip()
-            mode = "lecture"
+            mode = "translate"
 
         if not transcript:
             derived_ref.set({
@@ -317,14 +317,12 @@ async def _handle_summarize_task_core(request: Request):
         transcript = await resolve_transcript_text_async(session_id, data) or ""
         mode = data.get("mode", "lecture")
 
-        # ★ Translation sessions: extract original text only for better summary quality
+        # ★ Translation sessions: use translate-specific summary path (first-class mode).
+        # The ===ORIGINAL===/===TRANSLATION=== bilingual transcript is passed through
+        # in full so the translate prompt can draw from both sides.
         import_type = data.get("importType")
-        if (mode == "translate" or import_type == "translate") and "===ORIGINAL===" in transcript:
-            original_part = transcript.split("\n===TRANSLATION===")[0]
-            transcript = original_part.replace("===ORIGINAL===\n", "").strip()
-            mode = "lecture"  # Use lecture-style summary template
-        elif mode == "translate":
-            mode = "lecture"  # Fallback: translate mode always uses lecture template
+        if mode == "translate" or import_type == "translate":
+            mode = "translate"
 
         derived_ref = doc_ref.collection("derived").document("summary")
 
@@ -1625,6 +1623,48 @@ async def handle_todo_extraction_task(request: Request):
                 })
         except Exception:
             pass
+        return {"status": "failed", "error": str(e)[:200]}
+
+
+@router.post("/internal/tasks/timeline", dependencies=[Depends(verify_cloud_tasks_request)])
+async def handle_timeline_task(request: Request):
+    """Chapter-style timeline generation Cloud Tasks handler."""
+    from app.services.timeline_service import build_session_timeline
+    from app.routes.jobs import start_job, complete_job, fail_job
+
+    session_id = None
+    job_id = None
+    try:
+        payload = await request.json()
+        session_id = payload.get("sessionId")
+        job_id = payload.get("jobId")
+        force = bool(payload.get("force"))
+
+        if not session_id:
+            return {"status": "skipped", "reason": "missing_sessionId"}
+
+        if job_id and start_job(job_id) is None:
+            logger.info(f"[timeline task] job {job_id} already terminal — skip")
+            return {"status": "skipped", "reason": "job_already_terminal"}
+
+        result = await build_session_timeline(session_id, force=force)
+
+        if job_id:
+            if result.get("status") == "succeeded":
+                complete_job(job_id, result_url=f"/sessions/{session_id}/artifacts/timeline")
+            else:
+                fail_job(job_id, error_reason=str(result.get("reason") or "failed"))
+
+        return {"status": result.get("status", "unknown"), "result": result}
+
+    except Exception as e:
+        logger.exception(f"[timeline task] failed session={session_id}")
+        if job_id:
+            try:
+                fail_job(job_id, error_reason=str(e)[:200])
+            except Exception:
+                pass
+        # Return 200 to avoid Cloud Tasks retry storm on deterministic failures.
         return {"status": "failed", "error": str(e)[:200]}
 
 
