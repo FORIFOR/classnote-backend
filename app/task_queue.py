@@ -42,27 +42,34 @@ def _is_default_title(title: str) -> bool:
 
 
 def _build_auto_title(suggested_title: str, session_data: dict) -> str:
-    """Build auto title in format: 'M/D HH:MM_suggestedTitle'."""
+    """Build auto title in format: 'M/D HH:MM_<suggestedTitle>' (JST).
+
+    Examples:
+      suggested="両親と映画の思い出", createdAt=2026-04-21T11:21 JST
+        → "4/21 11:21_両親と映画の思い出"
+    """
+    suggested_title = (suggested_title or "").strip()
+    if not suggested_title:
+        return ""
+
     created_at = session_data.get("createdAt") or session_data.get("startAt")
     if created_at is None:
         return suggested_title
 
     # Firestore timestamps → datetime
-    if hasattr(created_at, "isoformat"):
-        # Already a datetime or Firestore DatetimeWithNanoseconds
-        dt = created_at
-    else:
+    if not hasattr(created_at, "isoformat"):
         return suggested_title
+    dt = created_at
 
     # Convert to JST (UTC+9)
     from datetime import timezone as tz
     jst = tz(timedelta(hours=9))
     dt_jst = dt.astimezone(jst) if dt.tzinfo else dt.replace(tzinfo=tz.utc).astimezone(jst)
 
-    m = dt_jst.month
-    d = dt_jst.day
-    hh = dt_jst.strftime("%H:%M")
-    return f"{m}月{d}日 {hh} — {suggested_title}"
+    m = dt_jst.month                      # 1-12, no zero-pad
+    d = dt_jst.day                        # 1-31, no zero-pad
+    hhmm = dt_jst.strftime("%H:%M")       # 2-digit hour, 2-digit minute
+    return f"{m}/{d} {hhmm}_{suggested_title}"
 
 
 def enqueue_cleanup_sessions_task(user_id: str, background_tasks: BackgroundTasks = None):
@@ -487,9 +494,11 @@ def enqueue_summary_v2_task(
     meeting_purpose: str | None = None,
     meeting_type: str | None = None,
     participants: list | None = None,
+    idempotency_key: str | None = None,
 ):
     """
     SummaryV2（根拠付き構造化サマリー）生成タスクをキューに入れる。
+    PR1: idempotencyKey を worker へ渡す（derived doc 上で dedupe に使う）。
     """
     payload = {
         "sessionId": session_id,
@@ -498,6 +507,7 @@ def enqueue_summary_v2_task(
         "meetingPurpose": meeting_purpose,
         "meetingType": meeting_type,
         "participants": participants or [],
+        "idempotencyKey": idempotency_key,
     }
 
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":

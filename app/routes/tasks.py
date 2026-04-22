@@ -1176,9 +1176,25 @@ async def handle_generate_highlights(request: Request):
 
 @router.post("/internal/tasks/summary_v2", dependencies=[Depends(verify_cloud_tasks_request)])
 async def handle_summary_v2_task(request: Request):
+    """SummaryV2 Cloud Tasks worker (PR1).
+
+    Pipeline (spec §7.2):
+      1. derived doc → running (via firestore_summary_v2.write_summary_v2_running)
+      2. transcript + chunks load
+      3. transcriptHash compute
+      4. mode / participants / purpose resolve
+      5. build_summary_v2_prompt + LLM call (delegates to generate_summary_v2)
+      6. parse / validate (SummaryV2 locks)
+      7. anchor resolution (v0.1 structural)
+      8. quality gate (v0.1 pass-through)
+      9. user edit merge (hidden / userEdited)
+     10. markdown render
+     11. Firestore write (derived + session mirror)
+     12. event + usage log
+
+    Errors map to errorReason per spec §13.2.
     """
-    Cloud Tasks endpoint for SummaryV2 (Evidence-based Structured Summary) Generation.
-    """
+    import time as _time
     try:
         payload = await request.json()
     except Exception:
@@ -1190,40 +1206,86 @@ async def handle_summary_v2_task(request: Request):
     meeting_purpose = payload.get("meetingPurpose")
     meeting_type = payload.get("meetingType")
     participants = payload.get("participants", [])
+    idempotency_key = payload.get("idempotencyKey")
 
     if not session_id:
         return {"status": "error", "message": "sessionId required"}
 
-    try:
-        from google.cloud import firestore
-        import os
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-        db = firestore.Client(project=project_id)
+    from google.cloud import firestore
+    import os as _os
+    from app.services.firestore_summary_v2 import (
+        write_summary_v2_running,
+        write_summary_v2_success,
+        write_summary_v2_failed,
+        sync_session_summary_v2_fields,
+        get_summary_v2_doc,
+    )
+    from app.services.summary_v2 import (
+        SUMMARY_V2_PROMPT_VERSION,
+        compute_transcript_hash,
+        generate_summary_v2,
+        merge_user_edited_items,
+        render_summary_v2_markdown,
+    )
+    from app.services.anchor_resolver import (
+        apply_quality_gate_v2,
+        build_chunks_by_id,
+        resolve_all_anchors_v2,
+    )
+    from app.util_models import SummaryV2, SummaryV2Item
 
-        doc_ref = db.collection("sessions").document(session_id)
+    project_id = _os.environ.get("GOOGLE_CLOUD_PROJECT") or _os.environ.get("GCP_PROJECT")
+    db = firestore.Client(project=project_id)
+    doc_ref = db.collection("sessions").document(session_id)
+
+    started_ms = int(_time.time() * 1000)
+
+    # Step 2: load session + transcript + chunks.
+    try:
         doc = doc_ref.get()
         if not doc.exists:
             return {"status": "skipped", "reason": "not_found"}
+        data = doc.to_dict() or {}
 
-        data = doc.to_dict()
         transcript = await resolve_transcript_text_async(session_id, data)
         if not transcript:
-            logger.error(f"[summary_v2] Empty transcript for {session_id}")
+            logger.error("[summary_v2] empty transcript for %s", session_id)
+            write_summary_v2_failed(
+                session_id, error_reason="empty_transcript", job_id=job_id,
+            )
             return {"status": "failed", "reason": "empty_transcript"}
 
-        derived_ref = doc_ref.collection("derived").document("summary_v2")
+        try:
+            chunks = get_transcript_chunks(session_id)
+        except Exception:
+            chunks = []
 
-        # Mark as running
-        derived_ref.set({
-            "status": "running",
-            "jobId": job_id,
-            "updatedAt": datetime.now(timezone.utc),
-        }, merge=True)
+        transcript_hash = compute_transcript_hash(chunks, fallback_text=transcript)
+        mode_for_meta = (meeting_type or data.get("mode") or "other")
+        resolved_idem = idempotency_key or (
+            f"sumv2:{session_id}:{transcript_hash[:16]}:{SUMMARY_V2_PROMPT_VERSION}"
+        )
 
-        # Generate
-        from app.services.summary_v2 import generate_summary_v2
+        logger.info(
+            "event=summary_v2_task_started sessionId=%s jobId=%s idempotencyKey=%s promptVersion=%s",
+            session_id, job_id, resolved_idem, SUMMARY_V2_PROMPT_VERSION,
+        )
 
-        summary = await generate_summary_v2(
+        # Step 1: Mark running (idempotent write).
+        write_summary_v2_running(
+            session_id,
+            idempotency_key=resolved_idem,
+            job_id=job_id,
+            prompt_version=SUMMARY_V2_PROMPT_VERSION,
+            transcript_hash=transcript_hash,
+            mode=mode_for_meta,
+        )
+
+        # Step 5–6: delegate to the existing generate_summary_v2() orchestrator
+        # which already calls the LLM and returns a SummaryV2. PR1 keeps the
+        # internal pipeline as-is; the new prompt builder / validator are
+        # wired via the v0.2 follow-up.
+        summary: SummaryV2 = await generate_summary_v2(
             session_id=session_id,
             transcript_text=transcript,
             diarized_segments=data.get("diarizedSegments"),
@@ -1233,38 +1295,98 @@ async def handle_summary_v2_task(request: Request):
             participants=participants or data.get("participants", []),
         )
 
-        # Save result
-        derived_ref.set({
-            "status": "succeeded",
-            "result": summary.dict(),
-            "jobId": job_id,
-            "updatedAt": datetime.now(timezone.utc),
-        }, merge=True)
+        # Step 7: anchor resolution (v0.1 structural).
+        chunks_by_id = build_chunks_by_id(chunks)
+        resolved_items: list[SummaryV2Item] = resolve_all_anchors_v2(summary.items, chunks_by_id)
 
-        doc_ref.update({
-            "summaryV2Status": "completed",
-            "summaryV2Markdown": summary.renderedMarkdown,
-            "updatedAt": datetime.now(timezone.utc),
+        # Step 8: quality gate (v0.1 pass-through + aggregation).
+        kept_items, quality, _filtered = apply_quality_gate_v2(resolved_items)
+
+        # Step 9: user edit merge — preserve userEdited / hidden items.
+        prior_doc = get_summary_v2_doc(session_id)
+        old_result = (prior_doc or {}).get("result") if prior_doc else None
+        old_items: list[SummaryV2Item] = []
+        if isinstance(old_result, dict):
+            try:
+                old_items = [SummaryV2Item(**it) for it in (old_result.get("items") or [])]
+            except Exception as parse_err:
+                logger.warning("[summary_v2] failed to parse old items for merge: %s", parse_err)
+                old_items = []
+        merged_items = merge_user_edited_items(old_items, kept_items)
+
+        # Apply merged items + recomputed quality back onto the summary.
+        summary = summary.model_copy(update={
+            "items": merged_items,
+            "quality": quality,
+            "version": 2,
+            "schemaVersion": "2.0",
         })
 
-        logger.info(f"[summary_v2] Generated for {session_id}")
+        # Step 10: markdown render (regenerate with final item list).
+        summary = summary.model_copy(update={
+            "renderedMarkdown": render_summary_v2_markdown(summary),
+        })
+
+        # Step 11: Firestore write (derived + session mirror).
+        latency_ms = int(_time.time() * 1000) - started_ms
+        model_info = {
+            "provider": "vertex",
+            "model": "gemini-2.5-flash",
+            "promptVersion": SUMMARY_V2_PROMPT_VERSION,
+            "tokensIn": None,   # PR1: not captured from generate_summary_v2 yet
+            "tokensOut": None,
+            "latencyMs": latency_ms,
+        }
+        meta = {
+            "transcriptVersion": 1,
+            "transcriptHash": transcript_hash,
+            "mode": mode_for_meta,
+            "idempotencyKey": resolved_idem,
+        }
+        summary_result = summary.model_dump()
+        write_summary_v2_success(
+            session_id,
+            summary_result=summary_result,
+            model_info=model_info,
+            meta=meta,
+        )
+        sync_session_summary_v2_fields(session_id, summary_result=summary_result)
+
+        # Step 12: usage log (structured).
+        logger.info(
+            "event=summary_v2_firestore_written sessionId=%s jobId=%s latencyMs=%d "
+            "filteredCount=%d avgConfidence=%.3f itemCount=%d",
+            session_id, job_id, latency_ms,
+            int(quality.filteredCount or 0),
+            float(quality.avgConfidence or 0.0),
+            len(merged_items),
+        )
+        try:
+            # Also publish asset-updated event when available.
+            await publish_session_event(
+                session_id, "assets.updated", {"fields": ["summary_v2", "title"]}
+            )
+        except Exception:
+            pass
+
         return {"status": "completed"}
 
     except Exception as e:
-        logger.exception(f"[summary_v2] Failed for {session_id}: {e}")
-        ts = datetime.now(timezone.utc)
-
+        logger.exception("[summary_v2] worker failed for %s: %s", session_id, e)
         try:
-            derived_ref.set({
-                "status": "failed",
-                "errorReason": str(e)[:500],
-                "jobId": job_id,
-                "updatedAt": ts,
-            }, merge=True)
+            write_summary_v2_failed(
+                session_id,
+                error_reason=str(e)[:500] or "unknown_error",
+                job_id=job_id,
+            )
         except Exception as db_err:
-            logger.error(f"Failed to update derived doc: {db_err}")
+            logger.error("[summary_v2] failed to write failed-state: %s", db_err)
 
-        return {"status": "failed", "error": str(e)}
+        logger.info(
+            "event=summary_v2_task_failed sessionId=%s jobId=%s errorReason=%s",
+            session_id, job_id, str(e)[:200],
+        )
+        return {"status": "failed", "error": str(e)[:500]}
 
 
 # [REMOVED] Duplicate deprecated playlist handler - the real implementation is at line 574
@@ -1344,6 +1466,29 @@ async def handle_derived_finalize_task(request: Request):
                 idempotency_key=idem_key,
                 usage_reserved=True,
             )
+        elif feature == "summary_v2":
+            # PR1: dispatch Summary v2 via the same Cloud Tasks worker
+            # used by manual POST :generate so the pipeline is single-path.
+            from app.task_queue import enqueue_summary_v2_task
+            enqueue_summary_v2_task(
+                session_id,
+                user_id=user_id,
+                idempotency_key=idem_key,
+            )
+        elif feature == "summary_quick":
+            # PR1: quick-summary auto-dispatch is opt-in. The worker endpoint
+            # already exists (/internal/tasks/summarize_quick); we reuse it.
+            try:
+                from app.task_queue import enqueue_summarize_quick_task
+                enqueue_summarize_quick_task(
+                    session_id,
+                    user_id=user_id,
+                    idempotency_key=idem_key,
+                )
+            except ImportError:
+                logger.warning(
+                    "[finalize] summary_quick requested but enqueue function absent; skipping"
+                )
         elif feature == "quiz":
             enqueue_quiz_batch_tasks(
                 session_id,

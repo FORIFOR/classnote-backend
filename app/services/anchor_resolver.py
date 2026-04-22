@@ -13,9 +13,16 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 logger = logging.getLogger("app.anchor_resolver")
+
+if TYPE_CHECKING:  # avoid runtime import cycle
+    from app.util_models import (
+        EvidenceRef,
+        SummaryV2Item,
+        SummaryV2Quality,
+    )
 
 
 # Minimum Jaccard-ish score required to claim a match. Below this threshold
@@ -362,3 +369,165 @@ def enrich_summary_with_anchors(
         logger.info(f"[anchor_resolver] enriched {total_enriched} bullets with anchors")
 
     return summary_json
+
+
+# =============================================================================
+# Summary v2 resolver (PR1 v0.1)
+# =============================================================================
+# The v1 API above (enrich_summary_with_anchors) is a text-matching heuristic
+# used by the existing summary pipeline. Summary v2 is a different contract:
+# the LLM emits segmentIds directly and we resolve them structurally from
+# chunks_by_id. This section exposes that v2 surface without touching the v1
+# code path above.
+#
+# Public names:
+#   resolve_item_anchors_v2(item, chunks_by_id)   -> SummaryV2Item
+#   resolve_all_anchors_v2(items, chunks_by_id)   -> list[SummaryV2Item]
+#   build_chunks_by_id(chunks)                    -> dict[str, chunk]
+#   apply_quality_gate_v2(items)
+#       -> (kept, SummaryV2Quality, filtered)
+#
+# v0.1 semantics (deliberately narrow so future diff can assert on them):
+#   - Evidence with unknown segmentIds is silently pruned.
+#   - When ≥1 valid segment remains:
+#         startMs  = min(chunk.startMs)
+#         endMs    = max(chunk.endMs)
+#         text     = " ".join(chunk.text).strip()[:200]
+#         anchorMs = first_valid_chunk.startMs
+#   - support:
+#         NONE    if zero resolved evidence refs
+#         PARTIAL if ≥1 resolved evidence ref
+#         FULL    reserved for v0.2 (token-overlap heuristic)
+#   - quality gate is pass-through; no item is filtered but
+#     SummaryV2Quality is still aggregated so clients see support
+#     distribution today.
+
+_V2_MAX_EVIDENCE_TEXT = 200
+
+
+def _v2_coerce_int(v: Any) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _v2_resolve_single_evidence(ref, chunks_by_id: Dict[str, Dict[str, Any]]):
+    """Return a new EvidenceRef with start/end/text populated from valid chunks.
+
+    Invalid segmentIds are silently dropped. If zero valid ids remain, the
+    result has segmentIds=[] and text="" (caller should discard it).
+    """
+    from app.util_models import EvidenceRef  # local import, avoid boot cycle
+
+    valid_ids: List[str] = []
+    valid_chunks: List[Dict[str, Any]] = []
+    for sid in getattr(ref, "segmentIds", None) or []:
+        chunk = chunks_by_id.get(sid)
+        if chunk:
+            valid_ids.append(sid)
+            valid_chunks.append(chunk)
+
+    if not valid_chunks:
+        return EvidenceRef(segmentIds=[], startMs=None, endMs=None, text="")
+
+    start_ms = min(_v2_coerce_int(c.get("startMs")) for c in valid_chunks)
+    end_ms = max(_v2_coerce_int(c.get("endMs")) for c in valid_chunks)
+
+    parts: List[str] = []
+    for c in valid_chunks:
+        t = (c.get("text") or "").strip()
+        if t:
+            parts.append(t)
+    joined = " ".join(parts).strip()
+    if len(joined) > _V2_MAX_EVIDENCE_TEXT:
+        joined = joined[:_V2_MAX_EVIDENCE_TEXT]
+
+    return EvidenceRef(
+        segmentIds=valid_ids,
+        startMs=start_ms,
+        endMs=end_ms,
+        text=joined,
+    )
+
+
+def _v2_infer_support(valid_evidence: List[Any]):
+    """v0.1: PARTIAL iff ≥1 resolved evidence, otherwise NONE. No FULL."""
+    from app.util_models import EvidenceSupport
+    if not valid_evidence:
+        return EvidenceSupport.NONE
+    return EvidenceSupport.PARTIAL
+
+
+def resolve_item_anchors_v2(item, chunks_by_id: Dict[str, Dict[str, Any]]):
+    """Return a new SummaryV2Item with resolved evidence / support / anchorMs.
+
+    Does not mutate the input item.
+    """
+    resolved = []
+    for ev in getattr(item, "evidence", None) or []:
+        new_ev = _v2_resolve_single_evidence(ev, chunks_by_id)
+        if new_ev.segmentIds:
+            resolved.append(new_ev)
+
+    anchor_ms = resolved[0].startMs if resolved else None
+    support = _v2_infer_support(resolved)
+
+    return item.model_copy(update={
+        "evidence": resolved,
+        "support": support,
+        "anchorMs": anchor_ms if anchor_ms is not None else item.anchorMs,
+    })
+
+
+def resolve_all_anchors_v2(items, chunks_by_id: Dict[str, Dict[str, Any]]):
+    return [resolve_item_anchors_v2(it, chunks_by_id) for it in items]
+
+
+def build_chunks_by_id(chunks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Normalize a flat chunks list into an id→chunk dict.
+
+    Tolerates chunks keyed by "id" or "segmentId". Chunks without an id are
+    silently skipped.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for c in chunks or []:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id") or c.get("segmentId")
+        if not cid:
+            continue
+        out[str(cid)] = c
+    return out
+
+
+def _v2_aggregate_quality(items, filtered_count: int):
+    """Aggregate SummaryV2Quality from a list of items (PR1 v0.1)."""
+    from app.util_models import EvidenceSupport, SummaryV2Quality
+    full = sum(1 for it in items if it.support == EvidenceSupport.FULL)
+    partial = sum(1 for it in items if it.support == EvidenceSupport.PARTIAL)
+    none = sum(1 for it in items if it.support == EvidenceSupport.NONE)
+    avg_conf = (
+        sum(float(it.confidence or 0.0) for it in items) / len(items)
+        if items else 0.0
+    )
+    return SummaryV2Quality(
+        fullCount=full,
+        partialCount=partial,
+        unsupportedCount=none,
+        avgConfidence=round(avg_conf, 4),
+        filteredCount=filtered_count,
+    )
+
+
+def apply_quality_gate_v2(items):
+    """PR1 v0.1: pass-through quality gate with aggregation.
+
+    Returns (kept, quality, filtered). filtered is always [] in v0.1.
+    quality.filteredCount == 0 here; v0.2 will drop items where support==NONE
+    AND confidence < 0.4 and bump filteredCount accordingly.
+    """
+    kept = list(items)
+    filtered: List[Any] = []
+    quality = _v2_aggregate_quality(kept, filtered_count=len(filtered))
+    return kept, quality, filtered

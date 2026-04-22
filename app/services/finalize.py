@@ -16,6 +16,7 @@ route handler は session 解決・権限チェック・transcript 再構築ま�
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -31,7 +32,52 @@ from app.task_queue import enqueue_derived_finalize_task
 logger = logging.getLogger(__name__)
 
 _SESSIONS = "sessions"
-_DEFAULT_PLAN: DerivedPlan = {"summary": True}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# PR1 feature flags (spec §6.1, §17).
+#   ENABLE_SUMMARY_V2_FINALIZE     — turn on v2 auto-generation at finalize
+#   ENABLE_SUMMARY_QUICK_FINALIZE  — turn on quick-summary auto-generation
+#   SUMMARY_PIPELINE_MODE          — v1_only | dual | v2_only (overrides the above)
+#
+# Defaults err on cost-safe side: only v1 runs. Ops flip flags to enable v2.
+ENABLE_SUMMARY_V2_FINALIZE = _env_bool("ENABLE_SUMMARY_V2_FINALIZE", default=False)
+ENABLE_SUMMARY_QUICK_FINALIZE = _env_bool("ENABLE_SUMMARY_QUICK_FINALIZE", default=False)
+SUMMARY_PIPELINE_MODE = os.environ.get("SUMMARY_PIPELINE_MODE", "v1_only").strip().lower()
+if SUMMARY_PIPELINE_MODE not in {"v1_only", "dual", "v2_only"}:
+    logger.warning(
+        "[finalize] invalid SUMMARY_PIPELINE_MODE=%r falling back to v1_only",
+        SUMMARY_PIPELINE_MODE,
+    )
+    SUMMARY_PIPELINE_MODE = "v1_only"
+
+
+def _compute_default_plan() -> DerivedPlan:
+    """Build the default derived plan from the current feature-flag state.
+
+    SUMMARY_PIPELINE_MODE takes precedence over the individual flags so ops
+    can A/B without flipping two env vars.
+    """
+    if SUMMARY_PIPELINE_MODE == "v2_only":
+        plan: DerivedPlan = {"summary_v2": True}
+    elif SUMMARY_PIPELINE_MODE == "dual":
+        plan = {"summary": True, "summary_v2": True}
+    else:  # v1_only
+        plan = {"summary": True}
+        if ENABLE_SUMMARY_V2_FINALIZE:
+            plan["summary_v2"] = True  # type: ignore[literal-required]
+    if ENABLE_SUMMARY_QUICK_FINALIZE:
+        plan["summary_quick"] = True  # type: ignore[literal-required]
+    return plan
+
+
+_DEFAULT_PLAN: DerivedPlan = _compute_default_plan()
 
 
 class FinalizeError(Exception):
@@ -58,7 +104,9 @@ def resolve_derived_plan(
     """
     if derived_plan is not None:
         plan: DerivedPlan = {}
-        for key in ("summary", "highlights", "quiz"):
+        # PR1: include summary_v2 / summary_quick keys so client-specified
+        # plans can opt in explicitly regardless of env flags.
+        for key in ("summary", "summary_v2", "summary_quick", "highlights", "quiz"):
             if derived_plan.get(key):
                 plan[key] = True  # type: ignore[literal-required]
         if plan:
@@ -72,6 +120,12 @@ def resolve_derived_plan(
         legacy_plan["quiz"] = True
     # legacy_generate_playlist は derivedPlan に乗らない(別ジョブ扱い)
     if legacy_plan:
+        # Merge env-gated v2 / quick flags on top of legacy client flags so
+        # ops can enable v2 even while iOS still sends legacy plan shape.
+        default = _compute_default_plan()
+        for k in ("summary_v2", "summary_quick"):
+            if default.get(k):
+                legacy_plan[k] = True  # type: ignore[literal-required]
         return legacy_plan
     return dict(_DEFAULT_PLAN)
 
