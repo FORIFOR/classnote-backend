@@ -570,13 +570,11 @@ def _check_admin_claims(token: str) -> tuple[bool, bool]:
         if not is_admin and uid in ADMIN_UIDS:
             is_admin = True
 
-        # 方法3: Firestore users コレクションでチェック（フォールバック）
-        if not is_admin:
-            user_doc = db.collection("users").document(uid).get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict() or {}
-                is_admin = user_data.get("isAdmin", False) or user_data.get("admin", False)
-                is_super_admin = is_super_admin or user_data.get("isSuperAdmin", False)
+        # SECURITY: Firestore users.{uid}.isAdmin によるフォールバックは削除。
+        # users/{uid} はクライアント SDK で書き込めるため、Rules の穴があると
+        # 自己昇格できてしまう。管理者は必ず Firebase Custom Claims もしくは
+        # ADMIN_UIDS 環境変数で付与する運用に統一する。
+        # （`app.admin_auth.get_current_admin_user` と同じ判定方針）
 
         return is_admin, is_super_admin
     except Exception:

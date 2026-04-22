@@ -1,6 +1,10 @@
 """
-Public (no-auth) read-only endpoints for the admin dashboard.
-Mirrors a subset of /admin/* endpoints without authentication.
+Read-only endpoints for the admin dashboard.
+
+SECURITY: Previously these endpoints were unauthenticated and exposed
+ops_events, session metadata (incl. ownerUid) and daily aggregates. All
+endpoints now require an admin Firebase ID token (`get_current_admin_user`),
+same policy as `/admin/*`.
 """
 import os
 import logging
@@ -8,9 +12,10 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from google.cloud import firestore
 
+from app.admin_auth import get_current_admin_user
 from app.services.ops_logger import OpsLogger, EventType, Severity
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -23,7 +28,10 @@ def get_db():
 
 
 @router.get("/stats")
-async def dashboard_stats(period: str = Query("24h", regex="^(24h|7d)$")):
+async def dashboard_stats(
+    period: str = Query("24h", regex="^(24h|7d)$"),
+    _admin=Depends(get_current_admin_user),
+):
     """KPI + chart data (same as /admin/stats/dashboard)."""
     db = get_db()
     now = datetime.now(timezone.utc)
@@ -84,6 +92,7 @@ async def dashboard_events(
     type: Optional[str] = None,
     uid: Optional[str] = None,
     sessionId: Optional[str] = None,
+    _admin=Depends(get_current_admin_user),
 ):
     """Events list with filters and pagination."""
     db = get_db()
@@ -113,7 +122,10 @@ async def dashboard_events(
 
 
 @router.get("/daily-sessions")
-async def dashboard_daily_sessions(days: int = Query(14, ge=1, le=90)):
+async def dashboard_daily_sessions(
+    days: int = Query(14, ge=1, le=90),
+    _admin=Depends(get_current_admin_user),
+):
     """Daily session stats."""
     db = get_db()
     now = datetime.now(timezone.utc)

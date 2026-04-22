@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from datetime import datetime, timedelta
@@ -10,8 +11,66 @@ from google.cloud import firestore
 from app.firebase import db
 from app.services import llm
 from app.services.usage import usage_logger
-from app.services.transcripts import resolve_transcript_text
+from app.services.transcripts import resolve_transcript_text, get_transcript_chunks
 from app.services.playlist_utils import normalize_playlist_items
+
+# Pattern to detect auto-generated default titles (e.g. "2026/03/12 14:30", "録音 2026-03-12", "セッション 3/12")
+# Also matches previously auto-generated titles like "3/12 14:30_タイトル" to allow re-generation.
+_DEFAULT_TITLE_RE = re.compile(
+    r"^("
+    r"\d{4}[/\-]\d{1,2}[/\-]\d{1,2}"   # date-based: 2026/03/12, 2026-03-12
+    r"|\d{1,2}/\d{1,2}\s+\d{2}:\d{2}_"  # auto-generated: 3/12 14:30_タイトル
+    r"|録音\s*\d"                          # 録音 2026...
+    r"|セッション\s*\d"                    # セッション 3/12...
+    r"|Recording\s"                        # Recording ...
+    r"|Session\s"                          # Session ...
+    r"|新しいセッション"                   # 新しいセッション
+    r"|New\s*Session"                      # New Session
+    r"|YouTube取り込み"                    # YouTube import default
+    r"|YouTube\s*Import"                   # YouTube Import (EN)
+    r"|インポート"                         # Generic import
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_default_title(title: str) -> bool:
+    """Return True if the title looks auto-generated (timestamp-based or generic)."""
+    if not title or not title.strip():
+        return True
+    return bool(_DEFAULT_TITLE_RE.match(title.strip()))
+
+
+def _build_auto_title(suggested_title: str, session_data: dict) -> str:
+    """Build auto title in format: 'M/D HH:MM_<suggestedTitle>' (JST).
+
+    Examples:
+      suggested="両親と映画の思い出", createdAt=2026-04-21T11:21 JST
+        → "4/21 11:21_両親と映画の思い出"
+    """
+    suggested_title = (suggested_title or "").strip()
+    if not suggested_title:
+        return ""
+
+    created_at = session_data.get("createdAt") or session_data.get("startAt")
+    if created_at is None:
+        return suggested_title
+
+    # Firestore timestamps → datetime
+    if not hasattr(created_at, "isoformat"):
+        return suggested_title
+    dt = created_at
+
+    # Convert to JST (UTC+9)
+    from datetime import timezone as tz
+    jst = tz(timedelta(hours=9))
+    dt_jst = dt.astimezone(jst) if dt.tzinfo else dt.replace(tzinfo=tz.utc).astimezone(jst)
+
+    m = dt_jst.month                      # 1-12, no zero-pad
+    d = dt_jst.day                        # 1-31, no zero-pad
+    hhmm = dt_jst.strftime("%H:%M")       # 2-digit hour, 2-digit minute
+    return f"{m}/{d} {hhmm}_{suggested_title}"
+
 
 def enqueue_cleanup_sessions_task(user_id: str, background_tasks: BackgroundTasks = None):
     """
@@ -43,7 +102,7 @@ def enqueue_cleanup_sessions_task(user_id: str, background_tasks: BackgroundTask
     }
     
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"[Cleanup] Enqueued task for {user_id}")
     except Exception as e:
         logger.error(f"[Cleanup] Failed to enqueue: {e}")
@@ -63,6 +122,29 @@ except Exception:
     # ローカルでクレデンシャルがない場合など
     tasks_client = None
     logger.warning("Cloud Tasks client init failed. BackgroundTasks will be used (Local Mode).")
+
+
+async def _create_task_async(parent: str, task: dict) -> object:
+    """[PERF] Offload sync gRPC create_task() to thread so it doesn't block the event loop."""
+    return await asyncio.to_thread(tasks_client.create_task, parent=parent, task=task)
+
+
+def _create_task_nonblocking(parent: str, task: dict) -> None:
+    """
+    [PERF] Fire-and-forget Cloud Tasks creation without blocking the event loop.
+    If called from an async context, schedules in a thread. Otherwise calls sync.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # We're in an async context — offload to thread pool
+        loop.run_in_executor(None, lambda: tasks_client.create_task(parent=parent, task=task))
+    else:
+        # Pure sync context — call directly
+        tasks_client.create_task(parent=parent, task=task)
 
 def enqueue_summarize_task(
     session_id: str,
@@ -111,15 +193,15 @@ def enqueue_summarize_task(
     }
 
     try:
-        response = tasks_client.create_task(parent=parent, task=task)
-        logger.info(f"Created task {response.name}")
+        _create_task_nonblocking(parent, task)
+        logger.info(f"Created summarize task for {session_id}")
     except Exception as e:
         logger.error(f"Failed to create task: {e}")
         raise e
 
 def enqueue_quiz_task(
     session_id: str,
-    count: int = 5,
+    count: int = 8,
     job_id: str | None = None,
     idempotency_key: str | None = None,
     user_id: str | None = None,
@@ -155,7 +237,167 @@ def enqueue_quiz_task(
         }
     }
     
-    tasks_client.create_task(parent=parent, task=task)
+    _create_task_nonblocking(parent, task)
+
+
+def enqueue_timeline_task(
+    session_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+    background_tasks: BackgroundTasks = None,
+):
+    """Enqueue a chapter-style timeline generation task."""
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "force": bool(force),
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running timeline task locally for session: {session_id}")
+        if background_tasks:
+            background_tasks.add_task(_run_local_timeline, session_id, job_id, bool(force))
+        else:
+            asyncio.create_task(_run_local_timeline(session_id, job_id, bool(force)))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/timeline"
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+    }
+    _create_task_nonblocking(parent, task)
+    logger.info(f"Enqueued timeline task for session {session_id}")
+
+
+async def _run_local_timeline(
+    session_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+):
+    """Local fallback for timeline generation (dev / USE_LOCAL_TASKS=1)."""
+    from app.services.timeline_service import build_session_timeline
+    from app.routes.jobs import start_job, complete_job, fail_job
+
+    if job_id:
+        if start_job(job_id) is None:
+            logger.info(f"[local timeline] job {job_id} already terminal — skip")
+            return
+    try:
+        result = await build_session_timeline(session_id, force=force)
+        if job_id:
+            if result.get("status") == "succeeded":
+                complete_job(job_id, result_url=f"/sessions/{session_id}/artifacts/timeline")
+            else:
+                fail_job(job_id, error_reason=str(result.get("reason") or "failed"))
+        logger.info(f"[local timeline] done session={session_id} result={result}")
+    except Exception as e:
+        logger.exception(f"[local timeline] failed session={session_id}")
+        if job_id:
+            fail_job(job_id, error_reason=str(e)[:200])
+
+
+def enqueue_summarize_quick_task(
+    session_id: str,
+    job_id: str | None = None,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+):
+    """
+    Quick Summary タスクをキューに入れる（30-60秒で先出し要約）。
+    CostGuard消費なし。dispatch_deadline短め。
+    """
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running quick summary task locally for session: {session_id}")
+        asyncio.create_task(_run_local_summarize_quick(session_id, job_id=job_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/summarize_quick"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 120},  # Quick is short
+    }
+
+    try:
+        _create_task_nonblocking(parent, task)
+        logger.info(f"Created quick summary task for {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to create quick summary task: {e}")
+
+
+async def _run_local_summarize_quick(session_id: str, job_id: str | None = None):
+    """Local fallback for quick summary (debug only)."""
+    logger.info(f"[Local] Quick summary for {session_id} (stub)")
+
+
+def enqueue_quiz_batch_tasks(
+    session_id: str,
+    total_questions: int = 8,
+    batch_size: int = 2,
+    job_id: str | None = None,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+    usage_reserved: bool = False,
+):
+    """
+    クイズ生成タスクを1つ投入する（シングルショット）。
+    重複防止のため全問を1回のLLM呼び出しで生成する。
+    """
+    payload = {
+        "sessionId": session_id,
+        "count": total_questions,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+        "usageReserved": usage_reserved,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running quiz locally for {session_id}")
+        asyncio.create_task(_run_local_quiz(session_id, total_questions, job_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/quiz"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+    }
+
+    try:
+        _create_task_nonblocking(parent, task)
+        logger.info(f"Created quiz task for {session_id} (count={total_questions})")
+    except Exception as e:
+        logger.error(f"Failed to create quiz task: {e}")
+
 
 def enqueue_qa_task(session_id: str, question: str, user_id: str, qa_id: str):
     """
@@ -182,7 +424,7 @@ def enqueue_qa_task(session_id: str, question: str, user_id: str, qa_id: str):
         "dispatch_deadline": {"seconds": 300},  # 5 mins for QA
     }
 
-    tasks_client.create_task(parent=parent, task=task)
+    _create_task_nonblocking(parent, task)
     logger.info(f"Enqueued QA task for session {session_id}, qaId: {qa_id}")
 
 def enqueue_translate_task(session_id: str, target_language: str, user_id: str):
@@ -210,7 +452,7 @@ def enqueue_translate_task(session_id: str, target_language: str, user_id: str):
         "dispatch_deadline": {"seconds": 600},  # 10 mins for translation
     }
 
-    tasks_client.create_task(parent=parent, task=task)
+    _create_task_nonblocking(parent, task)
     logger.info(f"Enqueued translate task for session {session_id}")
 
 
@@ -241,7 +483,7 @@ def enqueue_playlist_task(session_id: str, user_id: str | None = None, job_id: s
         }
     }
 
-    tasks_client.create_task(parent=parent, task=task)
+    _create_task_nonblocking(parent, task)
     logger.info(f"Enqueued playlist task for session {session_id}")
 
 
@@ -252,9 +494,11 @@ def enqueue_summary_v2_task(
     meeting_purpose: str | None = None,
     meeting_type: str | None = None,
     participants: list | None = None,
+    idempotency_key: str | None = None,
 ):
     """
     SummaryV2（根拠付き構造化サマリー）生成タスクをキューに入れる。
+    PR1: idempotencyKey を worker へ渡す（derived doc 上で dedupe に使う）。
     """
     payload = {
         "sessionId": session_id,
@@ -263,6 +507,7 @@ def enqueue_summary_v2_task(
         "meetingPurpose": meeting_purpose,
         "meetingType": meeting_type,
         "participants": participants or [],
+        "idempotencyKey": idempotency_key,
     }
 
     if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
@@ -283,7 +528,7 @@ def enqueue_summary_v2_task(
         "dispatch_deadline": {"seconds": 600},  # 10 mins
     }
 
-    tasks_client.create_task(parent=parent, task=task)
+    _create_task_nonblocking(parent, task)
     logger.info(f"Enqueued summary_v2 task for session {session_id}")
     return job_id
 
@@ -437,9 +682,31 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
         # Stage 3: Generate summary (with stage updates)
         _update_root_job_status(job_id, "running", stage="generating_structure", progress=0.3)
 
+        # ★ Translation sessions: use translate-specific summary path (first-class mode).
+        # Bilingual ===ORIGINAL===/===TRANSLATION=== transcript is passed through in full
+        # so the translate prompt (built in llm.py) can use both sides.
+        mode = data.get("mode", "lecture")
+        import_type = data.get("importType")
+        if mode == "translate" or import_type == "translate":
+            mode = "translate"
+
+        # Read user custom prompts
+        user_id = data.get("userId")
+        summary_instruction, _ = llm.get_user_custom_prompts(user_id)
+
+        # Fetch transcript chunks so summary bullets can be grounded with
+        # anchorMs / segmentIds (text-matched against real segments).
+        try:
+            transcript_segments = get_transcript_chunks(session_id)
+        except Exception as seg_err:
+            logger.warning(f"[summarize] failed to load transcript chunks for anchors: {seg_err}")
+            transcript_segments = None
+
         result = await llm.generate_summary_and_tags(
             transcript,
-            mode=data.get("mode", "lecture"),
+            mode=mode,
+            custom_instruction=summary_instruction,
+            segments=transcript_segments,
         )
 
         # Stage 4: Formatting
@@ -447,9 +714,10 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
 
         summary_md = result.get("summaryMarkdown")
         summary_json = result.get("summaryJson") or {}
-        summary_type = result.get("summaryType") or data.get("mode", "lecture")
+        summary_type = result.get("summaryType") or mode
         summary_json_version = result.get("summaryJsonVersion") or 1
         tags = result.get("tags") or []
+        suggested_title = result.get("suggestedTitle")
 
         # Extract partial for final update (TL;DR from summaryJson if available)
         partial_data = None
@@ -469,6 +737,14 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             "autoTags": tags[:4],
             "status": "要約済み",
         }
+        # Auto-update title if LLM suggested one and current title looks like a default
+        if suggested_title:
+            update_payload["suggestedTitle"] = suggested_title
+            current_title = data.get("title", "")
+            if not current_title or _is_default_title(current_title):
+                auto_title = _build_auto_title(suggested_title, data)
+                update_payload["title"] = auto_title
+                logger.info(f"[Summary] Auto-updated title: '{current_title}' → '{auto_title}'")
         doc_ref.update(update_payload)
 
         # Stage 5: Completed
@@ -490,6 +766,19 @@ async def _run_local_summarize(session_id: str, job_id: str | None = None):
             feature="summary",
             event_type="success"
         )
+
+        # [PLAYLIST PRE-GENERATE] Enqueue playlist if not already done (non-blocking)
+        try:
+            existing_playlist = data.get("playlist")
+            playlist_status = data.get("playlistStatus")
+            if not existing_playlist and playlist_status not in ("running", "completed"):
+                pl_job_id = f"playlist_{session_id[:8]}"
+                enqueue_playlist_task(session_id, job_id=pl_job_id, user_id=data.get("userId"))
+                doc_ref.update({"playlistStatus": "running"})
+                logger.info(f"[Playlist] Pre-enqueued after summary for {session_id}")
+        except Exception as pl_err:
+            logger.warning(f"[Playlist] Pre-enqueue failed for {session_id} (non-blocking): {pl_err}")
+
     except Exception as e:
         error_str = str(e)
 
@@ -566,7 +855,21 @@ async def _run_local_quiz(session_id: str, count: int, job_id: str | None = None
 
         _update_root_job_status(job_id, "running", stage="generating_questions", progress=0.3)
 
-        quiz_md = await llm.generate_quiz(transcript, mode=data.get("mode", "lecture"), count=count)
+        # ★ Translation sessions: extract original text and use lecture mode
+        quiz_mode = data.get("mode", "lecture")
+        quiz_transcript = transcript
+        if (quiz_mode == "translate" or data.get("importType") == "translate") and "===ORIGINAL===" in transcript:
+            original_part = transcript.split("\n===TRANSLATION===")[0]
+            quiz_transcript = original_part.replace("===ORIGINAL===\n", "").strip()
+            quiz_mode = "lecture"
+        elif quiz_mode == "translate":
+            quiz_mode = "lecture"
+
+        # Read user custom prompts
+        user_id = data.get("userId")
+        _, quiz_instruction = llm.get_user_custom_prompts(user_id)
+
+        quiz_md = await llm.generate_quiz(quiz_transcript, mode=quiz_mode, count=count, custom_instruction=quiz_instruction)
 
         # Stage 4: Formatting
         _update_root_job_status(job_id, "running", stage="formatting", progress=0.8)
@@ -642,6 +945,12 @@ async def _run_local_playlist(session_id: str, job_id: str | None = None):
         # [NEW] Normalize: ms/sec detection, duration clamp, validation
         items = normalize_playlist_items(raw_items, segments=segments, duration_sec=duration)
 
+        if not items:
+            logger.warning(f"[local playlist] LLM returned empty playlist for {session_id}")
+            doc_ref.update({"playlistStatus": "failed", "playlistError": "Empty playlist from LLM"})
+            _derived_doc_ref(session_id, "playlist").set({"status": "failed", "errorReason": "empty_result", "updatedAt": datetime.utcnow(), "jobId": job_id}, merge=True)
+            return
+
         # Update result (Legacy playlist field + New Artifact)
         ts = datetime.utcnow()
         doc_ref.update({
@@ -672,7 +981,16 @@ async def _run_local_playlist(session_id: str, job_id: str | None = None):
     doc_ref.update({"quizStatus": "running", "quizError": None, "status": "テスト生成"})
     try:
         from app.services.llm import clean_quiz_markdown
-        quiz_raw = await llm.generate_quiz(transcript, mode=data.get("mode", "lecture"), count=count)
+        # ★ Translation sessions: use lecture mode for quiz generation
+        quiz_mode2 = data.get("mode", "lecture")
+        quiz_transcript2 = transcript
+        if (quiz_mode2 == "translate" or data.get("importType") == "translate") and "===ORIGINAL===" in transcript:
+            original_part = transcript.split("\n===TRANSLATION===")[0]
+            quiz_transcript2 = original_part.replace("===ORIGINAL===\n", "").strip()
+            quiz_mode2 = "lecture"
+        elif quiz_mode2 == "translate":
+            quiz_mode2 = "lecture"
+        quiz_raw = await llm.generate_quiz(quiz_transcript2, mode=quiz_mode2, count=count)
         quiz_md = clean_quiz_markdown(quiz_raw)
         
         doc_ref.update({
@@ -708,6 +1026,97 @@ def enqueue_generate_highlights_task(session_id: str, user_id: str | None = None
     """
     logger.info("Highlights task is deprecated; skipping enqueue.")
 
+
+def enqueue_todo_extraction_task(
+    session_id: str,
+    account_id: str,
+    source_key: str,
+    summary_text: str,
+    transcript_text: str | None = None,
+    mode: str = "lecture",
+    user_id: str | None = None,
+):
+    """
+    [NEW 2026-02] TODO抽出タスクを非同期でキューに入れる。
+    要約完了後に呼び出し、ユーザーの待ち時間を削減する。
+    """
+    payload = {
+        "sessionId": session_id,
+        "accountId": account_id,
+        "sourceKey": source_key,
+        "summaryText": summary_text,
+        "transcriptText": transcript_text or "",
+        "mode": mode,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running TODO extraction locally for session: {session_id}")
+        asyncio.create_task(_run_local_todo_extraction(**payload))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/todo_extraction"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 120},  # 2 mins max for TODO extraction
+    }
+
+    _create_task_nonblocking(parent, task)
+    logger.info(f"Enqueued TODO extraction task for session {session_id}")
+
+
+async def _run_local_todo_extraction(
+    sessionId: str,
+    accountId: str,
+    sourceKey: str,
+    summaryText: str,
+    transcriptText: str = "",
+    mode: str = "lecture",
+    userId: str | None = None,
+    **kwargs,
+):
+    """Local fallback for TODO extraction."""
+    from app.services.todo_extractor import update_todos_from_summary
+
+    try:
+        todo_stats = await update_todos_from_summary(
+            session_id=sessionId,
+            account_id=accountId,
+            source_key=sourceKey,
+            summary_text=summaryText,
+            transcript_text=transcriptText,
+            mode=mode,
+        )
+        logger.info(f"[local TODO] Extracted for {sessionId}: created={todo_stats.get('created')}")
+
+        # Update session with todo_status
+        doc_ref = db.collection("sessions").document(sessionId)
+        doc_ref.update({
+            "todoStatus": "completed",
+            "todoUpdatedAt": datetime.utcnow(),
+            "todoStats": todo_stats,
+        })
+    except Exception as e:
+        logger.exception(f"[local TODO] Failed for {sessionId}: {e}")
+        # Mark as failed but don't block
+        try:
+            doc_ref = db.collection("sessions").document(sessionId)
+            doc_ref.update({
+                "todoStatus": "failed",
+                "todoError": str(e)[:200],
+                "todoUpdatedAt": datetime.utcnow(),
+            })
+        except Exception:
+            pass
+
+
 def enqueue_nuke_user_task(user_id: str):
     """
     [CRITICAL] Enqueue a task to completely wipe a user's account and data.
@@ -742,7 +1151,7 @@ def enqueue_nuke_user_task(user_id: str):
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued NUKE task for {user_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue Nuke task for {user_id}: {e}")
@@ -803,7 +1212,7 @@ def enqueue_transcribe_task(
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued transcribe task for session {session_id}, job_id={job_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue transcribe task: {e}")
@@ -836,7 +1245,7 @@ def enqueue_youtube_import_task(session_id: str, url: str, language: str = "ja",
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued youtube import task for {session_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue youtube import task: {e}")
@@ -867,7 +1276,7 @@ def enqueue_merge_migration_task(merge_id: str):
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued merge migration task for {merge_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue merge migration task: {e}")
@@ -899,7 +1308,7 @@ def enqueue_account_migration_task(from_account_id: str, to_account_id: str):
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued account migration task: {from_account_id} -> {to_account_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue account migration task: {e}")
@@ -972,11 +1381,7 @@ async def _run_local_youtube_import(session_id: str, url: str, language: str):
         data = doc_ref.get().to_dict() or {}
         uid = data.get("ownerUserId") or data.get("userId")
 
-        # Trigger next steps (Summary/Quiz/Playlist)
-        # [FIX] Use session-based idempotency key to prevent duplicate consumption
-        enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
-        enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
-        enqueue_playlist_task(session_id, user_id=uid)
+        # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
     except Exception as e:
         logger.exception("Local YouTube Import Failed")
         doc_ref.update({"status": "failed", "transcriptText": f"Error: {e}"})
@@ -1131,12 +1536,7 @@ async def _run_local_transcribe(session_id: str, force: bool = False, engine: st
         # Update job status: completed
         _update_job_status("completed")
 
-        # Trigger downstream tasks (summary, quiz)
-        # [FIX] Use session-based idempotency key to prevent duplicate consumption
-        if updates.get("transcriptText"):
-            uid = data.get("ownerUserId") or data.get("userId")
-            enqueue_summarize_task(session_id, user_id=uid, idempotency_key=f"auto_summary:{session_id}")
-            enqueue_quiz_task(session_id, user_id=uid, idempotency_key=f"auto_quiz:{session_id}")
+        # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
 
         logger.info(f"[local transcribe] completed for session: {session_id}")
 
@@ -1182,7 +1582,7 @@ def enqueue_merge_migration_task(
     }
 
     try:
-        tasks_client.create_task(parent=parent, task=task)
+        _create_task_nonblocking(parent, task)
         logger.info(f"Enqueued merge migration task for job {merge_job_id}")
     except Exception as e:
         logger.error(f"Failed to enqueue merge migration task: {e}")
@@ -1200,3 +1600,67 @@ async def _run_local_merge_migration(merge_job_id: str, source_uid: str, target_
     logger.warning("Local merge migration is not fully implemented in task_queue (logic is in routes/tasks.py).")
     # If we wanted to run it, we'd need to move the logic to a service.
     # For now, we assume local dev might not test full merge migration backgrounding strictly.
+
+
+# ---------- finalize v2: derived feature worker enqueue ---------- #
+
+def enqueue_derived_finalize_task(
+    session_id: str,
+    feature: str,
+    *,
+    reservation_id: str,
+    user_id: str | None = None,
+    account_id: str | None = None,
+    operation_id: str | None = None,
+    client_request_id: str | None = None,
+) -> None:
+    """finalize v2 の per-feature derived worker を Cloud Tasks にエンキューする。
+
+    PR D 時点では worker 本体(`/internal/tasks/derived/finalize`)は未実装。
+    PR E で routes/tasks.py にハンドラを追加するまで、本関数はキュー投入のみを担い
+    ローカル実行では警告ログを出して no-op する。
+
+    Args:
+        session_id: 対象 session(canonical id)
+        feature: `summary` | `highlights` | `quiz` のいずれか
+        reservation_id: 対応する credits_reservations doc id(= clientRequestId)
+        user_id: 実行ユーザー uid
+        account_id: 請求先 account id
+        operation_id: finalize operationId(audit 相関用)
+        client_request_id: 元 client request id(= reservation_id と同じ)
+    """
+    payload = {
+        "sessionId": session_id,
+        "feature": feature,
+        "reservationId": reservation_id,
+        "userId": user_id,
+        "accountId": account_id,
+        "operationId": operation_id,
+        "clientRequestId": client_request_id or reservation_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.warning(
+            f"[derived_finalize] local mode no-op for session={session_id} feature={feature}"
+            " (worker deferred to PR E)"
+        )
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/derived/finalize"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 1800},  # 30 mins
+    }
+
+    _create_task_nonblocking(parent, task)
+    logger.info(
+        f"[derived_finalize] enqueued session={session_id} feature={feature}"
+        f" reservation={reservation_id}"
+    )

@@ -1,4 +1,4 @@
-from typing import List, Optional, get_args, Dict
+from typing import List, Optional, get_args, Dict, Any
 from datetime import datetime, timedelta, timezone
 import asyncio
 import uuid
@@ -27,11 +27,15 @@ from app.task_queue import (
 )
 
 
-from app.services import llm
+from app.services import llm, project_folders
+from app.services.canonical import normalize_session_doc, build_session_response, canonicalize_for_write, diff_log
 from app.services.usage import usage_logger
 from app.services.cost_guard import cost_guard
 from app.services.transcripts import resolve_transcript_text, resolve_transcript_text_async, has_transcript_chunks, get_transcript_chunks_paginated, count_transcript_chunks
 from app.services.session_event_bus import publish_session_event
+from app.services.deprecation import log_deprecated_path
+from app.services.import_state import mark_import_completed
+from app.services.audit import emit as audit_emit
 from app import google_calendar
 import google.auth
 from google.auth import iam
@@ -39,6 +43,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from app.util_models import (
     SessionResponse,
+    LegacySessionResponse,
     CreateSessionRequest,
     UpdateSessionRequest,
     TranscriptUpdateRequest,
@@ -48,6 +53,7 @@ from app.util_models import (
     VideoUrlUpdateRequest,
     NotesUpdateRequest,
     SessionDetailResponse,
+    LegacySessionDetailResponse,
     ImagePrepareRequest,
     ImagePrepareResponse,
     ImageCommitRequest,
@@ -123,6 +129,11 @@ from app.util_models import (
     TranscriptSegmentsResponse,
     WatchTranscriptPartialRequest,
     WatchTranscriptPartialResponse,
+)
+from app.adapters.legacy import (
+    session_to_legacy,
+    session_detail_to_legacy,
+    log_legacy_usage,
 )
 
 class RegenerateTranscriptRequest(BaseModel):
@@ -655,14 +666,12 @@ async def _create_session_internal(
     start_at = created_at
     end_at = start_at + timedelta(hours=1)
 
-    data = {
+    data_template = {
         "title": title,
         "mode": mode,
-        "userId": owner_uid,
+        # [Canonical] 正規オーナーフィールド
         "ownerId": owner_uid,
-        "ownerUserId": owner_uid,
-        "ownerUid": owner_uid,
-        "ownerAccountId": owner_account_id,  # [FIX] Required for account-based queries
+        "ownerAccountId": owner_account_id,
         "status": "録音中",
         "transcriptionMode": transcription_mode,
         "visibility": visibility,
@@ -684,6 +693,8 @@ async def _create_session_internal(
         "deviceId": device_id,
         "source": source,
     }
+    # [Canonical] 互換フィールドも並行書き込み (Phase D で削除)
+    data = canonicalize_for_write(data_template)
 
     # Cloud ticket only for cloud transcription
     if transcription_mode == "cloud_google":
@@ -721,7 +732,8 @@ async def _create_session_internal(
         display_name=display_name,
     )
 
-    return data
+    legacy = session_detail_to_legacy(data)
+    return LegacySessionDetailResponse(**legacy)
 
 
 async def _check_session_creation_limits(user_uid: str, transcription_mode: str = "device_sherpa") -> dict:
@@ -805,7 +817,7 @@ def _create_session_transaction(transaction, session_ref, user_ref, session_data
         "userId": user_uid
     }
 
-@router.post("/sessions", response_model=SessionResponse, status_code=201)
+@router.post("/sessions", response_model=LegacySessionResponse, status_code=201)
 async def create_session(
     create_req: CreateSessionRequest, 
     background_tasks: BackgroundTasks, 
@@ -889,6 +901,18 @@ async def create_session(
     # [IMPORT SUPPORT]
     is_import = (create_req.purpose == "import")
     import_type = create_req.importType # "transcript" or "audio" or None
+
+    if create_req.folderId:
+        try:
+            # Resolve across account members: iOS-created folder (uid A) must
+            # be usable from Desktop (uid B) when both share an accountId.
+            project_folders.validate_folder_account(
+                current_user.uid,
+                current_user.account_id,
+                create_req.folderId,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
     
     # If importType is specified, we NEVER check cloud limits at creation time.
     # Logic:
@@ -1062,19 +1086,19 @@ async def create_session(
     status = txn_result["status"]
     final_data = txn_result["data"]
     
+    log_legacy_usage(endpoint="/sessions", uid=current_user.uid, props={"method": "POST"})
     if status == "exists":
         logger.info(f"[CreateSession] Idempotency Hit: {session_id}")
         ensure_can_view(final_data, current_user, session_id)
         # Return existing
-        owner_id = final_data.get("ownerUserId") or final_data.get("userId")
+        owner_id = final_data.get("ownerId") or final_data.get("ownerUserId") or final_data.get("userId")
         owner_account_id = final_data.get("ownerAccountId")
         is_owner = (owner_id == current_user.uid) or (owner_account_id and owner_account_id == current_user.account_id)
-        return SessionResponse(
+        resp = SessionResponse(
             id=session_id,
             clientSessionId=final_data.get("clientSessionId"),
             title=final_data.get("title", ""),
             mode=final_data.get("mode", ""),
-            userId=owner_id,
             status=final_data.get("status", ""),
             createdAt=final_data.get("createdAt"),
             cloudTicket=final_data.get("cloudTicket"),
@@ -1082,10 +1106,10 @@ async def create_session(
             cloudStatus=final_data.get("cloudStatus"),
             isOwner=is_owner,
             canManage=is_owner,
-            ownerUserId=owner_id,
             ownerId=owner_id,
             ownerAccountId=final_data.get("ownerAccountId")
         )
+        return LegacySessionResponse(**session_to_legacy(resp))
 
     # If created:
     create_result = txn_result["result"]
@@ -1115,6 +1139,19 @@ async def create_session(
         source="owner",
         display_name=current_user.display_name,
     )
+
+    if create_req.folderId:
+        try:
+            project_folders.set_session_organization(
+                uid=current_user.uid,
+                session_id=session_id,
+                folder_id=create_req.folderId,
+                session_data=final_data,
+                finalized=False,
+                account_id=current_user.account_id,
+            )
+        except Exception as exc:
+            logger.warning(f"[CreateSession] Failed to link folder: {exc}")
 
     if create_req.syncToGoogleCalendar:
         try:
@@ -1156,13 +1193,12 @@ async def create_session(
             if usage_report:
                 quota_remaining_seconds = float(usage_report.get("remainingSeconds", 0.0))
 
-    return SessionResponse(
+    resp = SessionResponse(
         id=session_id,
         clientSessionId=final_data.get("clientSessionId"),
         source=final_data.get("source"),
         title=final_data.get("title", ""),
         mode=final_data.get("mode", ""),
-        userId=current_user.uid,
         status=final_data.get("status", ""),
         createdAt=final_data.get("createdAt"),
         tags=final_data.get("tags"),
@@ -1173,10 +1209,10 @@ async def create_session(
         quotaRemainingSeconds=quota_remaining_seconds,
         isOwner=True,
         canManage=True,
-        ownerUserId=current_user.uid,
         ownerId=current_user.uid,
         ownerAccountId=current_user.account_id
     )
+    return LegacySessionResponse(**session_to_legacy(resp))
 
 
 @router.post("/sessions/{session_id}/cloud:start", response_model=CloudSTTStartResponse)
@@ -1307,11 +1343,11 @@ async def start_cloud_session(
 
 
 
-@router.get("/sessions", response_model=List[SessionResponse])
-@router.get("/sessions/", response_model=List[SessionResponse], include_in_schema=False)
+@router.get("/sessions", response_model=List[LegacySessionResponse])
 async def list_sessions(
     user_id: Optional[str] = None,
     kind: Optional[str] = None,
+    mode: Optional[str] = None,
     limit: int = 20,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
@@ -1323,6 +1359,7 @@ async def list_sessions(
     [PERFORMANCE] limit is capped at 100 to prevent timeout.
     For large datasets, use pagination with from_date/to_date.
     """
+    log_legacy_usage(endpoint="/sessions", uid=current_user.uid, props={"method": "GET"})
     # [PERFORMANCE] Cap limit to prevent timeout on large requests
     MAX_LIMIT = 500
     if limit > MAX_LIMIT:
@@ -1449,18 +1486,49 @@ async def list_sessions(
     
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
+    # [Fix 2026-04-18] account-aware: sessionMeta may live under any
+    # member uid of the caller's account. We now shallow-merge fields
+    # across every member uid (caller's uid wins on conflicts) so
+    # legacy split state — e.g. folderId on uid A written by
+    # set_session_organization AND isPinned on uid B written by the
+    # old update_session_meta — still surfaces together on reads. The
+    # writer is being unified separately; this merge keeps already-
+    # fragmented accounts consistent in the meantime.
     meta_map = {}
     if unique_docs:
         try:
-            meta_refs = [
-                db.collection("users").document(target_user_id).collection("sessionMeta").document(d.id)
-                for d in unique_docs
-            ]
+            from app.services import project_folders
+            reader_uids: list[str] = []
+            if account_id:
+                try:
+                    reader_uids = list(project_folders.resolve_member_uids(target_user_id, account_id))
+                except Exception as exc:
+                    logger.warning(f"[list_sessions] resolve_member_uids failed: {exc}")
+                    reader_uids = []
+            if target_user_id not in reader_uids:
+                reader_uids.insert(0, target_user_id)
+
             def _fetch_meta():
-                _m = {}
-                for snap in db.get_all(meta_refs):
-                    if snap.exists:
-                        _m[snap.id] = snap.to_dict()
+                _m: dict = {}
+                # reader_uids is ordered caller-first; later uids only
+                # fill in missing keys, so the caller's own state wins
+                # on conflicts (last-writer-wins in single-uid mode).
+                for candidate_uid in reader_uids:
+                    meta_refs = [
+                        db.collection("users")
+                        .document(candidate_uid)
+                        .collection("sessionMeta")
+                        .document(d.id)
+                        for d in unique_docs
+                    ]
+                    for snap in db.get_all(meta_refs):
+                        if not snap.exists:
+                            continue
+                        existing = _m.get(snap.id) or {}
+                        incoming = snap.to_dict() or {}
+                        merged = dict(incoming)
+                        merged.update(existing)  # earlier uid (caller) wins
+                        _m[snap.id] = merged
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
         except Exception as e:
@@ -1480,13 +1548,17 @@ async def list_sessions(
         is_pinned = meta.get("isPinned", False)
         is_archived = meta.get("isArchived", False)
         last_opened_at = meta.get("lastOpenedAt")
-        
+        folder_id = meta.get("folderId")
+
         is_participant = user_id in (data.get("participantUserIds") or []) or (data.get("sharedWith") or {}).get(user_id)
         if user_id and data.get("ownerUid") != user_id and data.get("ownerUserId") != user_id and not is_participant:
             continue
         if kind and kind != "all" and data.get("mode") != kind:
             continue
-            
+        if mode and data.get("mode") != mode:
+            continue
+
+
         for key in ["createdAt", "startedAt", "endedAt", "summaryUpdatedAt", "quizUpdatedAt"]:
              if key in data and data[key] and hasattr(data[key], 'isoformat'):
                  data[key] = data[key].isoformat()
@@ -1494,13 +1566,11 @@ async def list_sessions(
         data["hasSummary"] = (data.get("summaryStatus") == JobStatus.COMPLETED.value)
         data["hasQuiz"] = (data.get("quizStatus") == JobStatus.COMPLETED.value)
         shared_ids = list((data.get("sharedWith") or {}).keys())
-        
+
 
         owner_id = data.get("ownerUserId") or data.get("ownerUid") or data.get("userId", "")
         p_ids = data.get("participantUserIds") or list((data.get("sharedWith") or {}).keys())
-        
-        # [Insights Support] Calculate hasTranscript
-        has_transcript = bool(data.get("transcriptText"))
+
         # Fallback for duration if not set
         duration_sec = data.get("durationSec")
         audio_info = data.get("audio") or {}
@@ -1509,17 +1579,18 @@ async def list_sessions(
              duration_sec = audio_meta.get("durationSec") or audio_info.get("durationSec")
 
         # [NEW] Audio metadata for iOS download sync
-        has_audio = audio_info.get("hasAudio", False) or data.get("audioStatus") == "uploaded"
-        audio_size = audio_meta.get("sizeBytes") or audio_meta.get("size") or audio_info.get("sizeBytes")
         audio_sha = audio_meta.get("payloadSha256") or audio_meta.get("sha256") or data.get("audioSha256")
         audio_updated = audio_info.get("uploadedAt") or data.get("audioUpdatedAt")
         audio_content_type = audio_meta.get("contentType") or audio_info.get("contentType")
 
-        result.append(SessionResponse(
+        # [Canonical] Read-time normalize
+        _canonical = normalize_session_doc(data)
+        diff_log(data.get("id", ""), data, _canonical)
+
+        resp = SessionResponse(
             id=data["id"],
             title=data.get("title", ""),
             mode=data.get("mode", ""),
-            userId=owner_id, # Deprecated response field
             status=data.get("status", ""),
             createdAt=data.get("createdAt"),
             tags=data.get("tags"),
@@ -1528,7 +1599,6 @@ async def list_sessions(
             cloudStatus=data.get("cloudStatus"),
             isOwner=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
             canManage=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
-            ownerUserId=owner_id,
             ownerId=owner_id, # [FIX] Legacy Alias
             ownerAccountId=data.get("ownerAccountId"),  # [NEW] Account-based ownership
             participantUserIds=p_ids,
@@ -1540,8 +1610,8 @@ async def list_sessions(
             isPinned=is_pinned,
             isArchived=is_archived,
             lastOpenedAt=last_opened_at,
+            folderId=folder_id,
             # Insights
-            hasTranscript=has_transcript,
             hasSummary=data["hasSummary"],
             hasQuiz=data["hasQuiz"],
             durationSec=duration_sec,
@@ -1554,14 +1624,44 @@ async def list_sessions(
             # createdAt was already passed above
             localId=data.get("localId"), # [NEW]
             # [NEW] Audio metadata for iOS download sync
-            hasAudio=has_audio,
-            audioSizeBytes=audio_size,
             audioSha256=audio_sha,
             audioUpdatedAt=audio_updated,
             audioContentType=audio_content_type,
-        ))
+            # [Canonical] 新構造化フィールド (Phase A)
+            audio=_canonical.get("audio"),
+            transcript=_canonical.get("transcript"),
+            summary=_canonical.get("summary"),
+            suggestedTitle=(_canonical.get("summary") or {}).get("suggestedTitle") or data.get("suggestedTitle"),
+        )
+        result.append(LegacySessionResponse(**session_to_legacy(resp)))
 
     return result
+
+
+@router.get("/sessions/", response_model=List[SessionResponse], include_in_schema=False)
+async def list_sessions_alias(
+    request: Request,
+    user_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 20,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions",
+        route_status="alias",
+    )
+    return await list_sessions(
+        user_id=user_id,
+        kind=kind,
+        limit=limit,
+        from_date=from_date,
+        to_date=to_date,
+        current_user=current_user,
+    )
 
 
 @router.post("/sessions/{session_id}/import:transcript")
@@ -1799,18 +1899,49 @@ async def import_session_audio(
     
     # [NEW] Fetch sessionMeta for all visible sessions (Copy-free sharing)
     # [PERF] Offload sync get_all to thread
+    # [Fix 2026-04-18] account-aware: sessionMeta may live under any
+    # member uid of the caller's account. We now shallow-merge fields
+    # across every member uid (caller's uid wins on conflicts) so
+    # legacy split state — e.g. folderId on uid A written by
+    # set_session_organization AND isPinned on uid B written by the
+    # old update_session_meta — still surfaces together on reads. The
+    # writer is being unified separately; this merge keeps already-
+    # fragmented accounts consistent in the meantime.
     meta_map = {}
     if unique_docs:
         try:
-            meta_refs = [
-                db.collection("users").document(target_user_id).collection("sessionMeta").document(d.id)
-                for d in unique_docs
-            ]
+            from app.services import project_folders
+            reader_uids: list[str] = []
+            if account_id:
+                try:
+                    reader_uids = list(project_folders.resolve_member_uids(target_user_id, account_id))
+                except Exception as exc:
+                    logger.warning(f"[list_sessions] resolve_member_uids failed: {exc}")
+                    reader_uids = []
+            if target_user_id not in reader_uids:
+                reader_uids.insert(0, target_user_id)
+
             def _fetch_meta():
-                _m = {}
-                for snap in db.get_all(meta_refs):
-                    if snap.exists:
-                        _m[snap.id] = snap.to_dict()
+                _m: dict = {}
+                # reader_uids is ordered caller-first; later uids only
+                # fill in missing keys, so the caller's own state wins
+                # on conflicts (last-writer-wins in single-uid mode).
+                for candidate_uid in reader_uids:
+                    meta_refs = [
+                        db.collection("users")
+                        .document(candidate_uid)
+                        .collection("sessionMeta")
+                        .document(d.id)
+                        for d in unique_docs
+                    ]
+                    for snap in db.get_all(meta_refs):
+                        if not snap.exists:
+                            continue
+                        existing = _m.get(snap.id) or {}
+                        incoming = snap.to_dict() or {}
+                        merged = dict(incoming)
+                        merged.update(existing)  # earlier uid (caller) wins
+                        _m[snap.id] = merged
                 return _m
             meta_map = await asyncio.to_thread(_fetch_meta)
         except Exception as e:
@@ -1830,13 +1961,14 @@ async def import_session_audio(
         is_pinned = meta.get("isPinned", False)
         is_archived = meta.get("isArchived", False)
         last_opened_at = meta.get("lastOpenedAt")
-        
+        folder_id = meta.get("folderId")
+
         is_participant = user_id in (data.get("participantUserIds") or []) or (data.get("sharedWith") or {}).get(user_id)
         if user_id and data.get("ownerUid") != user_id and data.get("ownerUserId") != user_id and not is_participant:
             continue
         if kind and kind != "all" and data.get("mode") != kind:
             continue
-            
+
         for key in ["createdAt", "startedAt", "endedAt", "summaryUpdatedAt", "quizUpdatedAt"]:
              if key in data and data[key] and hasattr(data[key], 'isoformat'):
                  data[key] = data[key].isoformat()
@@ -1844,13 +1976,14 @@ async def import_session_audio(
         data["hasSummary"] = (data.get("summaryStatus") == JobStatus.COMPLETED.value)
         data["hasQuiz"] = (data.get("quizStatus") == JobStatus.COMPLETED.value)
         shared_ids = list((data.get("sharedWith") or {}).keys())
-        
 
-        owner_id = data.get("ownerUserId") or data.get("ownerUid") or data.get("userId", "")
+        # [Canonical] Read-time normalize
+        _canonical = normalize_session_doc(data)
+        diff_log(data.get("id", ""), data, _canonical)
+
+        owner_id = _canonical.get("ownerId", "")
         p_ids = data.get("participantUserIds") or list((data.get("sharedWith") or {}).keys())
-        
-        # [Insights Support] Calculate hasTranscript
-        has_transcript = bool(data.get("transcriptText"))
+
         # Fallback for duration if not set
         duration_sec = data.get("durationSec")
         audio_info = data.get("audio") or {}
@@ -1858,23 +1991,14 @@ async def import_session_audio(
         if duration_sec is None:
              duration_sec = audio_meta.get("durationSec") or audio_info.get("durationSec")
 
-        # [NEW] Audio metadata for iOS download sync
-        has_audio = audio_info.get("hasAudio", False) or data.get("audioStatus") == "uploaded"
-        audio_size = audio_meta.get("sizeBytes") or audio_meta.get("size") or audio_info.get("sizeBytes")
-        audio_sha = audio_meta.get("payloadSha256") or audio_meta.get("sha256") or data.get("audioSha256")
-        audio_updated = audio_info.get("uploadedAt") or data.get("audioUpdatedAt")
-        audio_content_type = audio_meta.get("contentType") or audio_info.get("contentType")
-
-        result.append(SessionResponse(
+        resp = SessionResponse(
             id=data["id"],
             title=data.get("title", ""),
             mode=data.get("mode", ""),
-            userId=owner_id, # Deprecated response field
             status=data.get("status", ""),
             createdAt=data.get("createdAt"),
             tags=data.get("tags"),
-            ownerUserId=owner_id,
-            ownerAccountId=data.get("ownerAccountId"),  # [NEW] Account-based ownership
+            ownerAccountId=data.get("ownerAccountId"),
             participantUserIds=p_ids,
             participants=data.get("participants"),
             visibility=data.get("visibility", "private"),
@@ -1882,45 +2006,91 @@ async def import_session_audio(
             topicSummary=data.get("topicSummary"),
             isOwner=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
             canManage=(owner_id == target_user_id) or (data.get("ownerAccountId") and data.get("ownerAccountId") == account_id),
-            ownerId=owner_id, # [FIX] Legacy Alias
+            ownerId=owner_id,
             sharedWithCount=len(p_ids),
             sharedUserIds=p_ids,
             isPinned=is_pinned,
             isArchived=is_archived,
             lastOpenedAt=last_opened_at,
+            folderId=folder_id,
             reactionCounts=data.get("reactionCounts", {}),
-            
-            # [NEW] Insights Fields
+            # Insights
+            hasSummary=data["hasSummary"],
+            hasQuiz=data["hasQuiz"],
             startedAt=data.get("startedAt"),
             endedAt=data.get("endedAt"),
             durationSec=duration_sec,
-            hasTranscript=has_transcript,
-            # [FIX] Derive statuses from aggregate status if internal flags are missing
-            summaryStatus=("completed" if data.get("status") in ["要約済み", "テスト完了"] else data.get("summaryStatus")),
             quizStatus=("completed" if data.get("status") == "テスト完了" else data.get("quizStatus")),
             diarizationStatus=data.get("diarizationStatus"),
             highlightsStatus=data.get("highlightsStatus"),
-        ))
-            
+            # [Canonical] 新構造化フィールド (Phase A)
+            audio=_canonical.get("audio"),
+            transcript=_canonical.get("transcript"),
+            summary=_canonical.get("summary"),
+            suggestedTitle=(_canonical.get("summary") or {}).get("suggestedTitle") or data.get("suggestedTitle"),
+        )
+        result.append(LegacySessionResponse(**session_to_legacy(resp)))
+
     return result
 
 
 # ★ Helper functions for parallel fetching in GET /sessions/{session_id}
-def _fetch_session_meta_sync(uid: str, session_id: str) -> dict:
-    """Fetch user's sessionMeta (pinned, archived, lastOpened)."""
+def _fetch_session_meta_sync(uid: str, session_id: str, account_id: Optional[str] = None) -> dict:
+    """Fetch user's sessionMeta (pinned, archived, lastOpened, folderId).
+
+    Fix (2026-04-18): account-aware shallow-merge read.
+
+    Writers targeting the sessionMeta doc have drifted over time:
+      - `set_session_organization` writes folderId on whichever member
+        uid already holds meta (fallback: owner uid).
+      - The old `update_session_meta` unconditionally wrote
+        isPinned / isArchived / lastOpenedAt on the caller's uid.
+      - Session creation writes a bootstrap doc on the owner uid.
+
+    So on multi-uid accounts (iOS uid A + Desktop uid B) the fields
+    can legitimately be split across two docs. We now walk every
+    member uid (caller first) and shallow-merge the docs — the
+    caller's own uid wins on conflicts, mirroring last-writer-wins
+    semantics on single-uid accounts.
+    """
     try:
-        meta_ref = db.collection("users").document(uid).collection("sessionMeta").document(session_id)
-        meta_snap = meta_ref.get()
-        if meta_snap.exists:
-            meta = meta_snap.to_dict()
+        from app.services import project_folders
+        reader_uids: list[str] = []
+        if account_id:
+            try:
+                reader_uids = list(project_folders.resolve_member_uids(uid, account_id))
+            except Exception as exc:
+                logger.warning(f"[sessionMeta] resolve_member_uids failed: {exc}")
+                reader_uids = []
+        if uid not in reader_uids:
+            reader_uids.insert(0, uid)
+
+        merged: dict = {}
+        for candidate_uid in reader_uids:
+            meta_ref = (
+                db.collection("users")
+                .document(candidate_uid)
+                .collection("sessionMeta")
+                .document(session_id)
+            )
+            meta_snap = meta_ref.get()
+            if not meta_snap.exists:
+                continue
+            incoming = meta_snap.to_dict() or {}
+            for key, value in incoming.items():
+                if key not in merged:
+                    merged[key] = value
+
+        if merged:
             return {
-                "isPinned": meta.get("isPinned", False),
-                "isArchived": meta.get("isArchived", False),
-                "lastOpenedAt": meta.get("lastOpenedAt"),
+                "isPinned": merged.get("isPinned", False),
+                "isArchived": merged.get("isArchived", False),
+                "lastOpenedAt": merged.get("lastOpenedAt"),
+                "folderId": merged.get("folderId"),
             }
     except Exception as e:
         logger.warning(f"Failed to fetch sessionMeta for detail: {e}")
-    return {"isPinned": False, "isArchived": False, "lastOpenedAt": None}
+    return {"isPinned": False, "isArchived": False, "lastOpenedAt": None, "folderId": None}
 
 
 def _fetch_members_sync(resolved_id: str) -> list:
@@ -1960,8 +2130,9 @@ def _fetch_members_sync(resolved_id: str) -> list:
         return []
 
 
-@router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+@router.get("/sessions/{session_id}", response_model=LegacySessionDetailResponse)
 async def get_session(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    log_legacy_usage(endpoint="/sessions/{session_id}", uid=current_user.uid, props={"method": "GET"})
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, doc, resolved_id = _resolve_session(session_id, current_user.uid)
     data = doc.to_dict()
@@ -1987,9 +2158,7 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
             
     data["hasSummary"] = (data.get("summaryStatus") == JobStatus.COMPLETED.value)
     data["hasQuiz"] = (data.get("quizStatus") == JobStatus.COMPLETED.value)
-    # [FIX] hasTranscript flag based on actual text content
     full_text = data.get("transcriptText") or ""
-    data["hasTranscript"] = bool(full_text)
     data["transcriptTextLen"] = len(full_text) if full_text else 0
 
     # [PERF] Return only 500-char preview; client should use /transcript_chunks for full text
@@ -2003,7 +2172,7 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     image_notes_raw = data.get("imageNotes") or []
     chunk_count, meta, image_notes_resolved, members_list = await asyncio.gather(
         asyncio.to_thread(count_transcript_chunks, resolved_id),
-        asyncio.to_thread(_fetch_session_meta_sync, current_user.uid, session_id),
+        asyncio.to_thread(_fetch_session_meta_sync, current_user.uid, session_id, current_user.account_id),
         asyncio.to_thread(_resolve_image_notes_with_urls, image_notes_raw),
         asyncio.to_thread(_fetch_members_sync, resolved_id),
     )
@@ -2012,6 +2181,7 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     data["isPinned"] = meta["isPinned"]
     data["isArchived"] = meta["isArchived"]
     data["lastOpenedAt"] = meta["lastOpenedAt"]
+    data["folderId"] = meta.get("folderId")
     data["imageNotes"] = image_notes_resolved
     data["members"] = members_list
 
@@ -2031,13 +2201,9 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     elif raw_status not in [e.value for e in AudioStatus]:
         data["audioStatus"] = AudioStatus.UNKNOWN
 
-    # [FIX] Populate hasAudio and audio metadata at top level for iOS
-    # Firestore stores hasAudio nested under audio.hasAudio, but SessionDetailResponse
-    # expects it at the top level. Without this, hasAudio always defaults to False.
+    # [FIX] Populate audio metadata at top level
     audio_info = data.get("audio") or {}
     audio_meta_raw = data.get("audioMeta") or {}  # Save before overwrite
-    data["hasAudio"] = audio_info.get("hasAudio", False) or data.get("audioStatus") == AudioStatus.UPLOADED or data.get("audioStatus") == "uploaded"
-    data["audioSizeBytes"] = audio_meta_raw.get("sizeBytes") or audio_meta_raw.get("size") or audio_info.get("sizeBytes")
     data["audioSha256"] = audio_meta_raw.get("payloadSha256") or audio_meta_raw.get("sha256") or data.get("audioSha256")
     data["audioUpdatedAt"] = audio_info.get("uploadedAt") or data.get("updatedAt")
     data["audioContentType"] = audio_meta_raw.get("contentType") or audio_info.get("contentType")
@@ -2053,12 +2219,9 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
     else:
         data["audioMeta"] = None
 
-    # [FIX] Explicitly populate permission fields (camelCase for iOS compatibility)
-    owner_id = data.get("ownerUserId") or data.get("ownerUid") or data.get("userId")
-    data["ownerUserId"] = owner_id
-    data["ownerUid"] = owner_id          # [FIX] iOS CodingKeys expects ownerUid
-    data["userId"] = owner_id            # [FIX] iOS fallback field
-    data["ownerId"] = owner_id           # [FIX] Legacy alias
+    # [FIX] Populate permission fields (normalized)
+    owner_id = data.get("ownerId") or data.get("ownerUserId") or data.get("ownerUid") or data.get("userId")
+    data["ownerId"] = owner_id
     owner_account_id = data.get("ownerAccountId")
     if owner_account_id:
         data["ownerAccountId"] = owner_account_id  # Ensure camelCase key present
@@ -2090,11 +2253,20 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
 async def sync_session_calendar(
     session_id: str,
     req: CalendarSyncRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     指定ユーザー（基本はリクエスト本人）のカレンダーにセッションを同期登録する。
     """
+    if request.url.path.endswith("/calendar:sync"):
+        log_deprecated_path(
+            request,
+            user_id=current_user.uid,
+            canonical_path="/sessions/{session_id}/calendar-sync",
+            route_status="alias",
+        )
+
     # [FIX] Support clientSessionId fallback for offline-first clients
     doc_ref, doc, session_id = _resolve_session(session_id, current_user.uid)
     data = doc.to_dict()
@@ -2454,6 +2626,38 @@ async def append_transcript_chunks(
         update_data["transcriptText"] = await resolve_transcript_text_async(session_id)
 
     doc_ref.set(update_data, merge=True)
+
+    # [finalize v2 Step 1] importState.completed は canonical 確定の source of truth。
+    # finalize=True の append 完了時にのみ書き、append のみ呼び出しでは触らない。
+    if body.finalize:
+        try:
+            server_chunk_count = await asyncio.to_thread(count_transcript_chunks, session_id)
+            last_chunk_index: Optional[int] = None
+            try:
+                last_chunk_index = max(
+                    (c.endMs for c in body.chunks if c.endMs is not None),
+                    default=None,
+                )
+            except Exception:
+                last_chunk_index = None
+            await asyncio.to_thread(
+                mark_import_completed,
+                session_id,
+                chunk_count=server_chunk_count,
+                last_chunk_index=last_chunk_index,
+                source="device",
+            )
+            audit_emit(
+                "import_state.completed",
+                session_id=session_id,
+                uid=current_user.uid,
+                source="device",
+                chunkCount=server_chunk_count,
+                via="transcript_chunks:append",
+            )
+        except Exception as exc:
+            logger.warning(f"[finalize_v2] mark_import_completed failed for {session_id}: {exc}")
+
     await publish_session_event(session_id, "assets.updated", {"fields": ["transcript"]})
 
     return TranscriptChunkAppendResponse(
@@ -2573,6 +2777,37 @@ async def replace_transcript_chunks(
     if body.updateSessionTranscript:
         update_data["transcriptText"] = await resolve_transcript_text_async(session_id)
     doc_ref.set(update_data, merge=True)
+
+    # [finalize v2 Step 1] replace は「完成形を書き込む」セマンティクスなので
+    # 常に importState.completed=True を立てる。
+    try:
+        server_chunk_count = await asyncio.to_thread(count_transcript_chunks, session_id)
+        last_chunk_index: Optional[int] = None
+        try:
+            last_chunk_index = max(
+                (c.endMs for c in body.chunks if c.endMs is not None),
+                default=None,
+            )
+        except Exception:
+            last_chunk_index = None
+        await asyncio.to_thread(
+            mark_import_completed,
+            session_id,
+            chunk_count=server_chunk_count,
+            last_chunk_index=last_chunk_index,
+            source="upload",
+        )
+        audit_emit(
+            "import_state.completed",
+            session_id=session_id,
+            uid=current_user.uid,
+            source="upload",
+            chunkCount=server_chunk_count,
+            via="transcript_chunks:replace",
+        )
+    except Exception as exc:
+        logger.warning(f"[finalize_v2] mark_import_completed failed for {session_id}: {exc}")
+
     await publish_session_event(session_id, "assets.updated", {"fields": ["transcript"]})
 
     return TranscriptChunkAppendResponse(
@@ -2587,8 +2822,17 @@ async def replace_transcript_chunks(
 async def device_sync(
     session_id: str,
     body: DeviceSyncRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user)
 ):
+    if request.url.path.endswith("/device_sync"):
+        log_deprecated_path(
+            request,
+            user_id=current_user.uid,
+            canonical_path="/sessions/{session_id}/device-sync",
+            route_status="alias",
+        )
+
     # [Security] Time-window risk enforcement
     from app.services.security import security_service
     denial = await security_service.enforce(current_user.uid, "device_sync")
@@ -2760,7 +3004,7 @@ async def device_sync(
         "sessionId": session_id,
     }
 
-@router.patch("/sessions/{session_id}", response_model=SessionResponse)
+@router.patch("/sessions/{session_id}", response_model=LegacySessionResponse)
 async def update_session(session_id: str, req: UpdateSessionRequest, current_user: CurrentUser = Depends(get_current_user)):
     """セッションの部分更新（タイトル、タグなど）"""
     # [FIX] Support clientSessionId fallback for offline-first clients
@@ -2810,20 +3054,20 @@ async def update_session(session_id: str, req: UpdateSessionRequest, current_use
         for key in ["createdAt"]:
             if key in session_data and hasattr(session_data[key], 'isoformat'):
                 session_data[key] = session_data[key].isoformat()
-        return SessionResponse(
+        resp = SessionResponse(
             id=session_id,
             title=session_data.get("title", ""),
             mode=session_data.get("mode", ""),
-            userId=session_data.get("userId", ""),
-            ownerUserId=session_data.get("ownerUserId") or session_data.get("ownerUid") or session_data.get("userId"),
             ownerAccountId=session_data.get("ownerAccountId"),  # [NEW] Account-based ownership
             status=session_data.get("status", ""),
             createdAt=session_data.get("createdAt"),
             tags=session_data.get("tags"),
             isOwner=True, # update_session called ensure_can_edit which implies owner/editor
             canManage=True, # Implicit since we just updated it
-            ownerId=session_data.get("ownerUserId") or session_data.get("ownerUid") or session_data.get("userId")
+            ownerId=session_data.get("ownerId") or session_data.get("ownerUserId") or session_data.get("ownerUid") or session_data.get("userId")
         )
+        log_legacy_usage(endpoint="/sessions/{session_id}", uid=current_user.uid, props={"method": "PATCH"})
+        return LegacySessionResponse(**session_to_legacy(resp))
     
     update_data["updatedAt"] = _now_timestamp()
     doc_ref.update(update_data)
@@ -2845,20 +3089,20 @@ async def update_session(session_id: str, req: UpdateSessionRequest, current_use
         if key in new_data and hasattr(new_data[key], 'isoformat'):
             new_data[key] = new_data[key].isoformat()
     
-    return SessionResponse(
+    resp = SessionResponse(
         id=session_id,
         title=new_data.get("title", ""),
         mode=new_data.get("mode", ""),
-        userId=new_data.get("userId", ""),
-        ownerUserId=new_data.get("ownerUserId") or new_data.get("ownerUid") or new_data.get("userId"),
         ownerAccountId=new_data.get("ownerAccountId"),  # [NEW] Account-based ownership
         status=new_data.get("status", ""),
         createdAt=new_data.get("createdAt"),
         tags=new_data.get("tags"),
         isOwner=True,
         canManage=True,
-        ownerId=new_data.get("ownerUserId") or new_data.get("ownerUid") or new_data.get("userId")
+        ownerId=new_data.get("ownerId") or new_data.get("ownerUserId") or new_data.get("ownerUid") or new_data.get("userId")
     )
+    log_legacy_usage(endpoint="/sessions/{session_id}", uid=current_user.uid, props={"method": "PATCH"})
+    return LegacySessionResponse(**session_to_legacy(resp))
 
 @router.patch("/sessions/{session_id}/meta")
 async def update_session_meta(
@@ -2879,9 +3123,22 @@ async def update_session_meta(
     # Access check
     session_data = session_snap.to_dict()
     ensure_can_view(session_data, current_user, session_id)
-    
-    # Meta Doc Ref
-    meta_ref = db.collection("users").document(current_user.uid).collection("sessionMeta").document(session_id)
+
+    # [Fix 2026-04-18] account-aware writer.
+    # Previously this wrote isPinned/isArchived/lastOpenedAt unconditionally
+    # to the caller's own uid, but set_session_organization (folder assign)
+    # writes folderId to the uid that *already* holds sessionMeta. On
+    # multi-uid accounts (iOS uid A + Desktop uid B) that split fields
+    # across two docs and the UI saw stale state. Prefer the uid that
+    # already owns the meta doc so all fields stay on ONE doc per account.
+    from app.services import project_folders
+    target_uid = (
+        project_folders.find_session_meta_uid(
+            current_user.uid, current_user.account_id, session_id
+        )
+        or current_user.uid
+    )
+    meta_ref = db.collection("users").document(target_uid).collection("sessionMeta").document(session_id)
     
     update_data = {}
     if body.isPinned is not None:
@@ -3912,6 +4169,46 @@ async def get_artifact_quiz(
     # [DISABLED] Lazy trigger removed — user triggers manually via generate button
     return DerivedStatusResponse(status=status, result=result, jobId=None)
 
+
+@router.get("/sessions/{session_id}/artifacts/timeline", response_model=DerivedStatusResponse)
+async def get_artifact_timeline(
+    session_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Return the chapter-style timeline artifact generated by timeline_service.
+
+    UI は summaryJson.timeline より本エンドポイントの items を優先利用してよい。
+    未生成の場合は status="idle" を返し、クライアント側で :generate を叩く。
+    """
+    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+
+    data = snapshot.to_dict()
+    ensure_can_view(data, current_user, session_id)
+
+    derived_doc = _derived_doc_ref(session_id, "timeline").get()
+    if derived_doc.exists:
+        derived_data = derived_doc.to_dict() or {}
+        status = _map_derived_status(derived_data.get("status"))
+        result = None
+        if derived_data.get("items") is not None:
+            result = {
+                "items": derived_data.get("items") or [],
+                "itemCount": derived_data.get("itemCount") or 0,
+                "generator": derived_data.get("generator"),
+                "version": derived_data.get("version"),
+            }
+        return DerivedStatusResponse(
+            status=status,
+            result=result,
+            updatedAt=derived_data.get("updatedAt"),
+            errorReason=derived_data.get("error") or derived_data.get("errorReason"),
+            idempotencyKey=derived_data.get("sourceKey"),
+            jobId=derived_data.get("jobId"),
+        )
+
+    return DerivedStatusResponse(status="idle", result=None, jobId=None)
+
+
 @router.get("/sessions/{session_id}/artifacts/transcript", response_model=DerivedStatusResponse)
 async def get_artifact_transcript(
     session_id: str,
@@ -4292,10 +4589,9 @@ async def delete_session(session_id: str, current_user: CurrentUser = Depends(ge
         raise e
         
     session_data = snap.to_dict()
-    # Ensure owner
-    if session_data.get("ownerUid") != current_user.uid and session_data.get("ownerUserId") != current_user.uid:
-         # Check if user is an admin? For now strict 403
-         raise HTTPException(status_code=403, detail="Not authorized to delete this session")
+    # Ensure owner — unified with the rest of sessions.py to correctly honor
+    # ownerAccountId (post-merge) and avoid cross-account delete drift.
+    ensure_is_owner(session_data, current_user, resolved_session_id)
 
     # [HARD DELETE] Cascade delete all associated data (GCS files, subcollections, members, meta)
     success = _cascade_delete_session(resolved_session_id, session_data, current_user.uid)
@@ -4304,7 +4600,7 @@ async def delete_session(session_id: str, current_user: CurrentUser = Depends(ge
 
     return {"ok": True, "deleted": resolved_session_id}
 
-@router.post("/sessions/batch_delete")
+@router.post("/sessions:batch-delete")
 async def batch_delete_sessions(
     body: BatchDeleteRequest,
     current_user: CurrentUser = Depends(get_current_user),
@@ -4380,6 +4676,46 @@ async def batch_delete_sessions(
             logger.warning(f"Failed to store idempotency key: {e}")
 
     return result
+
+
+@router.post("/sessions:batchDelete", include_in_schema=False, deprecated=True)
+async def batch_delete_sessions_alias_camel(
+    request: Request,
+    body: BatchDeleteRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions:batch-delete",
+        route_status="deprecated",
+    )
+    return await batch_delete_sessions(
+        body=body,
+        current_user=current_user,
+        x_idempotency_key=x_idempotency_key,
+    )
+
+
+@router.post("/sessions/batch_delete", include_in_schema=False, deprecated=True)
+async def batch_delete_sessions_alias_snake(
+    request: Request,
+    body: BatchDeleteRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions:batch-delete",
+        route_status="deprecated",
+    )
+    return await batch_delete_sessions(
+        body=body,
+        current_user=current_user,
+        x_idempotency_key=x_idempotency_key,
+    )
 
 # Audio URL
 @router.get("/sessions/{session_id}/audio_url", response_model=SignedCompressedAudioResponse, response_model_exclude_none=True)
@@ -5057,7 +5393,6 @@ async def invite_session_member(
     )
 
 @router.get("/sessions/{session_id}/members", response_model=List[SessionMemberResponse])
-@router.get("/sessions/{session_id}/shared_with_users", response_model=List[SharedUserSummary])
 async def get_shared_users(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """
     Get summary of users this session is shared with.
@@ -5114,6 +5449,21 @@ async def get_shared_users(session_id: str, current_user: CurrentUser = Depends(
         raise HTTPException(status_code=500, detail="Failed to fetch user profiles")
         
     return summaries
+
+
+@router.get("/sessions/{session_id}/shared_with_users", response_model=List[SharedUserSummary])
+async def get_shared_users_alias(
+    session_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions/{session_id}/members",
+        route_status="alias",
+    )
+    return await get_shared_users(session_id=session_id, current_user=current_user)
 
 @router.get("/sessions/{session_id}/participants_users", response_model=List[SharedUserSummary])
 async def get_participants_users(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
@@ -5342,7 +5692,7 @@ async def generate_session_share_code(session_id: str, current_user: CurrentUser
 class JoinSessionRequest(BaseModel):
     code: str
 
-@router.post("/sessions/share/join", response_model=SessionResponse)
+@router.post("/sessions/share/join", response_model=LegacySessionResponse)
 async def join_session(body: JoinSessionRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
     6桁コードでセッションに参加する。
@@ -5395,27 +5745,28 @@ async def join_session(body: JoinSessionRequest, current_user: CurrentUser = Dep
     updated_session["id"] = session_id
     
     # Populate response fields
-    owner_id = updated_session.get("ownerUserId") or updated_session.get("ownerUid")
+    owner_id = updated_session.get("ownerId") or updated_session.get("ownerUserId") or updated_session.get("ownerUid")
     p_ids = updated_session.get("participantUserIds") or []
     
-    return SessionResponse(
+    resp = SessionResponse(
         id=session_id,
         title=updated_session.get("title", ""),
         mode=updated_session.get("mode", ""),
-        userId=owner_id,
         status=updated_session.get("status", ""),
         createdAt=updated_session.get("createdAt"),
         tags=updated_session.get("tags"),
-        ownerUserId=owner_id,
         ownerAccountId=updated_session.get("ownerAccountId"),  # [NEW] Account-based ownership
         participantUserIds=p_ids,
         visibility=updated_session.get("visibility", "private"),
         autoTags=updated_session.get("autoTags", []),
         topicSummary=updated_session.get("topicSummary"),
         isOwner=(owner_id == current_user.uid) or (updated_session.get("ownerAccountId") and updated_session.get("ownerAccountId") == current_user.account_id),
+        ownerId=owner_id,
         sharedWithCount=len(p_ids),
         sharedUserIds=p_ids,
     )
+    log_legacy_usage(endpoint="/sessions/share/join", uid=current_user.uid, props={"method": "POST"})
+    return LegacySessionResponse(**session_to_legacy(resp))
 
 
 
@@ -5908,6 +6259,7 @@ async def get_session_transcript_chunks(
 @router.get("/sessions/{session_id}/transcript/chunks", include_in_schema=False, deprecated=True)
 async def get_session_transcript_chunks_alias(
     session_id: str,
+    request: Request,
     fromMs: Optional[int] = None,
     toMs: Optional[int] = None,
     from_sec: Optional[float] = None,
@@ -5920,6 +6272,12 @@ async def get_session_transcript_chunks_alias(
     [DEPRECATED] Use GET /sessions/{session_id}/transcript_chunks instead.
     This alias exists for iOS backward compatibility.
     """
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions/{session_id}/transcript_chunks",
+        route_status="deprecated",
+    )
     return await get_session_transcript_chunks(
         session_id=session_id,
         fromMs=fromMs,
@@ -5935,84 +6293,151 @@ async def get_session_transcript_chunks_alias(
 # ---------- Finalize Session ---------- #
 
 class FinalizeRequest(BaseModel):
+    # Legacy fields（後方互換のため残す。body.derivedPlan が優先される）
     generateSummary: bool = True
     generatePlaylist: bool = True
     generateQuiz: bool = False
+    # finalize v2 (PR D) 追加フィールド
+    clientRequestId: Optional[str] = None
+    derivedPlan: Optional[Dict[str, bool]] = None
+    expectedChunkCount: Optional[int] = None
 
-@router.post("/sessions/{session_id}/finalize")
-@limiter.limit(RateLimits.HEAVY)  # 10 requests/minute - triggers background jobs
-async def finalize_session(
-    request: Request,  # Required for rate limiter
+async def _finalize_session_impl(
+    request: Request,
     session_id: str,
-    body: FinalizeRequest = Body(default=FinalizeRequest()),
-    current_user: CurrentUser = Depends(get_current_user),
+    body: FinalizeRequest,
+    current_user: CurrentUser,
 ):
+    """Core finalize logic — shared by canonical and alias routes.
+
+    スタックしたデコレータによるシグネチャ崩れを避けるため、各 route handler
+    は薄い wrapper とし、本 impl に委譲する。
+
+    PR D (finalize v2):
+      - canonical 確定 (importState.completed)、credits reservation、
+        per-feature derived worker enqueue を一括で実行する。
+      - body.clientRequestId を冪等キーとし、同じ id なら副作用なしで同結果を返す。
+      - body.derivedPlan 未指定時は legacy フィールドから構築。両方空なら {summary: True}。
     """
-    Finalize a session after recording/sync completes.
-    Rebuilds transcriptText from chunks and enqueues requested jobs.
-    """
+    from app.services import finalize as finalize_service
+    from app.services.transcripts import count_transcript_chunks
+
     doc_ref, doc, resolved_id = _resolve_session(session_id, current_user.uid)
     data = doc.to_dict()
     ensure_is_owner(data, current_user, resolved_id)
 
-    # 1. Rebuild transcript from chunks
+    # 1. Rebuild transcript from chunks(legacy と同様)
     transcript_text = await resolve_transcript_text_async(resolved_id, data)
-    update_data = {
-        "status": "録音済み",
+    update_data: Dict[str, Any] = {
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     if transcript_text:
         update_data["transcriptText"] = transcript_text
         update_data["transcriptTextLen"] = len(transcript_text)
         update_data["hasTranscript"] = True
+    if update_data:
+        doc_ref.update(update_data)
 
-    doc_ref.update(update_data)
+    # 2. Server canonical chunk count
+    chunk_count = await asyncio.to_thread(count_transcript_chunks, resolved_id)
 
-    # 2. Enqueue requested jobs
-    jobs = []
+    # 3. import source 推定(既存 importState.source があれば尊重、なければ legacy 推定)
+    import_state = (data or {}).get("importState") or {}
+    import_source = import_state.get("source")
+    if not import_source:
+        mode = (data or {}).get("transcriptionMode") or ""
+        if "youtube" in mode or (data or {}).get("youtubeUrl"):
+            import_source = "youtube"
+        elif "upload" in mode:
+            import_source = "upload"
+        elif "cloud" in mode:
+            import_source = "cloud"
+        else:
+            import_source = "device"
+
     account_id = current_user.account_id or current_user.uid
 
-    if body.generateSummary and transcript_text:
-        try:
-            allowed, info = await cost_guard.guard_can_consume(account_id, "summary_generated", 1.0, user_id=current_user.uid)
-            if allowed:
-                enqueue_summarize_quick_task(resolved_id, user_id=current_user.uid, idempotency_key=f"finalize_quick:{resolved_id}")
-                job_id = enqueue_summarize_task(resolved_id, user_id=current_user.uid, usage_reserved=True)
-                jobs.append({"type": "summary", "jobId": job_id})
-            else:
-                jobs.append({"type": "summary", "status": "blocked", "reason": (info or {}).get("rule")})
-        except Exception as e:
-            logger.warning(f"[finalize] Failed to enqueue summary for {resolved_id}: {e}")
-            jobs.append({"type": "summary", "status": "error"})
+    # 4. finalize v2 service へ委譲
+    try:
+        result = await asyncio.to_thread(
+            finalize_service.finalize_session_v2,
+            session_id=resolved_id,
+            session_data=data or {},
+            uid=current_user.uid,
+            account_id=account_id,
+            transcript_text=transcript_text,
+            chunk_count=int(chunk_count or 0),
+            last_chunk_index=None,
+            import_source=import_source,
+            derived_plan_req=body.derivedPlan,
+            client_request_id=body.clientRequestId,
+            expected_chunk_count=body.expectedChunkCount,
+            legacy_generate_summary=body.generateSummary,
+            legacy_generate_playlist=body.generatePlaylist,
+            legacy_generate_quiz=body.generateQuiz,
+        )
+    except finalize_service.ChunkCountMismatchError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "chunk_count_mismatch", "message": str(exc)},
+        )
+    except finalize_service.credits_reservations.InsufficientCreditsError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "insufficient_credits", "message": str(exc)},
+        )
+    except finalize_service.FinalizeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "finalize_failed", "message": str(exc)},
+        )
 
+    # 5. playlist は derivedPlan に含まれないので legacy 扱いで別途 enqueue(後方互換)
     if body.generatePlaylist and transcript_text:
         try:
-            job_id = enqueue_playlist_task(resolved_id)
-            jobs.append({"type": "playlist", "jobId": job_id})
+            enqueue_playlist_task(resolved_id)
         except Exception as e:
             logger.warning(f"[finalize] Failed to enqueue playlist for {resolved_id}: {e}")
-            jobs.append({"type": "playlist", "status": "error"})
 
-    if body.generateQuiz and transcript_text:
-        try:
-            allowed, info = await cost_guard.guard_can_consume(account_id, "quiz_generated", 1.0, user_id=current_user.uid)
-            if allowed:
-                enqueue_quiz_batch_tasks(resolved_id, user_id=current_user.uid, usage_reserved=True)
-                jobs.append({"type": "quiz", "status": "queued"})
-            else:
-                jobs.append({"type": "quiz", "status": "blocked", "reason": (info or {}).get("rule")})
-        except Exception as e:
-            logger.warning(f"[finalize] Failed to enqueue quiz for {resolved_id}: {e}")
-            jobs.append({"type": "quiz", "status": "error"})
+    return result
 
-    return {
-        "ok": True,
-        "sessionId": resolved_id,
-        "status": "録音済み",
-        "hasTranscript": bool(transcript_text),
-        "transcriptTextLen": len(transcript_text) if transcript_text else 0,
-        "jobs": jobs,
-    }
+
+# ---------- finalize route handlers ---------- #
+# canonical = /sessions/{id}:finalize (Google AIP-136)
+# alias     = /sessions/{id}/finalize (deprecated, 後方互換)
+# 各 handler は _finalize_session_impl に薄く委譲する。
+# 以前はスタックデコレータでシグネチャが崩れて 422 を返していたため、分離した。
+
+@router.post("/sessions/{session_id}:finalize")
+@limiter.limit(RateLimits.HEAVY)
+async def finalize_session(
+    request: Request,
+    session_id: str,
+    body: FinalizeRequest = Body(default=FinalizeRequest()),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    return await _finalize_session_impl(request, session_id, body, current_user)
+
+
+@router.post(
+    "/sessions/{session_id}/finalize",
+    deprecated=True,
+    include_in_schema=False,
+)
+@limiter.limit(RateLimits.HEAVY)
+async def finalize_session_legacy(
+    request: Request,
+    session_id: str,
+    body: FinalizeRequest = Body(default=FinalizeRequest()),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    log_deprecated_path(
+        request,
+        user_id=current_user.uid,
+        canonical_path="/sessions/{session_id}:finalize",
+        route_status="deprecated",
+    )
+    return await _finalize_session_impl(request, session_id, body, current_user)
 
 
 # ---------- SummaryV2: Evidence-based Structured Summary ---------- #
@@ -6022,71 +6447,58 @@ async def get_summary_v2(
     session_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Get structured summary with evidence-based items.
-    """
+    """Get structured summary v2. Unified via to_summary_v2_response mapper (PR1)."""
+    from app.services.firestore_summary_v2 import (
+        get_summary_v2_doc,
+        to_summary_v2_response,
+    )
+
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
 
-    # Check derived doc
-    derived_ref = doc_ref.collection("derived").document("summary_v2")
-    derived_snap = derived_ref.get()
-
-    if not derived_snap.exists:
-        return SummaryV2Response(
-            status="pending",
-            summary=None,
-            jobId=None,
-        )
-
-    derived_data = derived_snap.to_dict() or {}
-    status = derived_data.get("status", "pending")
-
-    if status == "succeeded" or status == "completed":
-        summary_data = derived_data.get("result", {})
-        try:
-            summary = SummaryV2(**summary_data)
-        except Exception as e:
-            logger.warning(f"Failed to parse SummaryV2: {e}")
-            summary = None
-        return SummaryV2Response(
-            status="ready",
-            summary=summary,
-            jobId=derived_data.get("jobId"),
-            updatedAt=derived_data.get("updatedAt"),
-        )
-    elif status == "running":
-        return SummaryV2Response(
-            status="running",
-            jobId=derived_data.get("jobId"),
-            updatedAt=derived_data.get("updatedAt"),
-        )
-    elif status == "failed":
-        return SummaryV2Response(
-            status="failed",
-            errorReason=derived_data.get("errorReason"),
-            jobId=derived_data.get("jobId"),
-            updatedAt=derived_data.get("updatedAt"),
-        )
-    else:
-        return SummaryV2Response(
-            status=status,
-            jobId=derived_data.get("jobId"),
-        )
+    doc = get_summary_v2_doc(session_id)
+    payload = to_summary_v2_response(doc)
+    return SummaryV2Response(**payload)
 
 
-@router.post("/sessions/{session_id}/artifacts/summary_v2:generate")
+@router.post("/sessions/{session_id}/artifacts/summary_v2:generate", status_code=202)
 async def generate_summary_v2_endpoint(
     session_id: str,
     body: SummaryV2GenerateRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """Enqueue SummaryV2 generation.
+
+    PR1: computes transcriptHash + idempotencyKey, dedupes against existing
+    running/succeeded runs, and enqueues the Cloud Tasks worker. Returns
+    202 Accepted with status/jobId/idempotencyKey.
     """
-    Generate structured summary with evidence.
-    Runs as background task.
-    """
+    import os
+    from app.services.summary_v2 import (
+        SUMMARY_V2_PROMPT_VERSION,
+        compute_transcript_hash,
+    )
+    from app.services.firestore_summary_v2 import (
+        get_summary_v2_doc,
+        write_summary_v2_running,
+    )
+    from app.services.transcripts import get_transcript_chunks
+
+    # Feature gate: PR1 endpoint opt-in (default ON; lets ops disable quickly)
+    if os.environ.get("ENABLE_SUMMARY_V2_GENERATE_ENDPOINT", "1") == "0":
+        raise HTTPException(status_code=503, detail="summary_v2 generation disabled")
+
+    if request.url.path.endswith("/artifacts/summary_v2:generate"):
+        log_deprecated_path(
+            request,
+            user_id=current_user.uid,
+            canonical_path="/sessions/{session_id}/artifacts/summary-v2:generate",
+            route_status="alias",
+        )
+
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
     data = snapshot.to_dict()
     ensure_is_owner(data, current_user, session_id)
@@ -6095,101 +6507,101 @@ async def generate_summary_v2_endpoint(
     if not transcript_text:
         raise HTTPException(status_code=400, detail="No transcript available")
 
-    # Check if already running (unless force=True)
-    derived_ref = doc_ref.collection("derived").document("summary_v2")
-    derived_snap = derived_ref.get()
-    if derived_snap.exists and not body.force:
-        derived_data = derived_snap.to_dict() or {}
-        if derived_data.get("status") == "running":
-            return {"status": "already_running", "jobId": derived_data.get("jobId")}
-        if derived_data.get("status") in ["succeeded", "completed"]:
-            return {"status": "already_completed", "jobId": derived_data.get("jobId")}
+    # Compute transcript hash over canonical chunks (stable across retries).
+    try:
+        chunks = get_transcript_chunks(session_id)
+    except Exception:
+        chunks = []
+    transcript_hash = compute_transcript_hash(chunks, fallback_text=transcript_text)
+    idempotency_key = (
+        f"sumv2:{session_id}:{transcript_hash[:16]}:{SUMMARY_V2_PROMPT_VERSION}"
+    )
 
-    # Create job
+    # Dedup against existing run unless explicit force / regenerate.
+    existing = get_summary_v2_doc(session_id)
+    if existing and not (body.force or body.regenerateEvenIfExists):
+        existing_status = (existing.get("status") or "").lower()
+        existing_key = existing.get("idempotencyKey")
+        if existing_status == "running":
+            return {
+                "status": "running",
+                "jobId": existing.get("jobId"),
+                "idempotencyKey": existing_key or idempotency_key,
+            }
+        if existing_status in ("succeeded", "completed") and existing_key == idempotency_key:
+            return {
+                "status": "ready",
+                "jobId": existing.get("jobId"),
+                "idempotencyKey": idempotency_key,
+            }
+
     job_id = f"sumv2_{uuid.uuid4().hex[:8]}"
+    mode_for_meta = (body.meetingType or data.get("mode") or "other")
+
+    write_summary_v2_running(
+        session_id,
+        idempotency_key=idempotency_key,
+        job_id=job_id,
+        prompt_version=SUMMARY_V2_PROMPT_VERSION,
+        transcript_hash=transcript_hash,
+        mode=mode_for_meta,
+    )
+
+    # (legacy path below — retained for transition; will be replaced by
+    # Cloud Tasks worker once /internal/tasks/summary_v2 is wired for PR1.
+    # The write_summary_v2_running above already pinned derived state so
+    # GET endpoint returns "running" immediately.)
+    derived_ref = doc_ref.collection("derived").document("summary_v2")
     now = datetime.now(timezone.utc)
 
-    # Mark as running
-    derived_ref.set({
-        "status": "running",
-        "jobId": job_id,
-        "updatedAt": now,
-        "startedAt": now,
-    }, merge=True)
-
-    # Run in background
-    async def run_summary_v2():
-        try:
-            from app.services.summary_v2 import generate_summary_v2
-
-            summary = await generate_summary_v2(
-                session_id=session_id,
-                transcript_text=transcript_text,
-                diarized_segments=data.get("diarizedSegments"),
-                user_marks=data.get("userMarks"),
-                meeting_purpose=body.meetingPurpose or data.get("meetingPurpose"),
-                meeting_type=body.meetingType or data.get("mode"),
-                participants=body.participants or data.get("participants", []),
-            )
-
-            # Save result
-            derived_ref.set({
-                "status": "succeeded",
-                "result": summary.dict(),
-                "jobId": job_id,
-                "updatedAt": datetime.now(timezone.utc),
-            }, merge=True)
-
-            # Also save rendered markdown to session for compatibility
-            doc_ref.update({
-                "summaryV2Status": "completed",
-                "summaryV2Markdown": summary.renderedMarkdown,
-                "updatedAt": datetime.now(timezone.utc),
-            })
-
-            logger.info(f"[SummaryV2] Generated for {session_id}")
-
-            # [AUTO-TRIGGER] Extract TODOs async via Cloud Tasks (non-blocking, 体感爆速)
+    # Enqueue Cloud Tasks worker (PR1). The existing in-process fallback
+    # remains as a local-dev path when tasks_client is unavailable; prod
+    # routes through /internal/tasks/summary_v2.
+    try:
+        from app.task_queue import enqueue_summary_v2_task
+        enqueue_summary_v2_task(
+            session_id=session_id,
+            job_id=job_id,
+            idempotency_key=idempotency_key,
+            user_id=current_user.uid,
+        )
+    except Exception as enqueue_err:
+        logger.warning(
+            "[SummaryV2] enqueue fallback to in-process: %s", enqueue_err,
+        )
+        # Keep behavior correct if Cloud Tasks unavailable: run synchronously.
+        async def _run_local_fallback():
             try:
-                from app.task_queue import enqueue_todo_extraction_task
-                import hashlib
-
-                # Generate sourceKey from summary content hash for idempotency
-                summary_hash = hashlib.sha256(summary.renderedMarkdown.encode()).hexdigest()[:12]
-                source_key = f"session:{session_id}:artifact:summary_v2:{summary_hash}"
-
-                # Get session mode for appropriate TODO extraction
-                session_mode = data.get("mode", "lecture")
-
-                # Enqueue async - returns immediately, TODO extraction happens in background
-                enqueue_todo_extraction_task(
+                from app.services.summary_v2 import generate_summary_v2
+                summary = await generate_summary_v2(
                     session_id=session_id,
-                    account_id=current_user.account_id,
-                    source_key=source_key,
-                    summary_text=summary.renderedMarkdown,
                     transcript_text=transcript_text,
-                    mode=session_mode,
-                    user_id=current_user.user_id,
+                    diarized_segments=data.get("diarizedSegments"),
+                    user_marks=data.get("userMarks"),
+                    meeting_purpose=body.meetingPurpose or data.get("meetingPurpose"),
+                    meeting_type=body.meetingType or data.get("mode"),
+                    participants=body.participants or data.get("participants", []),
                 )
-                logger.info(f"[SummaryV2→TODO] Enqueued async TODO extraction (mode={session_mode})")
-            except Exception as todo_err:
-                # Don't fail the whole summary if TODO enqueue fails
-                logger.warning(f"[SummaryV2→TODO] Failed to enqueue TODO extraction (non-blocking): {todo_err}")
-
-        except Exception as e:
-            logger.exception(f"[SummaryV2] Failed for {session_id}: {e}")
-            derived_ref.set({
-                "status": "failed",
-                "errorReason": str(e)[:500],
-                "jobId": job_id,
-                "updatedAt": datetime.now(timezone.utc),
-            }, merge=True)
-
-    background_tasks.add_task(run_summary_v2)
+                derived_ref.set({
+                    "status": "succeeded",
+                    "result": summary.model_dump(),
+                    "jobId": job_id,
+                    "updatedAt": datetime.now(timezone.utc),
+                }, merge=True)
+            except Exception as exc:
+                logger.exception("[SummaryV2] local fallback failed: %s", exc)
+                derived_ref.set({
+                    "status": "failed",
+                    "errorReason": str(exc)[:500],
+                    "jobId": job_id,
+                    "updatedAt": datetime.now(timezone.utc),
+                }, merge=True)
+        background_tasks.add_task(_run_local_fallback)
 
     return {
-        "status": "started",
+        "status": "pending",
         "jobId": job_id,
+        "idempotencyKey": idempotency_key,
         "statusUrl": f"/sessions/{session_id}/artifacts/summary_v2",
     }
 
@@ -6198,11 +6610,20 @@ async def generate_summary_v2_endpoint(
 async def submit_summary_v2_feedback(
     session_id: str,
     body: SummaryV2FeedbackRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Submit feedback for a summary item.
     """
+    if request.url.path.endswith("/artifacts/summary_v2:feedback"):
+        log_deprecated_path(
+            request,
+            user_id=current_user.uid,
+            canonical_path="/sessions/{session_id}/artifacts/summary-v2:feedback",
+            route_status="alias",
+        )
+
     doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)

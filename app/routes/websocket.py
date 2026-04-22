@@ -276,7 +276,10 @@ async def ws_stream(websocket: WebSocket, session_id: str):
             return
         
         # Limit checks for Free Plan (Credit Based)
-        uid = session_data.get("userId") or session_data.get("ownerUserId") or session_data.get("ownerId")
+        # SECURITY: keep the authenticated caller's uid (set on L251). The previous
+        # implementation overwrote it with session_data.userId, which meant any
+        # viewer (shared account) opening the WS would consume the session owner's
+        # quota and be rate-limited/locked under the owner's identity.
         if uid:
             # [FIX] Fetch accountId for unified quota management
             # PHASE 1: Always use mode="user" since accounts/{accountId} doesn't have plan field yet

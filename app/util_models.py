@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field, computed_field, ConfigDict
+from pydantic import BaseModel, Field, computed_field, ConfigDict, field_validator, model_validator
 from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime, timezone
 
@@ -80,6 +80,7 @@ class AsyncJobType(str, Enum):
     QUIZ = "quiz"
     TRANSCRIPT = "transcript"
     PLAYLIST = "playlist"
+    TIMELINE = "timeline"
 
 
 class AsyncJobStatus(str, Enum):
@@ -178,6 +179,7 @@ class CreateSessionRequest(BaseModel):
     createdAt: Optional[datetime] = None
     durationSec: Optional[float] = None  # [WATCH] Pre-calculated duration for offline-first sessions
     source: str = "ios" # [NEW] Tracking origin
+    folderId: Optional[str] = None
 
 class UpdateSessionRequest(BaseModel):
     """PATCH 部分更新。指定したフィールドだけ更新。"""
@@ -591,7 +593,6 @@ class CloudUsageReport(BaseModel):
         return self.reasonIfBlocked
 
 class MeResponse(BaseModel):
-    id: Optional[str] = None  # iOS expects this field (alias for uid)
     uid: str
     displayName: Optional[str] = None
     username: Optional[str] = None  # [NEW]
@@ -617,7 +618,6 @@ class MeResponse(BaseModel):
     freeCloudCreditsRemaining: Optional[int] = None
     freeSummaryCreditsRemaining: Optional[int] = None
     freeQuizCreditsRemaining: Optional[int] = None
-    activeSessionCount: Optional[int] = None  # Compat alias for serverSessionCount
     
     # [NEW 2026-01] Session Limits for Free Plan
     serverSessionCount: Optional[int] = None  # Current count of server-saved sessions
@@ -628,9 +628,6 @@ class MeResponse(BaseModel):
     # [vNext] Consolidated Cloud Usage Report
     cloud: Optional[CloudUsageReport] = None
 
-    # [FIX] iOS互換性: cloudMinutesUsed/cloudMinutesLimit フィールド
-    cloudMinutesUsed: Optional[float] = None
-    cloudMinutesLimit: Optional[float] = None
 
     # [Security] App Store Receipt Validation
     appAccountToken: Optional[str] = None  # [NEW] UUID for StoreKit 2
@@ -666,6 +663,14 @@ class MeResponse(BaseModel):
     inviteRedeemed: bool = False             # Whether user has redeemed an invite code
     inviteBonusSummary: int = 0              # Bonus summary credits from invite
     inviteBonusQuiz: int = 0                 # Bonus quiz credits from invite
+
+
+class LegacyMeResponse(MeResponse):
+    """v1 compatibility response (legacy aliases)."""
+    id: Optional[str] = None
+    activeSessionCount: Optional[int] = None
+    cloudMinutesUsed: Optional[float] = None
+    cloudMinutesLimit: Optional[float] = None
 
 
 class FeatureGates(BaseModel):
@@ -889,20 +894,17 @@ class SessionResponse(BaseModel):
     source: Optional[str] = None # [NEW]
     title: str
     mode: str
-    userId: str
     status: str
     createdAt: datetime
     tags: Optional[List[str]] = None  # User-defined tags (max 4)
     # Sharing fields
     isOwner: Optional[bool] = None
     sharedWithCount: Optional[int] = None
-    sharedWithCount: Optional[int] = None
     sharedUserIds: Optional[List[str]] = []
     reactionCounts: Optional[Dict[str, int]] = {} # [NEW]
     
     # [NEW] Source of Truth fields
     canManage: Optional[bool] = None # [NEW] Explicit permission flag
-    ownerUserId: Optional[str] = None
     ownerId: Optional[str] = None # [NEW] Legacy alias for backward compatibility
     ownerAccountId: Optional[str] = None # [NEW] Account-based ownership
     participantUserIds: List[str] = []
@@ -913,7 +915,6 @@ class SessionResponse(BaseModel):
     
     # [NEW] Job Statuses per feature
     # [FIX] Default None (not "pending") — auto-triggers disabled, "pending" locks iOS UI
-    summaryStatus: Optional[str] = None
     quizStatus: Optional[str] = None
     diarizationStatus: Optional[str] = None
     highlightsStatus: Optional[str] = None
@@ -926,11 +927,8 @@ class SessionResponse(BaseModel):
     startedAt: Optional[datetime] = None
     endedAt: Optional[datetime] = None
     durationSec: Optional[float] = None
-    hasTranscript: bool = False # Helper for client efficiency
 
     # [NEW] Audio metadata for iOS download sync (no extra API call needed)
-    hasAudio: bool = False
-    audioSizeBytes: Optional[int] = None
     audioSha256: Optional[str] = None
     audioUpdatedAt: Optional[datetime] = None
     audioContentType: Optional[str] = None
@@ -943,6 +941,31 @@ class SessionResponse(BaseModel):
     # [NEW] Cloud STT availability (for instant fallback decision on iOS)
     cloudAvailable: Optional[bool] = None  # True if cloud STT is available right now
     quotaRemainingSeconds: Optional[float] = None  # Remaining cloud STT quota in seconds
+
+    # [Canonical] Phase A — 新構造化フィールド (旧フィールドと並行返却)
+    audio: Optional[dict] = None       # AudioInfo: {status, storagePath, sizeBytes, ...}
+    transcript: Optional[dict] = None  # TranscriptInfo: {status, source, textLength, ...}
+    summary: Optional[dict] = None     # SummaryInfo: {status, type, outcome, suggestedTitle, ...}
+    suggestedTitle: Optional[str] = None  # LLM 提案タイトル
+
+    # Derived booleans surfaced to clients (iOS list view)
+    hasSummary: Optional[bool] = None
+    hasQuiz: Optional[bool] = None
+
+    # Folder organization
+    folderId: Optional[str] = None
+
+
+class LegacySessionResponse(SessionResponse):
+    """v1 compatibility response (legacy aliases)."""
+    userId: Optional[str] = None
+    ownerUid: Optional[str] = None
+    ownerUserId: Optional[str] = None
+    hasAudio: Optional[bool] = None
+    audioSizeBytes: Optional[int] = None
+    hasTranscript: Optional[bool] = None
+    summaryStatus: Optional[str] = None
+
 
 class SessionMetaUpdateRequest(BaseModel):
     isPinned: Optional[bool] = None
@@ -1016,23 +1039,15 @@ class SessionDetailResponse(SessionResponse):
     diarizedSegments: Optional[List[dict]] = None
     
     # Audio availability
-    audioStatus: Optional[AudioStatus] = AudioStatus.UNKNOWN
     audioMeta: Optional[AudioMeta] = None  # [NEW]
     
     # AI Results
-    summaryStatus: Optional[JobStatus] = None
-    summaryError: Optional[str] = None
-    summaryMarkdown: Optional[str] = None
-    summaryJson: Optional[dict] = None
-    summaryJsonVersion: Optional[int] = None
-    summaryType: Optional[str] = None
     tags: List[str] = []
     imageNotes: List[ImageNoteDTO] = [] # [NEW]
 
     
     # [NEW] Batch Retranscribe State
     transcriptState: str = "partial" # "partial" | "final"
-    transcriptTextLen: int = 0
     batchRetranscribeState: str = "idle" # "idle"|"running"|"completed"|"failed"
     batchRetranscribeUsed: bool = False
     
@@ -1044,13 +1059,22 @@ class SessionDetailResponse(SessionResponse):
     playlistStatus: Optional[JobStatus] = None # Optional, as older sessions might not have it
     playlist: Optional[List[PlaylistItem]] = None
     
-    audioPath: Optional[str] = None
     speakers: Optional[List[dict]] = None
-    diarizedSegments: Optional[List[dict]] = None
     
     # Flags
     hasSummary: bool = False
     hasQuiz: bool = False
+
+
+class LegacySessionDetailResponse(SessionDetailResponse):
+    """v1 compatibility response (legacy aliases)."""
+    audioPath: Optional[str] = None
+    audioStatus: Optional[str] = None
+    summaryMarkdown: Optional[str] = None
+    summaryJson: Optional[dict] = None
+    summaryType: Optional[str] = None
+    summaryJsonVersion: Optional[int] = None
+    transcriptionMode: Optional[str] = None
 
 
 # --- Auth Models ---
@@ -1296,6 +1320,17 @@ class SummaryV2ItemType(str, Enum):
     NOTE = "note"
 
 
+class SummaryV2Category(str, Enum):
+    """Semantic category for summary items (議事録ハイライト分類)."""
+    DECISION = "decision"       # 決定事項
+    TODO = "todo"               # 次のアクション
+    CONCERN = "concern"         # 懸念・問題
+    INSIGHT = "insight"         # 気づき
+    FACT = "fact"               # 事実共有
+    DISCUSSION = "discussion"   # 雑談・会話メモ
+    OTHER = "other"
+
+
 class SummaryV2ItemStatus(str, Enum):
     """Status for action items."""
     TODO = "todo"
@@ -1305,49 +1340,133 @@ class SummaryV2ItemStatus(str, Enum):
 
 
 class EvidenceRef(BaseModel):
-    """Reference to transcript evidence for a summary item."""
-    startMs: int
-    endMs: int
+    """Reference to transcript evidence for a summary item.
+
+    PR1: segmentIds is the authoritative input from the LLM; startMs/endMs/text
+    are resolved server-side by anchor_resolver from chunks_by_id.
+    """
     segmentIds: List[str] = []
-    text: Optional[str] = None  # Excerpt from transcript
+    startMs: Optional[int] = None
+    endMs: Optional[int] = None
+    text: str = ""
 
 
 class SummaryV2Item(BaseModel):
-    """A single item in the structured summary with evidence."""
+    """A single item in the structured summary with evidence and timestamp link."""
     id: str
     type: SummaryV2ItemType
-    text: str
-    owner: Optional[str] = None       # Person responsible (for actions)
-    dueDate: Optional[str] = None     # Due date (for actions)
+    text: str                                          # 議事録調の要約文 (35-90文字)
+    shortText: Optional[str] = None                    # 短縮版 (UI一覧用, max 50文字)
+    category: str = "other"                            # SummaryV2Category value
+    importanceScore: float = Field(default=0.5, ge=0.0, le=1.0)
+    anchorMs: Optional[int] = None                     # タイムスタンプリンク用の代表時刻 (ms)
+    speakerIds: List[str] = []                         # 関連する話者ID群
+    owner: Optional[str] = None                        # 担当者 (for actions)
+    dueDate: Optional[str] = None                      # 期限 (for actions)
     status: SummaryV2ItemStatus = SummaryV2ItemStatus.UNKNOWN
     evidence: List[EvidenceRef] = []
     support: EvidenceSupport = EvidenceSupport.NONE
-    confidence: float = 0.0           # 0.0 - 1.0
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    orderIndex: int = 0                                # 表示順序
+    userEdited: bool = False                           # PR1: edit protection
+    hidden: bool = False                               # PR1: user hid this item
 
 
 class SummaryV2Quality(BaseModel):
     """Quality metrics for the summary."""
-    unsupportedCount: int = 0
-    partialCount: int = 0
     fullCount: int = 0
+    partialCount: int = 0
+    unsupportedCount: int = 0
     avgConfidence: float = 0.0
+    filteredCount: int = 0                             # PR1: items dropped by gate
+
+
+class LectureSection(BaseModel):
+    """One section of a lecture-style summary."""
+    title: str
+    summary: Optional[str] = None
+    bullets: List[str] = []
+
+
+class LectureTerm(BaseModel):
+    """A term (definition) introduced in a lecture."""
+    term: str
+    definition: Optional[str] = None
+
+
+class LectureExercise(BaseModel):
+    """A lecture exercise / practice question."""
+    prompt: str
+    answer: Optional[str] = None
+
+
+class SummaryV2LectureAddendum(BaseModel):
+    """Lecture-specific extensions (populated only when meetingType=='lecture')."""
+    theme: Optional[str] = None
+    sections: List[LectureSection] = []
+    studyGuide: Optional[str] = None
+    terms: List[LectureTerm] = []
+    exercises: List[LectureExercise] = []
+    formulasOrProcedures: List[str] = []
+
+
+_ALLOWED_MEETING_TYPES = {"lecture", "meeting", "translate", "interview", "other"}
 
 
 class SummaryV2(BaseModel):
-    """Structured summary with evidence-based items."""
-    version: int = 1
+    """Structured summary with evidence-based items (PR1: v2 / schema 2.0)."""
+    version: int = 2
+    schemaVersion: str = "2.0"
     generatedAt: Optional[datetime] = None
+    suggestedTitle: Optional[str] = None
+    headline: Optional[str] = None
+    overview: Optional[str] = None
+    keywords: List[str] = []
     meetingPurpose: Optional[str] = None
     meetingType: Optional[str] = None
     participants: List[str] = []
     items: List[SummaryV2Item] = []
     renderedMarkdown: Optional[str] = None
     quality: Optional[SummaryV2Quality] = None
+    lectureAddendum: Optional[SummaryV2LectureAddendum] = None
+
+    @field_validator("version")
+    @classmethod
+    def _lock_version(cls, v):
+        if v != 2:
+            raise ValueError("SummaryV2.version must be 2")
+        return v
+
+    @field_validator("schemaVersion")
+    @classmethod
+    def _lock_schema(cls, v):
+        if v != "2.0":
+            raise ValueError("SummaryV2.schemaVersion must be '2.0'")
+        return v
+
+    @field_validator("meetingType")
+    @classmethod
+    def _validate_meeting_type(cls, v):
+        if v is None:
+            return v
+        if v not in _ALLOWED_MEETING_TYPES:
+            raise ValueError(
+                f"meetingType must be one of {_ALLOWED_MEETING_TYPES} or None"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _lecture_addendum_requires_lecture_mode(self):
+        if self.lectureAddendum is not None and self.meetingType != "lecture":
+            # Silent normalization (PR1): strip non-lecture addenda rather than raise,
+            # so LLM misclassification doesn't hard-fail the whole summary.
+            object.__setattr__(self, "lectureAddendum", None)
+        return self
 
 
 class SummaryV2Response(BaseModel):
     """Response for GET /artifacts/summary_v2."""
-    status: str  # "ready", "running", "pending", "failed"
+    status: Literal["pending", "running", "ready", "failed"]
     summary: Optional[SummaryV2] = None
     jobId: Optional[str] = None
     updatedAt: Optional[datetime] = None
@@ -1360,21 +1479,28 @@ class SummaryV2GenerateRequest(BaseModel):
     meetingType: Optional[str] = None
     participants: List[str] = []
     force: bool = False
+    regenerateEvenIfExists: bool = False
 
 
 class SummaryV2FeedbackRequest(BaseModel):
     """Request for POST /artifacts/summary_v2:feedback."""
-    itemId: str
-    action: Literal["accept", "edit", "reject"]
+    itemId: Optional[str] = None
+    feedbackType: Literal[
+        "incorrect", "missing", "helpful", "hidden_by_user", "edited_by_user",
+        # Legacy aliases retained for backward compat:
+        "accept", "edit", "reject",
+    ]
+    action: Optional[Literal["accept", "edit", "reject"]] = None  # legacy
     editedText: Optional[str] = None
     correctedEvidence: Optional[List[EvidenceRef]] = None
     comment: Optional[str] = None
+    value: Optional[int] = None
 
 
 class SummaryV2FeedbackResponse(BaseModel):
     """Response for feedback submission."""
     ok: bool
-    itemId: str
+    itemId: Optional[str] = None
     action: str
 
 
