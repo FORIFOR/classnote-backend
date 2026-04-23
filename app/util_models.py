@@ -1616,6 +1616,62 @@ class TermHintsResponse(BaseModel):
     terms: List[TermHint] = []
 
 
+# ===========================================================================
+# Lifeselect Integration (PR3): partner order / cancel API
+# ===========================================================================
+
+class LifeselectIssueObject(BaseModel):
+    """Issued credentials returned on successful order."""
+    cp_identifier: str = ""
+    licence_key: str = ""
+
+
+class LifeselectErrorObject(BaseModel):
+    """Error payload block; empty fields indicate success."""
+    code: str = ""
+    msg: str = ""
+    detail: str = ""
+
+
+class LifeselectOrderRequest(BaseModel):
+    """POST /v1/integrations/lifeselect/orders."""
+    identifier: str = Field(
+        ...,
+        pattern=r"^[A-Z0-9]{2,3}$",
+        description="識別コード (2-3 chars, uppercase alnum)",
+    )
+    link_mng_id: str = Field(
+        ...,
+        pattern=r"^\d{7}$",
+        description="申込番号 (7 digits)",
+    )
+    contract_date: str = Field(
+        ...,
+        pattern=r"^\d{8}$",
+        description="申込日 YYYYMMDD",
+    )
+
+
+class LifeselectCancelRequest(BaseModel):
+    """POST /v1/integrations/lifeselect/cancellations."""
+    identifier: str = Field(..., pattern=r"^[A-Z0-9]{2,3}$")
+    link_mng_id: str = Field(..., pattern=r"^\d{7}$")
+    cp_identifier: str = Field(..., min_length=1)
+    licence_key: str = Field(..., min_length=1)
+    cancel_date: str = Field(..., pattern=r"^\d{8}$", description="解約日 YYYYMMDD")
+
+
+class LifeselectOrderResponse(BaseModel):
+    rtn: bool
+    issue: LifeselectIssueObject = Field(default_factory=LifeselectIssueObject)
+    error: LifeselectErrorObject = Field(default_factory=LifeselectErrorObject)
+
+
+class LifeselectCancelResponse(BaseModel):
+    rtn: bool
+    error: LifeselectErrorObject = Field(default_factory=LifeselectErrorObject)
+
+
 class UserMarkType(str, Enum):
     """Types of user marks during recording."""
     DECISION = "decision"
