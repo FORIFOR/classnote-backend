@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Any, Tuple
+import asyncio
 
 from app.firebase import db
 
@@ -98,14 +99,18 @@ def get_transcript_chunks_paginated(
 
 
 def count_transcript_chunks(session_id: str) -> int:
+    """Count transcript chunks using aggregation query (fast) with stream fallback."""
     ref = db.collection("sessions").document(session_id).collection("transcript_chunks")
-    count = 0
+    # ★ Use Firestore aggregation count (single round-trip, no document streaming)
     try:
-        for _ in ref.select([]).stream():
-            count += 1
+        count_result = ref.count().get()
+        return count_result[0][0].value if count_result else 0
     except Exception:
-        pass
-    return count
+        # Fallback: count via select (more efficient than full stream)
+        try:
+            return sum(1 for _ in ref.select([]).stream())
+        except Exception:
+            return 0
 
 
 def build_transcript_text_from_chunks(chunks: List[Dict[str, Any]]) -> Optional[str]:
@@ -119,13 +124,62 @@ def build_transcript_text_from_chunks(chunks: List[Dict[str, Any]]) -> Optional[
     return "\n".join([t for t in texts if t])
 
 
+def _read_canonical_text(session_id: str) -> Optional[str]:
+    """PR2: prefer canonical transcript when present.
+
+    Safe no-op for sessions without canonical — returns None quickly.
+    Direct Firestore read to avoid import cycle with entity_review_store.
+    """
+    try:
+        ref = (
+            db.collection("sessions").document(session_id)
+            .collection("derived").document("canonical_transcript")
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        text = data.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception:
+        # Never fail the fallback chain on canonical read errors.
+        return None
+    return None
+
+
 def resolve_transcript_text(
     session_id: str,
     session_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
+    # PR2: canonical (user-corrected) transcript is the authoritative
+    # source when available. All summary / TODO / highlights consumers
+    # benefit transparently — there is no legacy flat-text path change.
+    canonical = _read_canonical_text(session_id)
+    if canonical:
+        return canonical
     if session_data:
         transcript = session_data.get("transcriptText")
         if transcript:
             return transcript
     chunks = get_transcript_chunks(session_id)
     return build_transcript_text_from_chunks(chunks)
+
+
+async def resolve_transcript_text_async(
+    session_id: str,
+    session_data: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    [PERF] Async version — offloads sync Firestore .stream() to a thread
+    so it doesn't block the event loop.
+    """
+    # PR2: canonical preferred; offload to thread.
+    canonical = await asyncio.to_thread(_read_canonical_text, session_id)
+    if canonical:
+        return canonical
+    if session_data:
+        transcript = session_data.get("transcriptText")
+        if transcript:
+            return transcript
+    return await asyncio.to_thread(resolve_transcript_text, session_id)

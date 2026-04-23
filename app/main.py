@@ -45,7 +45,7 @@ def _check_env_vars():
 
 _check_env_vars()
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, projects, session_details, chat_v1, chat_conversations, chat_actions, admin_costs
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, projects, session_details, chat_v1, chat_conversations, chat_actions, admin_costs, entity_review
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -247,6 +247,7 @@ app.include_router(chat_v1.router)            # /v1/chat — session-first AI ch
 app.include_router(chat_conversations.router) # /v1/chat/conversations — conversation CRUD (Phase 7.4)
 app.include_router(chat_actions.router)       # /v1/chat/actions — execute chat actions (Phase 7.5)
 app.include_router(admin_costs.router)        # /admin/costs/* — cost observability (Phase cost.1)
+app.include_router(entity_review.router, tags=["Entity Review"])  # /v1/sessions/{id}/entity-review + /term-hints (PR2)
 app.include_router(projects.router, tags=["Projects"])
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)
 app.include_router(websocket.router, tags=["Streaming"])

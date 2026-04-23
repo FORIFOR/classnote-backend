@@ -1394,6 +1394,81 @@ async def handle_summary_v2_task(request: Request):
 # causes the second one to override the first.
 
 # =============================================================================
+# PR2 — Entity Review internal worker
+# =============================================================================
+
+@router.post(
+    "/internal/tasks/entity-review-run",
+    dependencies=[Depends(verify_cloud_tasks_request)],
+)
+async def handle_entity_review_run_task(request: Request):
+    """Run entity-review candidate extraction from canonical transcript.
+
+    Idempotent: if the latest review is already pending we short-circuit so
+    Cloud Tasks retries don't produce duplicate review docs.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    session_id = payload.get("sessionId")
+    user_id = payload.get("userId")
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+
+    from app.services import entity_review_services as svc
+    from app.services import entity_review_store as store
+
+    # Idempotency: skip if latest review already pending.
+    latest = store.get_latest_review(session_id)
+    if latest and latest.get("status") == "pending":
+        logger.info(
+            "[entity_review_run] skipping: session=%s already has pending review %s",
+            session_id, latest.get("reviewId"),
+        )
+        return {"status": "skipped", "reason": "already_pending"}
+
+    canonical = store.get_canonical_transcript(session_id)
+    if not canonical:
+        logger.info("[entity_review_run] skipping: no canonical for %s", session_id)
+        return {"status": "skipped", "reason": "canonical_missing"}
+
+    known_terms: list[str] = []
+    if user_id:
+        for t in store.list_terms_for_user(user_id):
+            c = t.get("canonical")
+            if c:
+                known_terms.append(c)
+            for a in t.get("aliases") or []:
+                if a and a not in known_terms:
+                    known_terms.append(a)
+
+    candidates = svc.build_candidates(
+        text=canonical.get("text") or "",
+        known_terms=known_terms,
+    )
+    review = store.create_review(
+        session_id,
+        source_transcript_version=int(canonical.get("version", 1)),
+        candidate_count=len(candidates),
+        language=canonical.get("language", "ja"),
+    )
+    if candidates:
+        store.save_candidates(session_id, review["reviewId"], candidates)
+    store.update_entity_review_status(
+        session_id,
+        "pending" if candidates else "none",
+        review["reviewId"] if candidates else None,
+    )
+    logger.info(
+        "event=entity_review_run sessionId=%s reviewId=%s candidates=%d",
+        session_id, review["reviewId"], len(candidates),
+    )
+    return {"status": "completed", "reviewId": review["reviewId"], "candidates": len(candidates)}
+
+
+# =============================================================================
 # PR E — Derived Finalize Worker
 # =============================================================================
 # /internal/tasks/derived/finalize は finalize v2 (PR D) の per-feature 派生ジョブ

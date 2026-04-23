@@ -45,10 +45,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
 #   ENABLE_SUMMARY_V2_FINALIZE     — turn on v2 auto-generation at finalize
 #   ENABLE_SUMMARY_QUICK_FINALIZE  — turn on quick-summary auto-generation
 #   SUMMARY_PIPELINE_MODE          — v1_only | dual | v2_only (overrides the above)
+# PR2 feature flag:
+#   ENABLE_ENTITY_REVIEW_FINALIZE  — enqueue entity-review-run on finalize
 #
-# Defaults err on cost-safe side: only v1 runs. Ops flip flags to enable v2.
+# Defaults err on cost-safe side: only v1 runs; entity review is opt-in.
 ENABLE_SUMMARY_V2_FINALIZE = _env_bool("ENABLE_SUMMARY_V2_FINALIZE", default=False)
 ENABLE_SUMMARY_QUICK_FINALIZE = _env_bool("ENABLE_SUMMARY_QUICK_FINALIZE", default=False)
+ENABLE_ENTITY_REVIEW_FINALIZE = _env_bool("ENABLE_ENTITY_REVIEW_FINALIZE", default=False)
 SUMMARY_PIPELINE_MODE = os.environ.get("SUMMARY_PIPELINE_MODE", "v1_only").strip().lower()
 if SUMMARY_PIPELINE_MODE not in {"v1_only", "dual", "v2_only"}:
     logger.warning(
@@ -367,6 +370,34 @@ def finalize_session_v2(
         )
     except Exception as exc:
         logger.warning(f"[finalize_v2] organization refresh skipped: {exc}")
+
+    # PR2: canonical transcript v1 is always saved on finalize success so
+    # downstream summary / TODO / highlights can treat it as source-of-truth.
+    # It is a single shallow Firestore write (no LLM), safe to run for every
+    # session. Entity-review extraction (the LLM-free but still-scanning job)
+    # is gated by ENABLE_ENTITY_REVIEW_FINALIZE so we can dark-launch it.
+    try:
+        if transcript_text:
+            from app.services import entity_review_store as _ers
+            _ers.save_canonical_transcript(
+                session_id,
+                version=1,
+                text=transcript_text,
+                base_version=1,
+                patch_count=0,
+                source="initial_finalize",
+                language=(session_data or {}).get("language", "ja"),
+            )
+            _ers.update_canonical_version(session_id, 1)
+    except Exception as exc:
+        logger.warning(f"[finalize_v2] canonical transcript save skipped: {exc}")
+
+    if ENABLE_ENTITY_REVIEW_FINALIZE:
+        try:
+            from app.task_queue import enqueue_entity_review_run_task
+            enqueue_entity_review_run_task(session_id=session_id, user_id=uid)
+        except Exception as exc:
+            logger.warning(f"[finalize_v2] entity-review enqueue skipped: {exc}")
 
     audit.emit(
         "session.finalize.enqueued",
