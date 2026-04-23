@@ -1504,6 +1504,118 @@ class SummaryV2FeedbackResponse(BaseModel):
     action: str
 
 
+# ===========================================================================
+# Entity Review (PR2): canonical transcript corrections + term memory
+# ===========================================================================
+
+EntityType = Literal[
+    "person", "company", "product", "project", "library",
+    "model", "api", "platform", "unknown",
+]
+DecisionAction = Literal["replace_all", "replace_once", "keep", "ignore"]
+EntityReviewStatus = Literal["none", "pending", "applied", "skipped", "failed"]
+
+
+class EntityReviewSuggestion(BaseModel):
+    """One suggested replacement for a suspected entity surface."""
+    value: str
+    score: float = Field(ge=0.0, le=1.0)
+
+
+class EntityReviewOccurrence(BaseModel):
+    """Where the surface appears in the transcript."""
+    segmentId: Optional[str] = None
+    startMs: Optional[int] = None
+    endMs: Optional[int] = None
+    snippet: str = ""
+
+
+class EntityReviewCandidate(BaseModel):
+    """A single entity-review candidate bubble the user reviews."""
+    candidateId: str
+    surface: str
+    normalized: str = ""
+    entityType: EntityType = "unknown"
+    suspicionScore: float = Field(ge=0.0, le=1.0)
+    reasons: List[str] = []
+    occurrenceCount: int = 0
+    occurrences: List[EntityReviewOccurrence] = []
+    suggestions: List[EntityReviewSuggestion] = []
+    decision: Literal["unreviewed", "replace_all", "replace_once", "keep", "ignore"] = "unreviewed"
+    replacement: Optional[str] = None
+
+
+class EntityReviewSummary(BaseModel):
+    """Parent review doc summary (without the candidates subcollection)."""
+    reviewId: str
+    status: EntityReviewStatus = "pending"
+    sourceTranscriptVersion: int
+    candidateCount: int = 0
+    appliedCount: int = 0
+    skippedCount: int = 0
+    language: str = "ja"
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+
+
+class EntityReviewResponse(BaseModel):
+    """GET /v1/sessions/{id}/entity-review."""
+    ok: bool = True
+    review: Optional[EntityReviewSummary] = None
+    candidates: List[EntityReviewCandidate] = []
+
+
+class ApplyDecision(BaseModel):
+    """One user decision on a single candidate."""
+    candidateId: str
+    action: DecisionAction
+    replacement: Optional[str] = None
+    learnTerm: bool = True
+
+
+class RegenerateOptions(BaseModel):
+    """What to re-enqueue after canonical transcript is updated."""
+    summary: bool = True
+    summary_v2: bool = False  # opt-in; default off to mirror PR1 cost stance
+    todos: bool = True
+    highlights: bool = True
+    quiz: bool = False
+
+
+class ApplyEntityReviewRequest(BaseModel):
+    """POST /v1/sessions/{id}/entity-review/apply."""
+    reviewId: str
+    decisions: List[ApplyDecision]
+    regenerate: RegenerateOptions = RegenerateOptions()
+
+
+class SkipEntityReviewRequest(BaseModel):
+    """POST /v1/sessions/{id}/entity-review/skip."""
+    reviewId: str
+
+
+class ApplyEntityReviewResponse(BaseModel):
+    ok: bool = True
+    canonicalTranscriptVersion: int
+    patchCount: int
+    regenerationEnqueued: bool
+
+
+class TermHint(BaseModel):
+    """Single term hint pushed to the next recording's STT/post-process."""
+    canonical: str
+    aliases: List[str] = []
+    entityType: EntityType = "unknown"
+    priority: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class TermHintsResponse(BaseModel):
+    """GET /v1/sessions/{id}/term-hints."""
+    ok: bool = True
+    version: int = 1
+    terms: List[TermHint] = []
+
+
 class UserMarkType(str, Enum):
     """Types of user marks during recording."""
     DECISION = "decision"

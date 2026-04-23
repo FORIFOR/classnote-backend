@@ -533,6 +533,34 @@ def enqueue_summary_v2_task(
     return job_id
 
 
+def enqueue_entity_review_run_task(
+    session_id: str,
+    user_id: str | None = None,
+) -> None:
+    """PR2: kick /internal/tasks/entity-review-run for post-finalize extraction.
+
+    No-op if local-tasks mode and no loop is running (local dev just relies
+    on the HTTP endpoint being callable directly).
+    """
+    payload = {"sessionId": session_id, "userId": user_id}
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"[entity-review-run] local mode, skip enqueue: {session_id}")
+        return
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/entity-review-run"
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 300},  # 5 mins is plenty for extraction
+    }
+    _create_task_nonblocking(parent, task)
+    logger.info(f"[entity-review-run] enqueued for session {session_id}")
+
+
 async def _run_local_summary_v2(
     session_id: str,
     job_id: str | None = None,
