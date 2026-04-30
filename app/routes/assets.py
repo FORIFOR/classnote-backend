@@ -374,24 +374,3 @@ async def ensure_asset_generation(
         raise HTTPException(400, f"Unsupported asset type for ensure: {asset_type}")
         
     return {"status": "enqueued", "type": asset_type}
-
-# We need a Transcript Artifact endpoint to match other artifacts
-@router.get("/sessions/{session_id}/artifacts/transcript", response_model=DerivedStatusResponse)
-async def get_artifact_transcript(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
-    """Bridge endpoint for Transcript as Artifact."""
-    doc_ref = _session_doc_ref(session_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise HTTPException(404, "Session not found")
-    data = doc.to_dict()
-    ensure_can_view(data, current_user, session_id)
-    
-    text = data.get("transcriptText")
-    if not text:
-         return DerivedStatusResponse(status=JobStatus.PENDING) # or MISSING
-         
-    return DerivedStatusResponse(
-        status=JobStatus.COMPLETED,
-        result={"transcript": text},
-        updatedAt=data.get("updatedAt")
-    )
