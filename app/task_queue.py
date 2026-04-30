@@ -1251,3 +1251,131 @@ def enqueue_summarize_quick_task(
 async def _run_local_summarize_quick(session_id: str, job_id: str | None = None):
     """Local fallback for quick summary (debug only)."""
     logger.info(f"[Local] Quick summary for {session_id} (stub)")
+
+
+# ---------------------------------------------------------------------------
+# enqueue_quiz_batch_tasks — シングルショット quiz 生成
+# ---------------------------------------------------------------------------
+
+def enqueue_quiz_batch_tasks(
+    session_id: str,
+    total_questions: int = 8,
+    batch_size: int = 2,
+    job_id: str | None = None,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+    usage_reserved: bool = False,
+):
+    """
+    クイズ生成タスクを1つ投入する（シングルショット）。
+    重複防止のため全問を1回のLLM呼び出しで生成する。
+    batch_size は互換のため受けるが内部で使用しない。
+    """
+    payload = {
+        "sessionId": session_id,
+        "count": total_questions,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+        "usageReserved": usage_reserved,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running quiz batch locally for {session_id}")
+        asyncio.create_task(_run_local_quiz(session_id, total_questions, job_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/quiz"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Created quiz batch task for {session_id} (count={total_questions})")
+    except Exception as e:
+        logger.error(f"Failed to create quiz batch task: {e}")
+
+
+# ---------------------------------------------------------------------------
+# enqueue_todo_extraction_task — 要約完了後に TODO 抽出を非同期実行
+# ---------------------------------------------------------------------------
+
+def enqueue_todo_extraction_task(
+    session_id: str,
+    account_id: str,
+    source_key: str,
+    summary_text: str,
+    transcript_text: str | None = None,
+    mode: str = "lecture",
+    user_id: str | None = None,
+):
+    """[2026-02] TODO 抽出タスクを非同期でキューに入れる。"""
+    payload = {
+        "sessionId": session_id,
+        "accountId": account_id,
+        "sourceKey": source_key,
+        "summaryText": summary_text,
+        "transcriptText": transcript_text or "",
+        "mode": mode,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running TODO extraction locally for session: {session_id}")
+        try:
+            asyncio.create_task(_run_local_todo_extraction(**payload))
+        except Exception as e:
+            logger.error(f"Local TODO extraction failed: {e}")
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/todo_extraction"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 120},
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Enqueued TODO extraction task for session {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to create TODO extraction task: {e}")
+
+
+async def _run_local_todo_extraction(
+    sessionId: str = "",
+    accountId: str = "",
+    sourceKey: str = "",
+    summaryText: str = "",
+    transcriptText: str = "",
+    mode: str = "lecture",
+    userId: str | None = None,
+    **kwargs,
+):
+    """Local fallback for TODO extraction (best-effort)."""
+    try:
+        from app.services.todo_extractor import update_todos_from_summary
+        await update_todos_from_summary(
+            session_id=sessionId,
+            account_id=accountId,
+            source_key=sourceKey,
+            summary_text=summaryText,
+            transcript_text=transcriptText,
+            mode=mode,
+        )
+    except Exception as e:
+        logger.warning(f"[Local] TODO extraction stub failed for {sessionId}: {e}")
