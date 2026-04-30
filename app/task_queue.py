@@ -1200,3 +1200,54 @@ async def _run_local_merge_migration(merge_job_id: str, source_uid: str, target_
     logger.warning("Local merge migration is not fully implemented in task_queue (logic is in routes/tasks.py).")
     # If we wanted to run it, we'd need to move the logic to a service.
     # For now, we assume local dev might not test full merge migration backgrounding strictly.
+
+
+# ---------------------------------------------------------------------------
+# enqueue_summarize_quick_task — quick先出し要約
+# ---------------------------------------------------------------------------
+
+def enqueue_summarize_quick_task(
+    session_id: str,
+    job_id: str | None = None,
+    idempotency_key: str | None = None,
+    user_id: str | None = None,
+):
+    """
+    Quick Summary タスクをキューに入れる（30-60秒で先出し要約）。
+    CostGuard消費なし。dispatch_deadline短め。
+    """
+    payload = {
+        "sessionId": session_id,
+        "jobId": job_id,
+        "idempotencyKey": idempotency_key,
+        "userId": user_id,
+    }
+
+    if tasks_client is None or os.environ.get("USE_LOCAL_TASKS") == "1":
+        logger.info(f"Running quick summary task locally for session: {session_id}")
+        asyncio.create_task(_run_local_summarize_quick(session_id, job_id=job_id))
+        return
+
+    parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+    url = f"{CLOUD_RUN_URL}/internal/tasks/summarize_quick"
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": url,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(payload).encode(),
+        },
+        "dispatch_deadline": {"seconds": 120},
+    }
+
+    try:
+        tasks_client.create_task(parent=parent, task=task)
+        logger.info(f"Created quick summary task for {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to create quick summary task: {e}")
+
+
+async def _run_local_summarize_quick(session_id: str, job_id: str | None = None):
+    """Local fallback for quick summary (debug only)."""
+    logger.info(f"[Local] Quick summary for {session_id} (stub)")
