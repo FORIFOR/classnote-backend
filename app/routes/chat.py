@@ -718,6 +718,8 @@ class CreditReport(BaseModel):
     plan: str
     monthly_limit: int
     topup_credits: int
+    total_limit: int | None
+    unlimited: bool
     used: int
     remaining: int
     daily_used: int
@@ -730,10 +732,16 @@ async def get_credits(
 ):
     """Get AI credit status for the current user."""
     report = ai_credits.get_credit_report(user.account_id)
+    monthly_limit = int(report["monthlyLimit"])
+    topup = int(report["topupCredits"])
+    unlimited = bool(report.get("unlimitedCredits", False))
+    total_limit = None if unlimited else monthly_limit + topup
     return CreditReport(
         plan=report["plan"],
-        monthly_limit=report["monthlyLimit"],
-        topup_credits=report["topupCredits"],
+        monthly_limit=monthly_limit,
+        topup_credits=topup,
+        total_limit=total_limit,
+        unlimited=unlimited,
         used=report["used"],
         remaining=report["remaining"],
         daily_used=report["dailyUsed"],
