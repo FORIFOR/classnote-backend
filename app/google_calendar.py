@@ -15,7 +15,7 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or os.enviro
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8000/google/oauth/callback")
 GOOGLE_SCOPES = os.environ.get(
     "GOOGLE_OAUTH_SCOPES",
-    "https://www.googleapis.com/auth/calendar.events",
+    "openid email profile https://www.googleapis.com/auth/calendar.events.readonly",
 )
 
 
@@ -135,6 +135,106 @@ def refresh_access_token(tokens: dict, uid: str) -> Tuple[Optional[str], Optiona
     }, merge=True)
 
     return new_access, expires_at
+
+
+def delete_tokens(uid: str) -> bool:
+    """
+    Google 連携を解除する。Firestore 上の googleCalendarTokens を削除して
+    disconnect 状態にする。削除前にトークンが存在していれば True、すでに未接続なら False。
+    """
+    from google.cloud.firestore_v1 import DELETE_FIELD
+
+    existed = load_tokens(uid) is not None
+    db.collection("users").document(uid).set(
+        {"googleCalendarTokens": DELETE_FIELD},
+        merge=True,
+    )
+    return existed
+
+
+def list_events(
+    uid: str,
+    start: datetime,
+    end: datetime,
+    top: int = 50,
+    calendar_id: str = "primary",
+) -> list[dict]:
+    """
+    Google Calendar の予定を startTime 昇順で最大 top 件取得する。
+    レスポンスは Microsoft 版 list_events と同等のスキーマに正規化する。
+    """
+    tokens = load_tokens(uid)
+    if not tokens:
+        raise RuntimeError("Google Calendar not connected for this user")
+
+    access_token, _ = refresh_access_token(tokens, uid)
+    if not access_token:
+        raise RuntimeError("Google Calendar access token unavailable")
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {
+        "timeMin": start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "timeMax": end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": str(max(1, min(top, 250))),
+    }
+    resp = requests.get(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        headers=headers,
+        params=params,
+        timeout=10,
+    )
+    if resp.status_code == 401:
+        raise RuntimeError("Google Calendar access denied (token may be revoked)")
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to list calendar events: {resp.status_code} {resp.text}"
+        )
+
+    items = resp.json().get("items", []) or []
+    out: list[dict] = []
+    for ev in items:
+        start_obj = ev.get("start") or {}
+        end_obj = ev.get("end") or {}
+        attendees = [
+            {
+                "email": a.get("email"),
+                "displayName": a.get("displayName"),
+                "optional": bool(a.get("optional")),
+                "responseStatus": a.get("responseStatus"),
+            }
+            for a in (ev.get("attendees") or [])
+            if a.get("email")
+        ]
+        organizer = ev.get("organizer") or {}
+        conference = ev.get("conferenceData") or {}
+        meet_url = None
+        for ep in conference.get("entryPoints", []) or []:
+            if ep.get("entryPointType") == "video" and ep.get("uri"):
+                meet_url = ep["uri"]
+                break
+        if not meet_url and ev.get("hangoutLink"):
+            meet_url = ev["hangoutLink"]
+
+        out.append({
+            "id": ev.get("id"),
+            "title": ev.get("summary"),
+            "description": ev.get("description"),
+            "start": start_obj.get("dateTime") or start_obj.get("date"),
+            "end": end_obj.get("dateTime") or end_obj.get("date"),
+            "isAllDay": "date" in start_obj and "dateTime" not in start_obj,
+            "location": ev.get("location"),
+            "htmlLink": ev.get("htmlLink"),
+            "meetUrl": meet_url,
+            "organizer": {
+                "email": organizer.get("email"),
+                "displayName": organizer.get("displayName"),
+            } if organizer else None,
+            "attendees": attendees,
+            "status": ev.get("status"),
+        })
+    return out
 
 
 def create_event(
