@@ -16,6 +16,7 @@ from app.services.playlist_utils import normalize_playlist_items
 from app.services.usage import usage_logger
 from app.services.ops_logger import log_job_transition, log_llm_event, log_stt_event, ErrorCode
 from app.services.cost_guard import cost_guard
+from app.services.ai_credits import ai_credits, estimate_cost
 from app.services.session_event_bus import publish_session_event
 from app.services.account_deletion import (
     LOCKS_COLLECTION,
@@ -84,6 +85,11 @@ async def _handle_summarize_task_core(request: Request):
     cost_guard_id = None
     cost_guard_mode = "user"
     has_consumed = False
+    # [Bug A] Track ai_credits consumption for refund on failure
+    ai_credits_account_id = None
+    ai_credits_consumed = False
+    ai_credits_cost = 0
+    ai_credits_mode_key = "summary_generated"
 
     try:
 
@@ -99,7 +105,7 @@ async def _handle_summarize_task_core(request: Request):
 
         doc_ref = db.collection("sessions").document(session_id)
         doc = doc_ref.get()
-        
+
         if not doc.exists:
             logger.warning(f"Session {session_id} not found.")
             return {"status": "skipped", "reason": "not_found"}
@@ -116,6 +122,7 @@ async def _handle_summarize_task_core(request: Request):
         cost_guard_id = owner_account_id or final_user_id
         cost_guard_mode = "account" if owner_account_id else "user"
         has_consumed = False  # Track if we've consumed quota for refund on failure
+        ai_credits_account_id = owner_account_id
 
         transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
@@ -174,6 +181,30 @@ async def _handle_summarize_task_core(request: Request):
                 return {"status": "blocked", "error": err_msg}
             has_consumed = True
             logger.info(f"[CostGuard] Reserved summary_generated for {cost_guard_id} ({cost_guard_mode})")
+
+        # [Bug A] Charge AI credits for summary generation. Idempotent via
+        # derived_ref.aiCreditsConsumed flag — re-runs of the same idempotency
+        # key are already short-circuited above, but the flag provides a second
+        # safety net for repeated executions that bypass the idempotency_key
+        # check (e.g. usage_reserved=True on retry).
+        if ai_credits_account_id:
+            try:
+                derived_now = derived_ref.get().to_dict() or {}
+                already = bool(derived_now.get("aiCreditsConsumed"))
+            except Exception:
+                already = False
+            if not already:
+                ai_credits_cost = estimate_cost("summary_generated")
+                ai_credits_mode_key = "summary_generated"
+                consume_ok, _info = ai_credits.consume(
+                    ai_credits_account_id, ai_credits_cost, ai_credits_mode_key
+                )
+                if consume_ok:
+                    ai_credits_consumed = True
+                    derived_ref.set({"aiCreditsConsumed": True, "aiCreditsCost": ai_credits_cost}, merge=True)
+                    logger.info(f"[AICredits] Consumed {ai_credits_cost} for summary {session_id} (account={ai_credits_account_id})")
+                else:
+                    logger.warning(f"[AICredits] Consume returned False for summary {session_id} (account={ai_credits_account_id}); proceeding without charge")
 
         # ops_logger: job started
         logger.info(f"Starting summary task for {session_id} job={job_id}")
@@ -269,6 +300,14 @@ async def _handle_summarize_task_core(request: Request):
         if has_consumed and cost_guard_id:
             await cost_guard.refund_consumption(cost_guard_id, "summary_generated", 1, mode=cost_guard_mode)
             logger.info(f"[CostGuard] Refunded summary_generated for {cost_guard_id} due to failure")
+
+        # [Bug A] Refund AI credits on failure
+        if ai_credits_consumed and ai_credits_account_id and ai_credits_cost > 0:
+            try:
+                ai_credits.refund(ai_credits_account_id, ai_credits_cost, ai_credits_mode_key)
+                derived_ref.set({"aiCreditsConsumed": False}, merge=True)
+            except Exception as refund_err:
+                logger.warning(f"[AICredits] Refund failed for summary {session_id}: {refund_err}")
 
         logger.exception(f"Summarization failed for session {session_id}")
 
@@ -455,6 +494,11 @@ async def _handle_quiz_task_core(request: Request):
     cost_guard_id = None
     cost_guard_mode = "user"
     has_consumed = False
+    # [Bug A] Track ai_credits consumption for refund on failure
+    ai_credits_account_id = None
+    ai_credits_consumed = False
+    ai_credits_cost = 0
+    ai_credits_mode_key = "quiz_generated"
 
     try:
         # [FIX] Initialize DB locally
@@ -465,13 +509,13 @@ async def _handle_quiz_task_core(request: Request):
             db = firestore.Client(project=project_id)
         except Exception as e:
             return {"status": "failed", "error": f"DB Init Failed: {e}"}
-        
+
         doc_ref = db.collection("sessions").document(session_id)
         doc = doc_ref.get()
-        
+
         if not doc.exists:
             return {"status": "skipped"}
-            
+
         data = doc.to_dict()
         if not final_user_id:
             final_user_id = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
@@ -481,6 +525,7 @@ async def _handle_quiz_task_core(request: Request):
         cost_guard_id = owner_account_id or final_user_id
         cost_guard_mode = "account" if owner_account_id else "user"
         has_consumed = False  # Track if we've consumed quota for refund on failure
+        ai_credits_account_id = owner_account_id
 
         transcript = resolve_transcript_text(session_id, data) or ""
         mode = data.get("mode", "lecture")
@@ -530,6 +575,27 @@ async def _handle_quiz_task_core(request: Request):
             has_consumed = True
             logger.info(f"[CostGuard] Reserved quiz_generated for {cost_guard_id} ({cost_guard_mode})")
 
+        # [Bug A] Charge AI credits for quiz generation. Idempotent via
+        # derived_ref.aiCreditsConsumed flag.
+        if ai_credits_account_id:
+            try:
+                derived_now = derived_ref.get().to_dict() or {}
+                already = bool(derived_now.get("aiCreditsConsumed"))
+            except Exception:
+                already = False
+            if not already:
+                ai_credits_cost = estimate_cost("quiz_generated")
+                ai_credits_mode_key = "quiz_generated"
+                consume_ok, _info = ai_credits.consume(
+                    ai_credits_account_id, ai_credits_cost, ai_credits_mode_key
+                )
+                if consume_ok:
+                    ai_credits_consumed = True
+                    derived_ref.set({"aiCreditsConsumed": True, "aiCreditsCost": ai_credits_cost}, merge=True)
+                    logger.info(f"[AICredits] Consumed {ai_credits_cost} for quiz {session_id} (account={ai_credits_account_id})")
+                else:
+                    logger.warning(f"[AICredits] Consume returned False for quiz {session_id} (account={ai_credits_account_id}); proceeding without charge")
+
         # ops_logger: job started
         log_job_transition(session_id, "quiz", "started", uid=final_user_id, job_id=job_id)
 
@@ -570,6 +636,14 @@ async def _handle_quiz_task_core(request: Request):
         if has_consumed and cost_guard_id:
             await cost_guard.refund_consumption(cost_guard_id, "quiz_generated", 1, mode=cost_guard_mode)
             logger.info(f"[CostGuard] Refunded quiz_generated for {cost_guard_id} due to failure")
+
+        # [Bug A] Refund AI credits on failure
+        if ai_credits_consumed and ai_credits_account_id and ai_credits_cost > 0:
+            try:
+                ai_credits.refund(ai_credits_account_id, ai_credits_cost, ai_credits_mode_key)
+                derived_ref.set({"aiCreditsConsumed": False}, merge=True)
+            except Exception as refund_err:
+                logger.warning(f"[AICredits] Refund failed for quiz {session_id}: {refund_err}")
 
         logger.exception(f"Quiz generation failed for session {session_id}")
 
