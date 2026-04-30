@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from google.cloud import firestore
 from app.firebase import db
+from app.services.ai_credits import PLAN_CREDITS
 
 logger = logging.getLogger("app.cost_guard")
 
@@ -13,6 +14,7 @@ logger = logging.getLogger("app.cost_guard")
 JST = timezone(timedelta(hours=9))
 
 # --- PLAN LIMITS (DEFINITIVE vNext) ---
+# AI credits の上限値は ai_credits.PLAN_CREDITS を Single Source of Truth として参照する。
 FREE_LIMITS = {
     "cloud_stt_sec": 0,            # [POLICY] Free plan cannot use cloud transcription
     "cloud_sessions_started": 0,   # [POLICY] Free plan cannot use cloud transcription
@@ -21,7 +23,7 @@ FREE_LIMITS = {
     "export_generated": 3,         # [NEW] Export: 3/month for free
     "server_session": 999999,      # Unlimited server sessions
     "sessions_created": 999999,    # No creation flow limit
-    "ai_credits": 40,              # AI Chat: 40 credits/month
+    "ai_credits": PLAN_CREDITS["free"],
 }
 
 
@@ -35,7 +37,7 @@ BASIC_LIMITS = {
     "server_session": 999999,      # Unlimited server sessions
     "sessions_created": 999999,    # Unlimited session creation
     "llm_calls": 200,              # Combined (Summary/Quiz/QA)
-    "ai_credits": 400,             # AI Chat: 400 credits/month
+    "ai_credits": PLAN_CREDITS["basic"],
 }
 
 def _safe_dict(snap) -> dict:
@@ -301,11 +303,24 @@ class CostGuardService:
             logger.info(f"[CostGuard] User {user_id} not found in DB, treating as new free user")
 
         plan = _resolve_plan_from_data(u_data, user_id=user_id)
+        unlimited = bool(u_data.get("unlimitedCredits", False))
 
         # 2. Get Usage
         if not m_snap:
             m_snap = m_ref.get(transaction=transaction)
         m_data = _safe_dict(m_snap)
+
+        # [Bug D] unlimitedCredits accounts bypass the limit check but still
+        # increment monthly counters so analytics/監査 stays accurate. Mirrors
+        # ai_credits.consume() unlimited bypass behavior.
+        if unlimited and feature != "server_session":
+            updates = {"updated_at": datetime.now(timezone.utc), feature: firestore.Increment(amount)}
+            if not m_snap.exists:
+                transaction.set(m_ref, updates, merge=True)
+            else:
+                transaction.update(m_ref, updates)
+            logger.info(f"[CostGuard] UNLIMITED bypass {user_id} ({plan}) {feature}: +{amount} (no limit check)")
+            return True, None
 
         # 3. Apply Limit Logic
         limit = None
