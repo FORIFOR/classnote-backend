@@ -261,8 +261,22 @@ from app.routes import assist
 app.include_router(assist.router, tags=["Assist"])
 app.include_router(billing.router, tags=["Billing"])
 app.include_router(share.router, tags=["Share"])
-app.include_router(google.router, tags=["Google"])
-app.include_router(google.integrations_router)
+# [DEPRECATED 2026-05-01] Legacy Google OAuth routes (replaced by integrations_google).
+# Kept import to avoid breaking any latent reference, but not registered:
+# app.include_router(google.router, tags=["Google"])
+# app.include_router(google.integrations_router)
+from app.routes import integrations_google, integrations_microsoft
+app.include_router(integrations_google.router)
+app.include_router(integrations_google.oauth_router)
+app.include_router(integrations_microsoft.router)
+app.include_router(integrations_microsoft.oauth_router)
+# Startup soft-check: warn if token_crypto / OAuth not configured
+try:
+    from app.services import token_crypto as _token_crypto
+    if not _token_crypto.is_configured():
+        print("WARNING: TOKEN_ENCRYPTION_KEY not set — /integrations/* will return 503")
+except Exception as _e:
+    print(f"WARNING: token_crypto preload failed: {_e}")
 app.include_router(search.router, tags=["Search"])
 app.include_router(reactions.router, tags=["Reactions"])
 app.include_router(admin.router, tags=["Admin"])
