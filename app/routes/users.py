@@ -161,15 +161,19 @@ def _find_best_production_entitlement(account_id: str, now: datetime) -> tuple[O
             if status not in ["active", "grace", "billing_retry", "active_lifetime"]:
                 continue
 
-            # Filter 3: Not expired
+            # [FIX 2026-05-01] Trust status as authoritative.
+            # App Store ASN2 / Stripe webhook may lag behind actual renewal; an
+            # entitlement with status="active" but stale currentPeriodEnd is
+            # almost always a webhook sync delay, not an actual expiry.
+            # Only the status filter above (Filter 2) decides validity.
             current_period_end = data.get("currentPeriodEnd")
-            if current_period_end:
-                if not current_period_end.tzinfo:
-                    current_period_end = current_period_end.replace(tzinfo=timezone.utc)
-
-                # Skip if expired (unless lifetime)
-                if current_period_end < now and status != "active_lifetime":
-                    continue
+            if current_period_end and not current_period_end.tzinfo:
+                current_period_end = current_period_end.replace(tzinfo=timezone.utc)
+            if current_period_end and current_period_end < now and status != "active_lifetime":
+                logger.info(
+                    f"[_find_best_production_entitlement] {doc.id} status={status} "
+                    f"but currentPeriodEnd={current_period_end} is past — trusting status"
+                )
 
             # This entitlement is valid - check if it's better than current best
             # Prefer the one with latest expiry (or any if we have none)
@@ -1215,20 +1219,25 @@ async def get_me(
                     # Check: Status is valid
                     elif ent_status not in ["active", "grace", "billing_retry", "active_lifetime"]:
                         logger.info(f"[/users/me] Entitlement {apple_ent_id} status={ent_status} - not active")
-                    # Check: Not expired
-                    elif current_period_end:
-                        if not current_period_end.tzinfo:
-                            current_period_end = current_period_end.replace(tzinfo=timezone.utc)
-                        if current_period_end < now and ent_status not in ["active_lifetime"]:
-                            logger.info(f"[/users/me] Entitlement {apple_ent_id} expired at {current_period_end}")
-                        else:
-                            # All checks passed - linked entitlement is valid
-                            linked_ent_valid = True
-                            final_plan = ent_plan or raw_plan
+                    # [FIX 2026-05-01] Trust status="active"/"grace"/"billing_retry" as
+                    # authoritative even if currentPeriodEnd is past. App Store ASN2 /
+                    # Stripe webhook may not have synced renewal yet. Only treat as
+                    # expired if status itself indicates expiry. This prevents the
+                    # "no_valid_production_entitlement" false-positive that downgraded
+                    # 6 paid subscribers to free on 2026-05-01.
                     else:
-                        # No expiry date but status is valid - trust it (lifetime or legacy)
+                        if current_period_end and not current_period_end.tzinfo:
+                            current_period_end = current_period_end.replace(tzinfo=timezone.utc)
+                        # Hard expiry only when status is NOT active-ish AND clearly past
+                        # (status guard above already filters non-active out)
                         linked_ent_valid = True
                         final_plan = ent_plan or raw_plan
+                        if current_period_end and current_period_end < now and ent_status != "active_lifetime":
+                            logger.info(
+                                f"[/users/me] Entitlement {apple_ent_id} status={ent_status} "
+                                f"but currentPeriodEnd={current_period_end} is past — trusting status, "
+                                f"renewal webhook may be delayed"
+                            )
 
             except Exception as e:
                 logger.error(f"[/users/me] Failed to verify linked entitlement {apple_ent_id}: {e}")
