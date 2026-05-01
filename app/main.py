@@ -45,7 +45,7 @@ def _check_env_vars():
 
 _check_env_vars()
 
-from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat
+from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, compat_aliases
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -261,6 +261,7 @@ from app.routes import assist
 app.include_router(assist.router, tags=["Assist"])
 app.include_router(billing.router, tags=["Billing"])
 app.include_router(share.router, tags=["Share"])
+app.include_router(compat_aliases.router)  # iOS hyphen aliases + transcript_segments artifacts alias + playlist:generate
 # [DEPRECATED 2026-05-01] Legacy Google OAuth routes (replaced by integrations_google).
 # Kept import to avoid breaking any latent reference, but not registered:
 # app.include_router(google.router, tags=["Google"])
