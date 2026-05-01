@@ -322,6 +322,10 @@ async def legacy_orb_theme_alias(
     current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
 ):
     """Deprecated alias of /system/orb-theme."""
-    from app.services.deprecation import log_deprecated_path
-    log_deprecated_path(request, replacement="/system/orb-theme")
+    try:
+        from app.services.deprecation import log_deprecated_path
+        log_deprecated_path(request, replacement="/system/orb-theme")
+    except ImportError:
+        # deprecation module not present in this build; alias still works
+        pass
     return await get_orb_theme(current_user=current_user)
