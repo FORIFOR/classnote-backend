@@ -55,8 +55,15 @@ class EventType(str, Enum):
     PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
     ABUSE_DETECTED = "ABUSE_DETECTED"
 
+    # AIチャット系
+    AI_CHAT_COMPLETED = "AI_CHAT_COMPLETED"
+    AI_CHAT_FAILED = "AI_CHAT_FAILED"
+
     # 管理者アクション
     ADMIN_ACTION = "ADMIN_ACTION"
+
+    # 互換API利用 (Phase D 判定用)
+    LEGACY_API_USED = "LEGACY_API_USED"
 
 
 class ErrorCode(str, Enum):
@@ -82,6 +89,9 @@ class ErrorCode(str, Enum):
     PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
     FREE_LIMIT_REACHED = "FREE_LIMIT_REACHED"
     PRO_LIMIT_REACHED = "PRO_LIMIT_REACHED"
+
+    # AIクレジット
+    AI_CREDIT_EXHAUSTED = "AI_CREDIT_EXHAUSTED"
 
     # 疑わしい挙動
     RETRY_STORM = "RETRY_STORM"
@@ -341,6 +351,59 @@ def log_llm_event(
         error_code=error_code,
         message=error_message or f"LLM {llm_type} {status}",
         debug=debug,
+    )
+
+
+def log_ai_chat(
+    uid: str,
+    *,
+    mode: str,
+    model: str,
+    credit_cost: int,
+    credits_remaining: int,
+    latency_ms: int,
+    session_ids: Optional[list[str]] = None,
+    used_search: bool = False,
+    scope_score: Optional[int] = None,
+    fallback_reason: Optional[str] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    answer_len: int = 0,
+    endpoint: str = "chat",
+    error_message: Optional[str] = None,
+) -> str:
+    """AIチャット完了/失敗イベントを記録"""
+    is_error = error_message is not None
+    event_type = EventType.AI_CHAT_FAILED if is_error else EventType.AI_CHAT_COMPLETED
+    severity = Severity.ERROR if is_error else Severity.INFO
+
+    props = {
+        "mode": mode,
+        "model": model,
+        "creditCost": credit_cost,
+        "creditsRemaining": credits_remaining,
+        "latencyMs": latency_ms,
+        "usedSearch": used_search,
+        "answerLen": answer_len,
+    }
+    if session_ids:
+        props["sessionIds"] = session_ids
+    if scope_score is not None:
+        props["scopeScore"] = scope_score
+    if fallback_reason:
+        props["fallbackReason"] = fallback_reason
+    if input_tokens is not None:
+        props["inputTokens"] = input_tokens
+    if output_tokens is not None:
+        props["outputTokens"] = output_tokens
+
+    return ops_logger.log(
+        severity,
+        event_type,
+        uid=uid,
+        endpoint=endpoint,
+        message=error_message or f"AI chat {mode} completed",
+        props=props,
     )
 
 

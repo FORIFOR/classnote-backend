@@ -16,6 +16,7 @@ PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJE
 VERTEX_REGION = os.environ.get("VERTEX_REGION", "us-central1")
 CHAT_MODEL_NAME = os.environ.get("CHAT_MODEL_NAME", "gemini-2.0-flash-lite")
 GENERAL_MODEL_NAME = os.environ.get("GENERAL_MODEL_NAME", "gemini-2.5-flash-lite")
+SEARCH_MODEL_NAME = os.environ.get("SEARCH_MODEL_NAME", "gemini-2.5-flash")
 
 _vertex_initialized = False
 _chat_model: Optional[GenerativeModel] = None
@@ -330,10 +331,12 @@ GENERAL_FRESH_SYSTEM_INSTRUCTION = """あなたは DeepNote の会話型アシ�
 - 回答は簡潔で実用的にしてください。"""
 
 FRESHNESS_KEYWORDS = [
-    "最新", "今", "現在", "今日", "最近", "ニュース",
-    "動向", "支持率", "CEO", "社長", "株価", "発表",
+    "最新", "今", "現在", "今日", "最近", "直近", "現時点",
+    "ニュース", "動向", "支持率", "CEO", "社長", "株価", "発表",
     "アップデート", "現職", "価格", "速報", "リリース",
     "いつ", "何時", "天気", "為替", "レート",
+    "調べて", "検索して",
+    "今どう", "どうなってる", "どうなっている",
 ]
 
 
@@ -350,6 +353,23 @@ def is_fresh_question(message: str) -> bool:
     return any(k.lower() in lower for k in FRESHNESS_KEYWORDS)
 
 
+def _get_search_model():
+    """Get a GenerativeModel configured for Google Search grounding.
+
+    Google Search grounding requires the 'global' location.
+    We initialize a separate vertexai client for this purpose.
+    """
+    from google.genai import Client
+    from google.genai.types import Tool, GoogleSearch
+
+    client = Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location="global",
+    )
+    return client, Tool(google_search=GoogleSearch())
+
+
 def call_gemini_general_with_search(
     message: str,
     history: Optional[list] = None,
@@ -357,26 +377,14 @@ def call_gemini_general_with_search(
 ) -> dict:
     """Call Gemini 2.5 Flash-Lite with Google Search grounding.
 
-    Uses Vertex AI grounding tool for real-time web information.
-    Cannot use JSON response schema with tools, so returns a simplified dict.
+    Uses Google Gen AI SDK with location=global for search grounding.
     Includes conversation history for multi-turn continuity.
     """
     _ensure_chat_model()
 
-    from google.cloud.aiplatform_v1beta1.types.tool import Tool as ProtoTool
-    from vertexai.generative_models import GenerativeModel
+    client, search_tool = _get_search_model()
 
-    # Use proto-level Tool with google_search field (not deprecated google_search_retrieval)
-    search_tool = ProtoTool(google_search=ProtoTool.GoogleSearch())
-
-    model = GenerativeModel(
-        GENERAL_MODEL_NAME,
-        system_instruction=GENERAL_FRESH_SYSTEM_INSTRUCTION,
-        tools=[search_tool],
-    )
-
-    # Google recommends temperature=1.0 for grounding
-    config = GenerationConfig(temperature=1.0)
+    from google.genai.types import GenerateContentConfig
 
     # Detect answer language from user input
     answer_lang = detect_answer_language(message)
@@ -399,39 +407,41 @@ def call_gemini_general_with_search(
 
     prompt_len = len(full_prompt)
     logger.info(
-        f"[GeminiChat] Calling GENERAL+SEARCH model={GENERAL_MODEL_NAME} "
-        f"prompt_len={prompt_len} temp=1.0 grounding=GoogleSearch history={len(history or [])}"
+        f"[GeminiChat] Calling GENERAL+SEARCH model={SEARCH_MODEL_NAME} "
+        f"prompt_len={prompt_len} temp=1.0 grounding=GoogleSearch location=global "
+        f"history={len(history or [])}"
     )
 
     try:
-        response = model.generate_content(full_prompt, generation_config=config)
+        response = client.models.generate_content(
+            model=SEARCH_MODEL_NAME,
+            contents=full_prompt,
+            config=GenerateContentConfig(
+                tools=[search_tool],
+                temperature=1.0,
+                system_instruction=GENERAL_FRESH_SYSTEM_INSTRUCTION,
+            ),
+        )
 
-        # Extract text — grounding responses may have multiple content parts
-        answer = ""
-        if response and response.candidates:
-            candidate = response.candidates[0]
-            if candidate.content and candidate.content.parts:
-                text_parts = []
-                for part in candidate.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        text_parts.append(part.text)
-                answer = "".join(text_parts)
+        answer = response.text or ""
 
         # Extract token usage
         usage = getattr(response, "usage_metadata", None)
         input_tokens = getattr(usage, "prompt_token_count", None) if usage else None
         output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
 
+        # Check grounding metadata
+        grounding = getattr(response.candidates[0] if response.candidates else None, "grounding_metadata", None)
+
         logger.info(
             f"[GeminiChat/search] Response OK: answer_len={len(answer)} "
-            f"parts={len(response.candidates[0].content.parts) if response and response.candidates else 0} "
             f"input_tokens={input_tokens} output_tokens={output_tokens} "
-            f"grounding_metadata={bool(getattr(response, 'grounding_metadata', None))}"
+            f"has_grounding={grounding is not None}"
         )
 
         return {
             "answer": answer or "回答の生成に失敗しました。",
-            "mode": "general_static",
+            "mode": "general_fresh",
             "used_sessions": [],
             "citations": [],
             "confidence": 0.7,
@@ -443,7 +453,63 @@ def call_gemini_general_with_search(
             "_output_tokens": output_tokens,
         }
     except Exception as e:
-        logger.error(f"[GeminiChat/search] Call failed: {e}", exc_info=True)
+        logger.error(f"[GeminiChat/search] Call failed (model={GENERAL_MODEL_NAME}, location=global): {e}", exc_info=True)
+        raise
+
+
+def call_gemini_search_hybrid(
+    hybrid_prompt: str,
+) -> dict:
+    """Call Gemini with Google Search grounding using a pre-built hybrid prompt
+    that already includes session context.
+    """
+    _ensure_chat_model()
+
+    from google.genai.types import GenerateContentConfig
+
+    client, search_tool = _get_search_model()
+
+    logger.info(
+        f"[GeminiChat] Calling HYBRID+SEARCH model={SEARCH_MODEL_NAME} "
+        f"prompt_len={len(hybrid_prompt)} location=global"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=SEARCH_MODEL_NAME,
+            contents=hybrid_prompt,
+            config=GenerateContentConfig(
+                tools=[search_tool],
+                temperature=1.0,
+                system_instruction=GENERAL_FRESH_SYSTEM_INSTRUCTION,
+            ),
+        )
+
+        answer = response.text or ""
+        usage = getattr(response, "usage_metadata", None)
+        input_tokens = getattr(usage, "prompt_token_count", None) if usage else None
+        output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+
+        logger.info(
+            f"[GeminiChat/hybrid] Response OK: answer_len={len(answer)} "
+            f"input_tokens={input_tokens} output_tokens={output_tokens}"
+        )
+
+        return {
+            "answer": answer or "回答の生成に失敗しました。",
+            "mode": "general_fresh",
+            "used_sessions": [],
+            "citations": [],
+            "confidence": 0.7,
+            "needs_general_knowledge": True,
+            "follow_up_suggestion": "他に気になることはありますか？",
+            "conversation_summary_next": "セッション+Web検索で回答。",
+            "used_search": True,
+            "_input_tokens": input_tokens,
+            "_output_tokens": output_tokens,
+        }
+    except Exception as e:
+        logger.error(f"[GeminiChat/hybrid] Failed (location=global): {e}", exc_info=True)
         raise
 
 
@@ -499,7 +565,7 @@ def stream_gemini_chat(turn_prompt: str, model_name: Optional[str] = None) -> Ge
         top_p=0.9,
     )
 
-    logger.info(f"[GeminiChat/stream] model={model_name} mode={mode} prompt_len={len(turn_prompt)}")
+    logger.info(f"[GeminiChat/stream] model={model_name} prompt_len={len(turn_prompt)}")
 
     try:
         response_stream = model.generate_content(
@@ -519,40 +585,32 @@ def stream_gemini_chat(turn_prompt: str, model_name: Optional[str] = None) -> Ge
 def stream_gemini_with_search(
     prompt: str,
 ) -> Generator[str, None, None]:
-    """Stream Gemini with Google Search grounding.
+    """Stream Gemini with Google Search grounding via Google Gen AI SDK.
 
-    Args:
-        prompt: Pre-built prompt (from build_stream_prompt).
+    Uses location=global as required by Google Search grounding.
     """
     _ensure_chat_model()
 
-    from google.cloud.aiplatform_v1beta1.types.tool import Tool as ProtoTool
+    from google.genai.types import GenerateContentConfig
 
-    search_tool = ProtoTool(google_search=ProtoTool.GoogleSearch())
+    client, search_tool = _get_search_model()
 
-    model = GenerativeModel(
-        GENERAL_MODEL_NAME,
-        system_instruction=GENERAL_FRESH_SYSTEM_INSTRUCTION,
-        tools=[search_tool],
-    )
-
-    config = GenerationConfig(temperature=1.0)
-
-    logger.info(f"[GeminiChat/stream+search] model={GENERAL_MODEL_NAME} prompt_len={len(prompt)}")
+    logger.info(f"[GeminiChat/stream+search] model={SEARCH_MODEL_NAME} location=global prompt_len={len(prompt)}")
 
     try:
-        response_stream = model.generate_content(
-            prompt,
-            generation_config=config,
-            stream=True,
+        response_stream = client.models.generate_content_stream(
+            model=SEARCH_MODEL_NAME,
+            contents=prompt,
+            config=GenerateContentConfig(
+                tools=[search_tool],
+                temperature=1.0,
+                system_instruction=GENERAL_FRESH_SYSTEM_INSTRUCTION,
+            ),
         )
         for chunk in response_stream:
-            if chunk.candidates:
-                candidate = chunk.candidates[0]
-                if candidate.content and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            yield part.text
+            text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+            if text:
+                yield text
     except Exception as e:
-        logger.error(f"[GeminiChat/stream+search] Failed: {e}", exc_info=True)
+        logger.error(f"[GeminiChat/stream+search] Failed (location=global): {e}", exc_info=True)
         raise

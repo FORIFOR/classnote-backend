@@ -15,6 +15,7 @@ PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJE
 VERTEX_REGION = os.environ.get("VERTEX_REGION", "us-central1")
 CHAT_MODEL_NAME = os.environ.get("CHAT_MODEL_NAME", "gemini-2.0-flash-lite")
 GENERAL_MODEL_NAME = os.environ.get("GENERAL_MODEL_NAME", "gemini-2.5-flash-lite")
+SEARCH_MODEL_NAME = os.environ.get("SEARCH_MODEL_NAME", "gemini-2.5-flash")
 
 _vertex_initialized = False
 
@@ -116,28 +117,69 @@ def stream_gemini_chat(turn_prompt: str, model_name: str = None) -> Generator[st
 
 
 def stream_gemini_with_search(turn_prompt: str) -> Generator[str, None, None]:
-    """Stream text chunks from Gemini with Google Search grounding."""
+    """Stream text chunks from Gemini with Google Search grounding.
+
+    Uses Google Gen AI SDK with location=global as required by Google Search grounding.
+    """
     _ensure_initialized()
 
-    from google.cloud.aiplatform_v1beta1.types.tool import Tool as ProtoTool
+    from google.genai import Client
+    from google.genai.types import Tool, GoogleSearch, GenerateContentConfig
 
-    search_tool = ProtoTool(google_search=ProtoTool.GoogleSearch())
-
-    model = GenerativeModel(
-        GENERAL_MODEL_NAME,
-        system_instruction=STREAM_FRESH_SYSTEM_INSTRUCTION,
-        tools=[search_tool],
+    client = Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location="global",
     )
-    config = GenerationConfig(temperature=1.0)
+    search_tool = Tool(google_search=GoogleSearch())
 
-    logger.info(f"[GeminiStream] Streaming SEARCH model={GENERAL_MODEL_NAME} prompt_len={len(turn_prompt)}")
+    logger.info(f"[GeminiStream] Streaming SEARCH model={SEARCH_MODEL_NAME} location=global prompt_len={len(turn_prompt)}")
 
-    response = model.generate_content(turn_prompt, generation_config=config, stream=True)
+    response_stream = client.models.generate_content_stream(
+        model=SEARCH_MODEL_NAME,
+        contents=turn_prompt,
+        config=GenerateContentConfig(
+            tools=[search_tool],
+            temperature=1.0,
+            system_instruction=STREAM_FRESH_SYSTEM_INSTRUCTION,
+        ),
+    )
 
-    for chunk in response:
-        if chunk.candidates:
-            candidate = chunk.candidates[0]
-            if candidate.content and candidate.content.parts:
-                for part in candidate.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        yield part.text
+    for chunk in response_stream:
+        text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+        if text:
+            yield text
+
+
+def stream_gemini_search_hybrid(
+    hybrid_prompt: str,
+) -> Generator[str, None, None]:
+    """Stream Gemini with Google Search grounding using a pre-built hybrid prompt
+    that already includes session context.
+    """
+    from google.genai import Client
+    from google.genai.types import Tool, GoogleSearch, GenerateContentConfig
+
+    client = Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location="global",
+    )
+    search_tool = Tool(google_search=GoogleSearch())
+
+    logger.info(f"[GeminiStream/hybrid] model={SEARCH_MODEL_NAME} location=global prompt_len={len(hybrid_prompt)}")
+
+    response_stream = client.models.generate_content_stream(
+        model=SEARCH_MODEL_NAME,
+        contents=hybrid_prompt,
+        config=GenerateContentConfig(
+            tools=[search_tool],
+            temperature=1.0,
+            system_instruction=STREAM_FRESH_SYSTEM_INSTRUCTION,
+        ),
+    )
+
+    for chunk in response_stream:
+        text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+        if text:
+            yield text
