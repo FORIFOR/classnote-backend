@@ -29,6 +29,7 @@ from app.services.normalizers import mail as mail_norm
 logger = logging.getLogger("app.routes.integrations.google")
 router = APIRouter(prefix="/integrations/google", tags=["Integrations:Google"])
 oauth_router = APIRouter(prefix="/google", tags=["Integrations:Google"])
+auth_alias_router = APIRouter(prefix="/auth/google", tags=["Integrations:Google"])
 
 
 def _ensure_ready():
@@ -51,14 +52,7 @@ def _resolve_uid(token: Optional[str], current_user: Optional[CurrentUser]) -> s
     raise HTTPException(status_code=401, detail="not_authenticated")
 
 
-@router.get("/oauth/start")
-async def google_integrations_oauth_start(
-    return_to: str = "/",
-    token: Optional[str] = None,
-    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
-):
-    _ensure_ready()
-    uid = _resolve_uid(token, current_user)
+def _build_google_authorize_redirect(uid: str, return_to: str) -> RedirectResponse:
     state = oauth_state_store.issue(
         uid=uid,
         provider="google",
@@ -76,6 +70,29 @@ async def google_integrations_oauth_start(
         "prompt": "consent",
     }
     return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params))
+
+
+@router.get("/oauth/start")
+async def google_integrations_oauth_start(
+    return_to: str = "/",
+    token: Optional[str] = None,
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    _ensure_ready()
+    uid = _resolve_uid(token, current_user)
+    return _build_google_authorize_redirect(uid, return_to)
+
+
+@auth_alias_router.get("/start")
+async def google_auth_start_alias(
+    return_to: str = "/",
+    token: Optional[str] = None,
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    """Alias path /auth/google/start (matches frontend `/auth/{provider}/start` convention)."""
+    _ensure_ready()
+    uid = _resolve_uid(token, current_user)
+    return _build_google_authorize_redirect(uid, return_to)
 
 
 @oauth_router.get("/oauth/callback")

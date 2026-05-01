@@ -268,6 +268,7 @@ app.include_router(share.router, tags=["Share"])
 from app.routes import integrations_google, integrations_microsoft
 app.include_router(integrations_google.router)
 app.include_router(integrations_google.oauth_router)
+app.include_router(integrations_google.auth_alias_router)
 app.include_router(integrations_microsoft.router)
 app.include_router(integrations_microsoft.oauth_router)
 # Startup soft-check: warn if token_crypto / OAuth not configured

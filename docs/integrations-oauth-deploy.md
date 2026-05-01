@@ -63,22 +63,29 @@ Optional:
 After deploy:
 
 ```
-GET  /integrations/google/oauth/start            # → redirects to Google
-GET  /google/oauth/callback                      # provider returns here
+# Canonical OAuth start paths (matches frontend /auth/{provider}/start convention)
+GET  /auth/google/start                          # → redirects to Google
+GET  /auth/microsoft/start                       # → redirects to Microsoft
+
+# Provider callbacks (registered in GCP / Azure)
+GET  /google/oauth/callback
+GET  /auth/microsoft/callback
+
+# Integration management + data fetching
 GET  /integrations/google/status
 DELETE /integrations/google
 GET  /integrations/google/calendar/events?timeMin=...&timeMax=...
 GET  /integrations/google/calendar/list
 GET  /integrations/google/mail/messages?q=...
 GET  /integrations/google/mail/messages/{id}
+GET  /integrations/google/oauth/start            # alias of /auth/google/start
 
-GET  /integrations/microsoft/oauth/start
-GET  /auth/microsoft/callback
 GET  /integrations/microsoft/status
 DELETE /integrations/microsoft
 GET  /integrations/microsoft/calendar/events?startDateTime=...&endDateTime=...
 GET  /integrations/microsoft/mail/messages?top=25&search=...
 GET  /integrations/microsoft/mail/messages/{id}
+GET  /integrations/microsoft/oauth/start         # alias of /auth/microsoft/start
 ```
 
 If `TOKEN_ENCRYPTION_KEY` or provider client secrets are missing, the

@@ -40,12 +40,13 @@ def _resolve_uid(token: Optional[str], current_user: Optional[CurrentUser]) -> s
     raise HTTPException(status_code=401, detail="not_authenticated")
 
 
-@router.get("/oauth/start")
+@oauth_router.get("/start")
 async def microsoft_oauth_start(
     return_to: str = "/",
     token: Optional[str] = None,
     current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
 ):
+    """Canonical path: /auth/microsoft/start (matches Apr-29 dev contract)."""
     _ensure_ready()
     uid = _resolve_uid(token, current_user)
     state = oauth_state_store.issue(
@@ -64,6 +65,16 @@ async def microsoft_oauth_start(
         "prompt": "select_account",
     }
     return RedirectResponse(microsoft_client.AUTH_URL + "?" + urlencode(params))
+
+
+# Backward-compat alias under /integrations prefix
+@router.get("/oauth/start")
+async def microsoft_oauth_start_compat(
+    return_to: str = "/",
+    token: Optional[str] = None,
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
+):
+    return await microsoft_oauth_start(return_to=return_to, token=token, current_user=current_user)
 
 
 @oauth_router.get("/callback")
