@@ -1923,3 +1923,87 @@ def _summary_json_to_markdown(summary: dict, mode: str = "meeting") -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Quick Summary — 30-60秒で返せる先出し要約（CostGuard 消費なし）
+# ---------------------------------------------------------------------------
+
+QUICK_SUMMARY_MAX_TOKENS = 800
+
+
+async def generate_quick_summary(text: str, mode: str = "lecture") -> dict:
+    """
+    30-60秒で返せる短い要約。highlights 3件 + topicSummary。
+    """
+    if not text or len(text) < MIN_TRANSCRIPT_LENGTH:
+        return {"markdown": "文字起こしが短すぎます。", "topicSummary": ""}
+
+    truncated = text[:15000] if len(text) > 15000 else text
+    _ensure_model()
+    from vertexai.generative_models import GenerationConfig
+
+    prompt = _build_quick_summary_prompt(truncated, mode)
+    resp = await _timed_llm_call(
+        _model,
+        prompt,
+        GenerationConfig(
+            temperature=0.3,
+            max_output_tokens=QUICK_SUMMARY_MAX_TOKENS,
+        ),
+        label="summary_quick",
+    )
+    raw = (resp.text or "").strip()
+
+    topic = ""
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            topic = stripped[:100]
+            break
+
+    return {"markdown": raw, "topicSummary": topic}
+
+
+def _build_quick_summary_prompt(text: str, mode: str) -> str:
+    if mode == "meeting":
+        return f"""以下の文字起こし（会議）を30秒で読める短い要約にしてください。
+
+# 出力ルール（厳守）
+- Markdownのみ出力（余計な挨拶・説明禁止）
+- 最初に1行で会議のテーマを書く
+- 「## 重要ポイント」で3点以内の箇条書き
+- 「## キーワード」で重要語を3-6個
+- 文字起こしに無い情報は作らない
+
+=== 文字起こし ===
+{text}
+"""
+    if mode == "translate":
+        return f"""以下の文字起こし（逐次通訳セッション）を30秒で読める短い日本語要約にしてください。
+文字起こしには原語パートと日本語訳パートが `===ORIGINAL===` / `===TRANSLATION===` で
+区切られている場合があります。両方を参照して統合してください。
+
+# 出力ルール（厳守）
+- Markdown のみ出力（余計な挨拶・説明禁止）
+- 出力は日本語
+- 最初に1行でセッションのテーマを書く
+- 「## 重要ポイント」で3点以内の箇条書き
+- 「## キーワード」で重要語を3-6個（原語が重要なら「原語（日本語訳）」形式で残して良い）
+- 文字起こしに無い情報は作らない
+
+=== 文字起こし ===
+{text}
+"""
+    return f"""以下の文字起こし（講義）を30秒で読める短い要約にしてください。
+
+# 出力ルール（厳守）
+- Markdownのみ出力（余計な挨拶・説明禁止）
+- 最初に1行で講義のテーマを書く
+- 「## 重要ポイント」で3点以内の箇条書き
+- 「## キーワード」で重要語を3-6個
+- 文字起こしに無い情報は作らない
+
+=== 文字起こし ===
+{text}
+"""
