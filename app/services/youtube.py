@@ -15,11 +15,33 @@ try:
         TranscriptsDisabled,
         VideoUnavailable,
     )
+    # RequestBlocked / IpBlocked are only present on youtube-transcript-api >= 1.0
+    try:
+        from youtube_transcript_api._errors import RequestBlocked  # type: ignore
+    except ImportError:
+        RequestBlocked = None  # type: ignore
+    try:
+        from youtube_transcript_api._errors import IpBlocked  # type: ignore
+    except ImportError:
+        IpBlocked = None  # type: ignore
     YOUTUBE_TRANSCRIPT_AVAILABLE = True
 except ImportError:
     YouTubeTranscriptApi = None
     NoTranscriptFound = TranscriptsDisabled = VideoUnavailable = None
+    RequestBlocked = IpBlocked = None
     YOUTUBE_TRANSCRIPT_AVAILABLE = False
+
+
+def _is_blocked_exception(exc: Exception) -> bool:
+    """True when the exception indicates YouTube blocked our IP/request."""
+    name = type(exc).__name__
+    if name in ("RequestBlocked", "IpBlocked"):
+        return True
+    if RequestBlocked is not None and isinstance(exc, RequestBlocked):
+        return True
+    if IpBlocked is not None and isinstance(exc, IpBlocked):
+        return True
+    return False
 
 logger = logging.getLogger("app.services.youtube")
 
@@ -213,6 +235,17 @@ def fetch_youtube_transcript(
     except VideoUnavailable:
         raise ValueError("動画が利用できません（非公開または削除済み）")
     except Exception as e:
+        if _is_blocked_exception(e):
+            logger.warning(
+                f"YouTube blocked request for {video_id} from Cloud Run IP "
+                f"(RequestBlocked/IpBlocked). Proxy or YouTube Data API v3 required."
+            )
+            raise ValueError(
+                "YouTube への接続が一時的に制限されています。"
+                "サーバ管理者によるプロキシ設定が必要です（YouTube が"
+                "クラウド環境からのアクセスをブロックしているため）。"
+                "しばらく時間をおいてから再試行してください。"
+            )
         logger.exception(f"Transcript fetch failed for {video_id}")
         raise ValueError(f"字幕の取得に失敗しました: {str(e)}")
     
