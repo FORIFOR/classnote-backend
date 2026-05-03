@@ -24,11 +24,17 @@ try:
         from youtube_transcript_api._errors import IpBlocked  # type: ignore
     except ImportError:
         IpBlocked = None  # type: ignore
+    # Proxy support (Webshare / generic). Only present on >= 1.0.
+    try:
+        from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig  # type: ignore
+    except ImportError:
+        WebshareProxyConfig = GenericProxyConfig = None  # type: ignore
     YOUTUBE_TRANSCRIPT_AVAILABLE = True
 except ImportError:
     YouTubeTranscriptApi = None
     NoTranscriptFound = TranscriptsDisabled = VideoUnavailable = None
     RequestBlocked = IpBlocked = None
+    WebshareProxyConfig = GenericProxyConfig = None
     YOUTUBE_TRANSCRIPT_AVAILABLE = False
 
 
@@ -42,6 +48,25 @@ def _is_blocked_exception(exc: Exception) -> bool:
     if IpBlocked is not None and isinstance(exc, IpBlocked):
         return True
     return False
+
+
+def _build_proxy_config():
+    """Build proxy config from environment variables.
+    Supports Webshare (native) or generic HTTP proxy URL.
+    Returns None when no proxy is configured.
+    """
+    # Webshare native integration (recommended by youtube-transcript-api docs)
+    ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    ws_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    if ws_user and ws_pass and WebshareProxyConfig is not None:
+        return WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass)
+
+    # Generic HTTP proxy URL fallback (e.g., http://user:pass@host:port)
+    proxy_url = os.environ.get("YOUTUBE_PROXY_URL")
+    if proxy_url and GenericProxyConfig is not None:
+        return GenericProxyConfig(https_url=proxy_url)
+
+    return None
 
 logger = logging.getLogger("app.services.youtube")
 
@@ -207,27 +232,34 @@ def fetch_youtube_transcript(
         # instance-based API. Support both variants so we don't break on
         # library upgrade.
         if hasattr(YouTubeTranscriptApi, "get_transcript"):
-            # Legacy (<1.0)
+            # Legacy (<1.0). Proxy not supported in this codepath.
             items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
         else:
-            # New API (>=1.0): instance .fetch() returns FetchedTranscript
-            # whose .snippets is a list of FetchedTranscriptSnippet objects
-            # exposing .text / .start / .duration. Normalise to dict shape so
-            # the rest of this module (format_transcript_text etc.) keeps
-            # working unchanged.
-            ytt = YouTubeTranscriptApi()
+            # New API (>=1.0): instance .fetch() with optional proxy_config.
+            # Cloud Run egress IPs are widely blocked by YouTube anti-bot;
+            # WEBSHARE_PROXY_USERNAME/PASSWORD env vars (Webshare datacenter
+            # proxy) are required for production reliability.
+            proxy_config = _build_proxy_config()
+            if proxy_config is not None:
+                logger.info(f"Using proxy for YouTube transcript fetch (video={video_id})")
+            ytt = YouTubeTranscriptApi(proxy_config=proxy_config) if proxy_config is not None else YouTubeTranscriptApi()
             fetched = ytt.fetch(video_id, languages=languages)
-            snippets = getattr(fetched, "snippets", None) or list(fetched)
-            items = []
-            for s in snippets:
-                if isinstance(s, dict):
-                    items.append(s)
-                else:
-                    items.append({
-                        "text": getattr(s, "text", "") or "",
-                        "start": float(getattr(s, "start", 0.0) or 0.0),
-                        "duration": float(getattr(s, "duration", 0.0) or 0.0),
-                    })
+            # Prefer the library's official to_raw_data() helper when available,
+            # otherwise normalise FetchedTranscriptSnippet objects manually.
+            if hasattr(fetched, "to_raw_data"):
+                items = fetched.to_raw_data()
+            else:
+                snippets = getattr(fetched, "snippets", None) or list(fetched)
+                items = []
+                for s in snippets:
+                    if isinstance(s, dict):
+                        items.append(s)
+                    else:
+                        items.append({
+                            "text": getattr(s, "text", "") or "",
+                            "start": float(getattr(s, "start", 0.0) or 0.0),
+                            "duration": float(getattr(s, "duration", 0.0) or 0.0),
+                        })
     except TranscriptsDisabled:
         raise ValueError("この動画では字幕が無効化されています")
     except NoTranscriptFound:
