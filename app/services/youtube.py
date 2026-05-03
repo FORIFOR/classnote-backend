@@ -4,6 +4,7 @@ Lightweight alternative to yt-dlp + STT approach.
 """
 
 import logging
+import os
 import re
 from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
