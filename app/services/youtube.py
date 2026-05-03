@@ -180,7 +180,32 @@ def fetch_youtube_transcript(
     logger.info(f"Fetching transcript for video {video_id} with languages {languages}")
     
     try:
-        items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+        # youtube-transcript-api >= 1.0 removed the classmethod
+        # `YouTubeTranscriptApi.get_transcript()` and switched to an
+        # instance-based API. Support both variants so we don't break on
+        # library upgrade.
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            # Legacy (<1.0)
+            items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+        else:
+            # New API (>=1.0): instance .fetch() returns FetchedTranscript
+            # whose .snippets is a list of FetchedTranscriptSnippet objects
+            # exposing .text / .start / .duration. Normalise to dict shape so
+            # the rest of this module (format_transcript_text etc.) keeps
+            # working unchanged.
+            ytt = YouTubeTranscriptApi()
+            fetched = ytt.fetch(video_id, languages=languages)
+            snippets = getattr(fetched, "snippets", None) or list(fetched)
+            items = []
+            for s in snippets:
+                if isinstance(s, dict):
+                    items.append(s)
+                else:
+                    items.append({
+                        "text": getattr(s, "text", "") or "",
+                        "start": float(getattr(s, "start", 0.0) or 0.0),
+                        "duration": float(getattr(s, "duration", 0.0) or 0.0),
+                    })
     except TranscriptsDisabled:
         raise ValueError("この動画では字幕が無効化されています")
     except NoTranscriptFound:
