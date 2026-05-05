@@ -17,6 +17,7 @@
 - `../deepnote-contracts/quality/route-inventory-diff.md`
 - `../deepnote-contracts/quality/production-smoke-checklist.md`
 - `../deepnote-contracts/quality/release-unit-template.md`
+- **`../deepnote-contracts/quality/master-user-pre-deploy-test-instructions.md`** (production deploy 前必須)
 - `../deepnote-contracts/reports/canonicalization-plan.md`
 
 ## Backend が所有する責務
