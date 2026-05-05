@@ -68,6 +68,41 @@ class MoveSessionRequest(BaseModel):
     folderId: Optional[str] = None  # null/省略 = root に戻す
 
 
+class BulkImportItem(BaseModel):
+    """ローカルだけに存在していた folder を server に取り込むための entry。
+
+    iOS UserDefaults / Desktop localStorage に蓄積された folder を初回起動時に
+    bulk POST する用途。
+    """
+    name: str = Field(..., min_length=1, max_length=80)
+    color: Optional[str] = Field(None, max_length=16)
+    icon: Optional[str] = Field(None, max_length=64)
+    order: Optional[int] = None
+    # 既存 session を folder に紐付けるための optional 配列。
+    # 各 sessionId が caller の所有である場合のみ紐付け、所有外は silently skip。
+    sessionIds: Optional[List[str]] = None
+    # client が一意に発行した nonce (例: UUID)。重複呼び出しを idempotent にする。
+    clientId: Optional[str] = Field(None, max_length=64)
+
+
+class BulkImportRequest(BaseModel):
+    items: List[BulkImportItem] = Field(default_factory=list)
+
+
+class BulkImportResult(BaseModel):
+    folderId: str
+    name: str
+    status: str  # "created" | "matched" | "updated" | "skipped"
+    sessionsAssigned: int = 0
+
+
+class BulkImportResponse(BaseModel):
+    results: List[BulkImportResult]
+    created: int = 0
+    matched: int = 0
+    sessionsAssigned: int = 0
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -332,6 +367,121 @@ def list_sessions_in_folder_legacy(folder_id: str, current_user: CurrentUser = D
 
 # =============================================================================
 # Move endpoint — canonical /v1/sessions/{id}:move + legacy /sessions/{id}:move
+# =============================================================================
+
+# =============================================================================
+# Bulk import (client-local → server migration)
+# =============================================================================
+# iOS UserDefaults / Desktop localStorage に蓄積された folder を初回起動時に取り込む。
+# 既存の同名 folder は skip (matched)、新規だけ create する idempotent 設計。
+# session の所有者外 sessionId は silently skip (security)。
+MAX_BULK_ITEMS = 200
+
+
+def _bulk_import_impl(uid: str, items: List[BulkImportItem]) -> BulkImportResponse:
+    if len(items) > MAX_BULK_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Too many items (max {MAX_BULK_ITEMS})")
+
+    # 既存 folder name → folderId の index を 1 回だけ作る
+    existing = list(_folders_collection(uid).stream())
+    name_to_id: dict[str, str] = {}
+    for d in existing:
+        data = d.to_dict() or {}
+        n = (data.get("name") or "").strip()
+        if n:
+            name_to_id.setdefault(n, d.id)
+
+    base_order = _next_order(uid)
+    results: List[BulkImportResult] = []
+    created = 0
+    matched = 0
+    sessions_assigned_total = 0
+    now = datetime.now(timezone.utc)
+
+    for i, item in enumerate(items):
+        name = item.name.strip()
+        if not name:
+            continue
+
+        if name in name_to_id:
+            folder_id = name_to_id[name]
+            status_label = "matched"
+        else:
+            folder_id = uuid.uuid4().hex[:16]
+            order = item.order if item.order is not None else (base_order + i)
+            data = {
+                "name": name,
+                "color": item.color,
+                "icon": item.icon,
+                "order": int(order),
+                "sessionCount": 0,
+                "createdAt": now,
+                "updatedAt": now,
+                "importedFromClient": True,
+                "clientId": item.clientId,
+            }
+            _folders_collection(uid).document(folder_id).set(data)
+            name_to_id[name] = folder_id
+            status_label = "created"
+            created += 1
+
+        sessions_assigned = 0
+        if item.sessionIds:
+            for sess_id in item.sessionIds[:500]:  # safety cap
+                try:
+                    sess_ref = db.collection("sessions").document(sess_id)
+                    snap = sess_ref.get()
+                    if not snap.exists:
+                        continue
+                    sdata = snap.to_dict() or {}
+                    if sdata.get("ownerUserId") != uid:
+                        continue  # 所有者外は silently skip
+                    if sdata.get("folderId") == folder_id:
+                        continue
+                    sess_ref.update({"folderId": folder_id, "updatedAt": now})
+                    sessions_assigned += 1
+                except Exception as e:
+                    logger.warning(f"bulkImport: failed to assign session {sess_id} to folder {folder_id}: {e}")
+
+        if sessions_assigned > 0:
+            try:
+                _folders_collection(uid).document(folder_id).update({
+                    "sessionCount": firestore.Increment(sessions_assigned),
+                    "updatedAt": now,
+                })
+            except Exception as e:
+                logger.warning(f"bulkImport: sessionCount update failed for {folder_id}: {e}")
+
+        if status_label == "matched":
+            matched += 1
+        sessions_assigned_total += sessions_assigned
+        results.append(BulkImportResult(
+            folderId=folder_id,
+            name=name,
+            status=status_label,
+            sessionsAssigned=sessions_assigned,
+        ))
+
+    return BulkImportResponse(
+        results=results,
+        created=created,
+        matched=matched,
+        sessionsAssigned=sessions_assigned_total,
+    )
+
+
+@router.post(":bulkImport", response_model=BulkImportResponse)
+def bulk_import_folders(body: BulkImportRequest, current_user: CurrentUser = Depends(get_current_user)):
+    return _bulk_import_impl(current_user.uid, body.items)
+
+
+@legacy_router.post(":bulkImport", response_model=BulkImportResponse, include_in_schema=False)
+def bulk_import_folders_legacy(body: BulkImportRequest, current_user: CurrentUser = Depends(get_current_user)):
+    return _bulk_import_impl(current_user.uid, body.items)
+
+
+# =============================================================================
+# Move endpoints (canonical /v1/sessions/{id}:move + legacy /sessions/{id}:move)
 # =============================================================================
 
 @move_router.post("/v1/sessions/{session_id}:move")
