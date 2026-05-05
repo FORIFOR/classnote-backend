@@ -27,6 +27,7 @@ from app.dependencies import CurrentUser, get_current_user
 from app.services import line_link_tokens
 from app.services import line_messaging
 from app.services import line_briefing
+from app.services import asset_delivery
 
 logger = logging.getLogger("app.routes.integrations.line")
 
@@ -70,6 +71,8 @@ class M:
         "・「最新」: 最新の会議の要約\n"
         "・「TODO」: 直近のTODO（最大3件）\n"
         "・「決定事項」: 最新会議の決定事項\n"
+        "・「資料」: 最新会議の PDF / DOCX / PPTX リンク\n"
+        "・「PDF」「DOCX」「PPTX」: 個別フォーマット\n"
         "・「ヘルプ」: この案内"
     )
 
@@ -111,6 +114,16 @@ class M:
     DECISIONS_NONE = "最新の会議には決定事項が記録されていません。"
     DECISIONS_HEADER = "最新の会議の決定事項:"
     DECISIONS_LINE = "・{text}"
+
+    ASSETS_NONE = "最新会議の記録がないため、資料リンクをお出しできません。"
+    ASSETS_HEADER = "最新会議「{title}」の資料リンクです。"
+    ASSETS_TEMPLATE = (
+        "{header}\n"
+        "Web: {web}\n"
+        "PDF: {pdf}\n"
+        "DOCX: {docx}\n"
+        "PPTX: {pptx}"
+    )
 
     CONFIG_MISSING = (
         "サーバー設定が未完了のため、LINE連携をご案内できません。"
@@ -201,6 +214,14 @@ def _classify_command(text: str) -> str:
         return "todos"
     if any(k in t for k in ("決定", "decision")):
         return "decisions"
+    if any(k in t for k in ("pdf", "ピーディーエフ")):
+        return "pdf"
+    if "docx" in t or "ワード" in t or "word" in t:
+        return "docx"
+    if "pptx" in t or "パワポ" in t or "ppt" in t or "powerpoint" in t:
+        return "pptx"
+    if any(k in t for k in ("資料", "asset", "asset")):
+        return "assets"
     return "unknown"
 
 
@@ -218,6 +239,23 @@ def _build_reply_for_linked(account_id: str, command: str) -> str:
         return _format_todos(line_briefing.get_recent_todos(account_id, limit=3))
     if command == "decisions":
         return _format_decisions(line_briefing.get_latest_decisions(account_id))
+    if command in ("assets", "pdf", "docx", "pptx"):
+        bundle = asset_delivery.get_latest_export_links(account_id)
+        if not bundle:
+            return M.ASSETS_NONE
+        if command == "pdf":
+            return f"最新会議「{bundle['title']}」の PDF: {bundle['links']['pdf']}"
+        if command == "docx":
+            return f"最新会議「{bundle['title']}」の DOCX: {bundle['links']['docx']}"
+        if command == "pptx":
+            return f"最新会議「{bundle['title']}」の PPTX: {bundle['links']['pptx']}"
+        return M.ASSETS_TEMPLATE.format(
+            header=M.ASSETS_HEADER.format(title=bundle["title"]),
+            web=bundle["links"]["web"],
+            pdf=bundle["links"]["pdf"],
+            docx=bundle["links"]["docx"],
+            pptx=bundle["links"]["pptx"],
+        )
     return M.UNKNOWN_COMMAND
 
 
