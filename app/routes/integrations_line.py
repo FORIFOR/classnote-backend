@@ -29,6 +29,7 @@ from app.services import line_messaging
 from app.services import line_briefing
 from app.services import asset_delivery
 from app.services import bot_audit
+from app.services import group_shared_briefing
 
 logger = logging.getLogger("app.routes.integrations.line")
 
@@ -86,6 +87,16 @@ class M:
     GROUP_NOT_SUPPORTED = (
         "現在、LINEグループでのご利用には未対応です。\n"
         "DeepNote とLINEの個人チャットでご利用ください。"
+    )
+
+    GROUP_NO_SHARED_DATA = (
+        "このグループに共有された会議データが見つかりませんでした。\n"
+        "DeepNote 上で「このワークスペースに共有」を有効にしてからご利用ください。"
+    )
+
+    GROUP_PRIVATE_REJECTED = (
+        "クレジット残量や TODO は個人情報のため、グループでは表示できません。\n"
+        "DeepNote との個人チャットでご確認ください。"
     )
 
     UNKNOWN_COMMAND = (
@@ -270,12 +281,56 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
     line_user_id = source.get("userId") or ""
 
     if source_type != "user":
-        # Phase 1: groups / rooms get a polite "not supported" reply only.
-        line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
+        # Phase 7: groups / rooms can request *shared* data from a linked
+        # speaker, but never private data (credit / TODO). If the speaker
+        # is not linked, OR no shared session exists, we fall back to the
+        # "未対応" notice so we still never leak private data.
+        group_id = source.get("groupId") or source.get("roomId")
+        if not group_id or not line_user_id:
+            line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
+            bot_audit.record(
+                provider="line", source_type=source_type or "unknown",
+                source_user_id=line_user_id, command="unsupported",
+                outcome="blocked_unsupported_source",
+            )
+            return
+        link = line_link_tokens.get_link(line_user_id)
+        cmd = _classify_command(user_text)
+        if cmd in ("credit", "todos"):
+            line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_PRIVATE_REJECTED)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=(link or {}).get("accountId"),
+                command=cmd, outcome="blocked_private_in_group",
+            )
+            return
+        if not link:
+            line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id, command=cmd,
+                outcome="blocked_unsupported_source",
+            )
+            return
+        ws_key = f"line:{group_id}"
+        if cmd == "decisions":
+            decisions = group_shared_briefing.get_recent_shared_decisions(
+                link["accountId"], ws_key, limit=3
+            )
+            text = _format_decisions(decisions) if decisions else M.GROUP_NO_SHARED_DATA
+        elif cmd == "latest" or cmd == "help":
+            shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
+            text = _format_latest(shared) if shared else M.GROUP_NO_SHARED_DATA
+        else:
+            text = M.GROUP_NO_SHARED_DATA
+        line_messaging.reply(reply_token, [line_messaging.text_message(text)])
         bot_audit.record(
-            provider="line", source_type=source_type or "unknown",
-            source_user_id=line_user_id, command="unsupported",
-            outcome="blocked_unsupported_source",
+            provider="line", source_type=source_type,
+            source_user_id=line_user_id,
+            account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+            command=cmd,
+            outcome="ok_shared_only" if "共有" not in text else "no_shared_data",
         )
         return
 
@@ -512,7 +567,15 @@ def _render_invalid_page() -> HTMLResponse:
 
 
 def _render_login_prompt_page(token: str) -> HTMLResponse:
-    body = f"<p>{M.CONNECT_LOGIN_PROMPT}</p><p class=\"url\">token: {token}</p>"
+    """Redirect-style fallback page: send the user to the backend-hosted
+    Firebase login (Phase 5). If the user lands on the connect URL from a
+    desktop browser and no LINE_CONNECT_FRONTEND_URL is configured, we
+    self-host the login flow at /integrations/line/login?token=...
+    """
+    body = (
+        f"<p>{M.CONNECT_LOGIN_PROMPT}</p>"
+        f"<p><a href=\"/integrations/line/login?token={token}\">DeepNote にログインして連携を完了する</a></p>"
+    )
     return _render_html(title=M.CONNECT_PAGE_TITLE, body_html=body)
 
 

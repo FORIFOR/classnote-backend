@@ -86,7 +86,9 @@ async def test_line_dm_unlinked_records_audit(line_configured, line_links, captu
 
 
 @pytest.mark.anyio
-async def test_line_group_message_records_blocked(line_configured, line_links, captured_audit):
+async def test_line_group_credit_records_private_blocked(line_configured, line_links, captured_audit):
+    """Phase 7: credit in group → blocked_private_in_group (was previously unsupported)."""
+    line_links["links"]["U2"] = {"accountId": "acct", "deepnoteUid": "uid"}
     body = json.dumps({"events": [{
         "type": "message", "replyToken": "rt",
         "source": {"type": "group", "groupId": "G", "userId": "U2"},
@@ -96,9 +98,9 @@ async def test_line_group_message_records_blocked(line_configured, line_links, c
         await c.post("/integrations/line/webhook", content=body,
                      headers={"X-Line-Signature": "x"})
     row = captured_audit[-1]
-    assert row["outcome"] == "blocked_unsupported_source"
+    assert row["outcome"] == "blocked_private_in_group"
     assert row["source_type"] == "group"
-    assert row["command"] == "unsupported"
+    assert row["command"] == "credit"
 
 
 @pytest.mark.anyio
@@ -123,7 +125,8 @@ async def test_line_linked_credit_records_ok(line_configured, line_links, captur
 
 
 @pytest.mark.anyio
-async def test_slack_channel_records_blocked(slack_configured, slack_links, captured_audit):
+async def test_slack_channel_credit_records_private_blocked(slack_configured, slack_links, captured_audit):
+    """Phase 7: credit @mention in channel → blocked_private_in_group."""
     body = json.dumps({"type": "event_callback", "team_id": "T",
         "event": {"type": "app_mention", "channel_type": "channel", "channel": "C",
                   "user": "U", "text": "<@BOT> credit", "ts": "1.0"}}).encode()
@@ -132,7 +135,8 @@ async def test_slack_channel_records_blocked(slack_configured, slack_links, capt
     row = captured_audit[-1]
     assert row["provider"] == "slack"
     assert row["source_type"] == "channel"
-    assert row["outcome"] == "blocked_unsupported_source"
+    assert row["outcome"] == "blocked_private_in_group"
+    assert row["command"] == "credit"
 
 
 @pytest.mark.anyio

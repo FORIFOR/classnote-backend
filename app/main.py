@@ -290,6 +290,15 @@ app.include_router(integrations_slack.router)
 # DeepNote Clow scheduled digests (Phase 3 — Cloud Scheduler hits this internal route)
 from app.routes import digests as _digests
 app.include_router(_digests.router, include_in_schema=False)
+# DeepNote Clow Phase 5 — backend-hosted Firebase login fallback for bot connect
+from app.routes import bot_login as _bot_login
+app.include_router(_bot_login.router)
+# DeepNote Clow Phase 6 — backend-hosted GET bridge for /sessions/{id}/export
+from app.routes import bot_export_bridge as _bot_export_bridge
+app.include_router(_bot_export_bridge.router)
+# DeepNote Clow Phase 8 — self-service settings + audit + opt-out for bot users
+from app.routes import bot_settings as _bot_settings
+app.include_router(_bot_settings.router)
 # Startup soft-check: warn if token_crypto / OAuth not configured
 try:
     from app.services import token_crypto as _token_crypto

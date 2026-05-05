@@ -152,7 +152,10 @@ async def test_webhook_linked_user_credit_command(configured, fake_links, monkey
 
 
 @pytest.mark.anyio
-async def test_webhook_group_message_returns_unsupported(configured, fake_links):
+async def test_webhook_group_credit_request_blocked(configured, fake_links):
+    """Phase 7: credit/TODO are private — even linked speakers can't see them in groups."""
+    fake_links["links"]["U3"] = {"deepnoteUid": "uid-3", "accountId": "acct-3",
+                                  "lineSourceType": "user"}
     body = json.dumps({"events": [{
         "type": "message",
         "replyToken": "rt-g",
@@ -164,8 +167,8 @@ async def test_webhook_group_message_returns_unsupported(configured, fake_links)
                          headers={"X-Line-Signature": "x"})
     assert r.status_code == 200
     text = configured[-1][2][0]["text"]
-    assert "未対応" in text
-    # Crucially, no credit data for U3 should leak.
+    assert "個人情報" in text
+    # No credit numbers may appear.
     assert "あなたのDeepNoteアカウント" not in text
 
 

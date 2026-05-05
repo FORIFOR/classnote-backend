@@ -158,8 +158,8 @@ async def test_dm_linked_credit_command(configured, fake_links, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_channel_mention_returns_unsupported(configured, fake_links):
-    """Public channel mentions must NEVER expose personal data."""
+async def test_channel_credit_mention_is_blocked(configured, fake_links):
+    """Phase 7: channel @mention asking for credit must NEVER expose personal data."""
     fake_links["links"][("T3", "U3")] = {"deepnoteUid": "uid-3", "accountId": "acct-3",
                                          "teamId": "T3", "slackUserId": "U3"}
     body = json.dumps({
@@ -174,7 +174,7 @@ async def test_channel_mention_returns_unsupported(configured, fake_links):
         r = await c.post("/integrations/slack/events", content=body)
     assert r.status_code == 200
     text = configured[-1]["text"]
-    assert "未対応" in text
+    assert "個人情報" in text
     assert "あなたのDeepNoteアカウント" not in text
 
 

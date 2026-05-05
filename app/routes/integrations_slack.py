@@ -28,6 +28,7 @@ from app.services import slack_briefing
 from app.services import slack_oauth_state
 from app.services import asset_delivery
 from app.services import bot_audit
+from app.services import group_shared_briefing
 from app.services.integrations import slack_client
 
 logger = logging.getLogger("app.routes.integrations.slack")
@@ -83,6 +84,14 @@ class M:
     GROUP_NOT_SUPPORTED = (
         "現在、チャンネルでのご利用には未対応です。\n"
         "DeepNote とのSlack DMでご利用ください。"
+    )
+    GROUP_NO_SHARED_DATA = (
+        "このチャンネルに共有された会議データが見つかりませんでした。\n"
+        "DeepNote 上で「このワークスペースに共有」を有効にしてからご利用ください。"
+    )
+    GROUP_PRIVATE_REJECTED = (
+        "クレジット残量や TODO は個人情報のため、チャンネルでは表示できません。\n"
+        "DeepNote との DM でご確認ください。"
     )
 
     UNKNOWN_COMMAND = "認識できませんでした。「ヘルプ」と送ると使い方が表示されます。"
@@ -278,14 +287,50 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         return  # never reply to bots / our own posts
 
     if channel_type != "im":
-        # Channel / group / mpim → polite refusal, no personal data.
-        if event.get("type") == "app_mention":
+        # Phase 7: channel / group can request *shared* sessions, but never
+        # private data. Public channels are noisy, so we only respond to
+        # explicit @mentions, not every message.
+        if event.get("type") != "app_mention":
+            return
+        cmd = _classify_command(_strip_app_mentions(text))
+        if cmd in ("credit", "todos"):
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=M.GROUP_PRIVATE_REJECTED, thread_ts=thread_ts)
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id, command=cmd,
+                outcome="blocked_private_in_group",
+            )
+            return
+        link = slack_link_tokens.get_link(team_id, user)
+        if not link:
             slack_client.post_message(team_id=team_id, channel=channel,
                                       text=M.GROUP_NOT_SUPPORTED, thread_ts=thread_ts)
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id, command=cmd,
+                outcome="blocked_unsupported_source",
+            )
+            return
+        ws_key = f"slack:{team_id}"
+        if cmd == "decisions":
+            decisions = group_shared_briefing.get_recent_shared_decisions(
+                link["accountId"], ws_key, limit=3
+            )
+            reply_text = _format_decisions(decisions) if decisions else M.GROUP_NO_SHARED_DATA
+        elif cmd in ("latest", "help"):
+            shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
+            reply_text = _format_latest(shared) if shared else M.GROUP_NO_SHARED_DATA
+        else:
+            reply_text = M.GROUP_NO_SHARED_DATA
+        slack_client.post_message(team_id=team_id, channel=channel,
+                                  text=reply_text, thread_ts=thread_ts)
         bot_audit.record(
             provider="slack", source_type=channel_type or "unknown",
-            source_user_id=user, team_id=team_id, command="unsupported",
-            outcome="blocked_unsupported_source",
+            source_user_id=user, team_id=team_id,
+            account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+            command=cmd,
+            outcome="ok_shared_only" if "共有" not in reply_text else "no_shared_data",
         )
         return
 
@@ -505,7 +550,10 @@ def _render_invalid_page() -> HTMLResponse:
 
 
 def _render_login_prompt_page(token: str) -> HTMLResponse:
-    body = f"<p>{M.CONNECT_LOGIN_PROMPT}</p><p class=\"url\">token: {token}</p>"
+    body = (
+        f"<p>{M.CONNECT_LOGIN_PROMPT}</p>"
+        f"<p><a href=\"/integrations/slack/login?token={token}\">DeepNote にログインして連携を完了する</a></p>"
+    )
     return _render_html(title=M.CONNECT_PAGE_TITLE, body_html=body)
 
 

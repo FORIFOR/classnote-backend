@@ -29,10 +29,17 @@ logger = logging.getLogger("app.services.asset_delivery")
 
 
 def _app_base_url() -> str:
+    """Where the export bridge / web view lives.
+
+    Priority:
+      1. DEEPNOTE_APP_BASE_URL (frontend, when it exists)
+      2. CLOUD_RUN_SERVICE_URL (backend self-host bridge — Phase 6)
+      3. hard-coded prod backend URL (last resort)
+    """
     return (
         os.environ.get("DEEPNOTE_APP_BASE_URL")
         or os.environ.get("CLOUD_RUN_SERVICE_URL")
-        or "https://app.deepnote.example"
+        or "https://deepnote-api-mur5rvqgga-an.a.run.app"
     ).rstrip("/")
 
 
