@@ -31,6 +31,31 @@ from datetime import datetime, timezone
 router = APIRouter()
 logger = logging.getLogger("app.tasks")
 
+# Cloud Tasks `summarize-queue` / `quiz-queue` are configured with maxAttempts=3.
+# When this is the final attempt, transient errors must be persisted as a
+# terminal "failed" state instead of bouncing a 503 back to Cloud Tasks —
+# otherwise the session is left stranded at summaryStatus="running" and
+# never recovers in the UI.
+CLOUD_TASKS_MAX_ATTEMPTS = 3
+
+
+def _is_final_cloud_task_attempt(request: Request) -> bool:
+    """Return True iff the incoming request is the last permitted retry.
+
+    Cloud Tasks sends ``X-CloudTasks-TaskRetryCount`` (0-indexed retries
+    *after* the initial dispatch). On the final allowed attempt that
+    counter equals ``maxAttempts - 1``. Header is absent for direct curl /
+    local invocations — treat that as "not final" so we keep the same
+    retry-friendly behaviour outside of Cloud Tasks.
+    """
+    raw = request.headers.get("X-CloudTasks-TaskRetryCount")
+    if raw is None:
+        return False
+    try:
+        return int(raw) >= CLOUD_TASKS_MAX_ATTEMPTS - 1
+    except (TypeError, ValueError):
+        return False
+
 @router.get("/internal/tasks/ping")
 async def ping_task():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc)}
@@ -111,19 +136,24 @@ async def handle_summarize_quick_task(request: Request):
 
     except Exception as e:
         logger.exception(f"[QuickSummary] Failed for {session_id}")
+        error_str = str(e)
+        is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str
+        final_attempt = _is_final_cloud_task_attempt(request)
+        if is_transient and not final_attempt:
+            # Don't persist "failed" yet — let Cloud Tasks retry with a fresh
+            # quota window. The session keeps its current pending state.
+            raise HTTPException(status_code=503, detail="Transient error, retrying...")
         if derived_ref is not None:
             try:
                 derived_ref.set({
                     "status": "failed",
-                    "errorReason": str(e),
+                    "errorReason": error_str,
                     "updatedAt": datetime.now(timezone.utc),
                     "idempotencyKey": idempotency_key,
+                    "finalAttempt": final_attempt and is_transient,
                 }, merge=True)
             except Exception:
                 pass
-        error_str = str(e)
-        if "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str:
-            raise HTTPException(status_code=503, detail="Transient error, retrying...")
         return {"status": "failed", "error": error_str}
 
 
@@ -412,37 +442,43 @@ async def _handle_summarize_task_core(request: Request):
             await usage_logger.log(user_id=final_user_id, feature="summary", event_type="error", session_id=session_id)
         error_str = str(e)
         is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
-        
-        if is_transient:
-             logger.warning(f"Transient error detected for session {session_id}, raising 503 for retry.")
+        final_attempt = _is_final_cloud_task_attempt(request)
+
+        if is_transient and not final_attempt:
+             logger.warning(f"Transient error for session {session_id} (retry available), raising 503 for retry.")
              raise HTTPException(status_code=503, detail="Transient error, retrying...")
 
-        # Update DB on failure
-        # We need to be careful if DB init failed, db might be undefined? 
-        # But we are inside try where db init happened or returned.
+        # Persist terminal failure: either non-transient OR Cloud Tasks final
+        # attempt. Without this, sessions hit by sustained 429 stay stuck at
+        # summaryStatus="running" forever once Cloud Tasks gives up.
+        terminal_reason = (
+            f"Vertex AI transient error after {CLOUD_TASKS_MAX_ATTEMPTS} attempts: {error_str}"
+            if is_transient and final_attempt
+            else error_str
+        )
         try:
              doc_ref.update({
                  "summaryStatus": "failed",
-                 "summaryError": str(e),
+                 "summaryError": terminal_reason,
                  "summaryUpdatedAt": datetime.now(timezone.utc),
                  "status": "録音済み",
              })
              if job_id:
-                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
+                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": terminal_reason}, merge=True)
              derived_ref.set({
                  "status": "failed",
-                 "errorReason": str(e),
+                 "errorReason": terminal_reason,
                  "updatedAt": datetime.now(timezone.utc),
                  "idempotencyKey": idempotency_key,
+                 "finalAttempt": is_transient and final_attempt,
              }, merge=True)
              await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
         except Exception as db_err:
             logger.warning(f"[summarize] Failed to update error status in DB: {db_err}")
 
-        # ops_logger: job failed
-        log_job_transition(session_id, "summarize", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
+        log_job_transition(session_id, "summarize", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=terminal_reason)
 
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": terminal_reason}
 
     # finally: removed
 
@@ -713,30 +749,35 @@ async def _handle_quiz_task_core(request: Request):
             await usage_logger.log(user_id=final_user_id, feature="quiz", event_type="error", session_id=session_id)
         error_str = str(e)
         is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
+        final_attempt = _is_final_cloud_task_attempt(request)
 
-        if is_transient:
-             logger.warning(f"Transient error detected for quiz {session_id}, raising 503 for retry.")
+        if is_transient and not final_attempt:
+             logger.warning(f"Transient error for quiz {session_id} (retry available), raising 503 for retry.")
              raise HTTPException(status_code=503, detail="Transient error, retrying...")
 
-        # Safe DB update
+        terminal_reason = (
+            f"Vertex AI transient error after {CLOUD_TASKS_MAX_ATTEMPTS} attempts: {error_str}"
+            if is_transient and final_attempt
+            else error_str
+        )
         try:
-            doc_ref.update({"quizStatus": "failed", "quizError": str(e), "status": "録音済み"})
+            doc_ref.update({"quizStatus": "failed", "quizError": terminal_reason, "status": "録音済み"})
             if job_id:
-                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
+                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": terminal_reason}, merge=True)
             derived_ref.set({
                 "status": "failed",
-                "errorReason": str(e),
+                "errorReason": terminal_reason,
                 "updatedAt": datetime.now(timezone.utc),
                 "idempotencyKey": idempotency_key,
+                "finalAttempt": is_transient and final_attempt,
             }, merge=True)
             await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
         except Exception as db_err:
             logger.warning(f"[quiz] Failed to update error status in DB: {db_err}")
 
-        # ops_logger: job failed
-        log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
+        log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=terminal_reason)
 
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": terminal_reason}
 
     # finally: removed
 
