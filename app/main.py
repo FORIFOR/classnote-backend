@@ -242,6 +242,12 @@ app.include_router(account_merge.router, tags=["Account Merge"])
 app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
 app.include_router(sessions.router, tags=["Sessions"])
+# Folders / Library organisation — canonical /v1/folders + legacy /folders + /sessions/{id}:move
+# See: deepnote-contracts/api/endpoints-map.md (V-017/V-018)
+from app.routes import folders as _folders_module
+app.include_router(_folders_module.router)
+app.include_router(_folders_module.legacy_router)
+app.include_router(_folders_module.move_router)
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)
 app.include_router(websocket.router, tags=["Streaming"])
 app.include_router(auth.router, tags=["Authentication"])
