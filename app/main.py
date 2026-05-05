@@ -287,6 +287,9 @@ app.include_router(integrations_line.router)
 # DeepNote Clow Slack bot (Phase 1: 1:1 DM only — events + OAuth install + link-token API)
 from app.routes import integrations_slack
 app.include_router(integrations_slack.router)
+# DeepNote Clow scheduled digests (Phase 3 — Cloud Scheduler hits this internal route)
+from app.routes import digests as _digests
+app.include_router(_digests.router, include_in_schema=False)
 # Startup soft-check: warn if token_crypto / OAuth not configured
 try:
     from app.services import token_crypto as _token_crypto
