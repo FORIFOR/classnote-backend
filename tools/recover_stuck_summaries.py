@@ -85,7 +85,24 @@ def main() -> int:
                   f"updated={updated} owner={data.get('ownerAccountId')}")
         return 0
 
-    from app.task_queue import enqueue_summarize_task
+    # Standalone Cloud Tasks enqueue — avoid importing app.task_queue so this
+    # script runs without fastapi installed locally. Mirrors the production
+    # ``enqueue_summarize_task`` payload (sessionId / jobId / idempotencyKey
+    # / userId / usageReserved) and target URL exactly.
+    import json as _json
+    from google.cloud import tasks_v2  # type: ignore
+
+    location = os.environ.get("TASKS_LOCATION", "asia-northeast1")
+    queue_name = os.environ.get("SUMMARIZE_QUEUE", "summarize-queue")
+    cloud_run_url = os.environ.get("CLOUD_RUN_SERVICE_URL")
+    if not cloud_run_url:
+        print("ERROR: CLOUD_RUN_SERVICE_URL not set "
+              "(e.g. https://deepnote-api-...run.app)", file=sys.stderr)
+        return 2
+
+    tasks_client = tasks_v2.CloudTasksClient()
+    parent = tasks_client.queue_path(project_id, location, queue_name)
+    target_url = f"{cloud_run_url.rstrip('/')}/internal/tasks/summarize"
 
     enqueued = 0
     failed = 0
@@ -94,6 +111,22 @@ def main() -> int:
             break
         owner_uid = data.get("ownerUserId") or data.get("userId") or data.get("ownerUid")
         idem = f"recover-stuck:{sid}:{int(time.time() // 60)}"
+        payload = {
+            "sessionId": sid,
+            "jobId": None,
+            "idempotencyKey": idem,
+            "userId": owner_uid,
+            "usageReserved": False,
+        }
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": target_url,
+                "headers": {"Content-Type": "application/json"},
+                "body": _json.dumps(payload).encode(),
+            },
+            "dispatch_deadline": {"seconds": 1800},
+        }
         try:
             db.collection("sessions").document(sid).update({
                 "summaryStatus": "queued",
@@ -101,7 +134,7 @@ def main() -> int:
                 "summaryUpdatedAt": datetime.now(timezone.utc),
                 "summaryRecoveredAt": datetime.now(timezone.utc),
             })
-            enqueue_summarize_task(sid, user_id=owner_uid, idempotency_key=idem)
+            tasks_client.create_task(parent=parent, task=task)
             enqueued += 1
             print(f"  [REQUEUE] {sid} (owner={owner_uid})")
         except Exception as e:
