@@ -248,6 +248,7 @@ from app.routes import folders as _folders_module
 app.include_router(_folders_module.router)
 app.include_router(_folders_module.legacy_router)
 app.include_router(_folders_module.move_router)
+app.include_router(_folders_module.bulk_router)
 app.include_router(tasks.router, tags=["Internal Tasks"], include_in_schema=False)
 app.include_router(websocket.router, tags=["Streaming"])
 app.include_router(auth.router, tags=["Authentication"])

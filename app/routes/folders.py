@@ -29,6 +29,9 @@ logger = logging.getLogger("app.folders")
 router = APIRouter(prefix="/v1/folders", tags=["Folders"])
 legacy_router = APIRouter(prefix="/folders", tags=["Folders"], include_in_schema=False)
 move_router = APIRouter(tags=["Folders"])  # /v1/sessions/{id}:move + legacy alias
+# colon-RPC action paths (`:bulkImport`) は prefix と "/" 区切りで結合されると
+# `{folder_id}` variable にマッチしてしまうため、専用 router で path を直接書く。
+bulk_router = APIRouter(tags=["Folders"])
 
 
 # =============================================================================
@@ -470,12 +473,12 @@ def _bulk_import_impl(uid: str, items: List[BulkImportItem]) -> BulkImportRespon
     )
 
 
-@router.post(":bulkImport", response_model=BulkImportResponse)
+@bulk_router.post("/v1/folders:bulkImport", response_model=BulkImportResponse)
 def bulk_import_folders(body: BulkImportRequest, current_user: CurrentUser = Depends(get_current_user)):
     return _bulk_import_impl(current_user.uid, body.items)
 
 
-@legacy_router.post(":bulkImport", response_model=BulkImportResponse, include_in_schema=False)
+@bulk_router.post("/folders:bulkImport", response_model=BulkImportResponse, include_in_schema=False)
 def bulk_import_folders_legacy(body: BulkImportRequest, current_user: CurrentUser = Depends(get_current_user)):
     return _bulk_import_impl(current_user.uid, body.items)
 
