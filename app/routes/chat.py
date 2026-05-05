@@ -718,10 +718,13 @@ class CreditReport(BaseModel):
     plan: str
     monthly_limit: int
     topup_credits: int
+    total_limit: int | None
+    unlimited: bool
     used: int
     remaining: int
     daily_used: int
     daily_soft_cap: int
+    daily_remaining: int
 
 
 @router.get("/credits", response_model=CreditReport)
@@ -730,14 +733,22 @@ async def get_credits(
 ):
     """Get AI credit status for the current user."""
     report = ai_credits.get_credit_report(user.account_id)
+    monthly_limit = int(report["monthlyLimit"])
+    topup = int(report["topupCredits"])
+    unlimited = bool(report.get("unlimitedCredits", False))
+    daily_used = int(report["dailyUsed"])
+    daily_cap = int(report["dailySoftCap"])
     return CreditReport(
         plan=report["plan"],
-        monthly_limit=report["monthlyLimit"],
-        topup_credits=report["topupCredits"],
-        used=report["used"],
-        remaining=report["remaining"],
-        daily_used=report["dailyUsed"],
-        daily_soft_cap=report["dailySoftCap"],
+        monthly_limit=monthly_limit,
+        topup_credits=topup,
+        total_limit=None if unlimited else (monthly_limit + topup),
+        unlimited=unlimited,
+        used=int(report["used"]),
+        remaining=int(report["remaining"]),
+        daily_used=daily_used,
+        daily_soft_cap=daily_cap,
+        daily_remaining=max(0, daily_cap - daily_used),
     )
 
 

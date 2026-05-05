@@ -1,12 +1,11 @@
-import os
 from urllib.parse import urlencode
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 
-from app.dependencies import get_current_user, get_current_user_optional, CurrentUser, CurrentUser
+from app.dependencies import get_current_user, get_current_user_optional, CurrentUser
 from app.google_calendar import (
     _sign_state,
     _verify_state,
@@ -14,11 +13,15 @@ from app.google_calendar import (
     GOOGLE_CLIENT_SECRET,
     GOOGLE_REDIRECT_URI,
     GOOGLE_SCOPES,
+    delete_tokens,
+    list_events,
+    load_tokens,
     save_tokens,
 )
 
 
 router = APIRouter(prefix="/google")
+integrations_router = APIRouter(prefix="/integrations/google", tags=["Google Integration"])
 
 
 @router.get("/oauth/start")
@@ -29,7 +32,7 @@ async def google_oauth_start(
 ):
     # Determine UID: priority to `token` query param (for iOS Safari), fallback to Header (for Web)
     uid = None
-    
+
     if token:
         try:
             from firebase_admin import auth
@@ -39,7 +42,7 @@ async def google_oauth_start(
             raise HTTPException(status_code=401, detail="Invalid token")
     elif current_user:
         uid = current_user.uid
-    
+
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -103,3 +106,74 @@ async def google_oauth_callback(code: str, state: str):
     # Fallback: JSON
     return JSONResponse({"status": "connected", "uid": uid})
 
+
+# ────────────────────────────────────────────────
+# /integrations/google/status, /integrations/google, /integrations/google/calendar/events
+# ────────────────────────────────────────────────
+
+@integrations_router.get("/status")
+async def google_integration_status(current_user: CurrentUser = Depends(get_current_user)):
+    tokens = load_tokens(current_user.uid)
+    if not tokens:
+        return {"connected": False}
+
+    expires_at = tokens.get("expiresAt")
+    expires_iso: str | None = None
+    if isinstance(expires_at, datetime):
+        expires_iso = expires_at.astimezone(timezone.utc).isoformat()
+    elif isinstance(expires_at, str):
+        expires_iso = expires_at
+
+    return {
+        "connected": True,
+        "hasRefreshToken": bool(tokens.get("refreshToken")),
+        "expiresAt": expires_iso,
+        "scopes": GOOGLE_SCOPES.split(),
+    }
+
+
+@integrations_router.delete("")
+async def google_integration_disconnect(current_user: CurrentUser = Depends(get_current_user)):
+    existed = delete_tokens(current_user.uid)
+    return {"disconnected": existed}
+
+
+@integrations_router.get("/calendar/events")
+async def list_google_calendar_events(
+    start: datetime | None = Query(
+        None,
+        description="ISO8601 (UTC). 省略時は現在時刻。",
+    ),
+    end: datetime | None = Query(
+        None,
+        description="ISO8601 (UTC). 省略時は start + 7 日。",
+    ),
+    top: int = Query(50, ge=1, le=200, description="返す最大件数（1-200）"),
+    calendar_id: str = Query("primary", description="カレンダー ID（既定: primary）"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    now = datetime.now(timezone.utc)
+    s = start or now
+    e = end or (s + timedelta(days=7))
+    if e <= s:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    try:
+        events = list_events(current_user.uid, s, e, top=top, calendar_id=calendar_id)
+    except RuntimeError as ex:
+        msg = str(ex)
+        if "not connected" in msg:
+            raise HTTPException(status_code=409, detail="Google Calendar not connected")
+        if "not configured" in msg:
+            raise HTTPException(status_code=500, detail=msg)
+        if "access denied" in msg:
+            raise HTTPException(status_code=401, detail=msg)
+        raise HTTPException(status_code=502, detail=msg)
+
+    return {
+        "calendarId": calendar_id,
+        "start": s.isoformat(),
+        "end": e.isoformat(),
+        "count": len(events),
+        "events": events,
+    }
