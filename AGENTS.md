@@ -11,9 +11,15 @@ deploy / `gcloud run deploy` / traffic 切替 / Cloud Run revision 作成 / tag 
 1. `~/Projects/deepnote-contracts/quality/backend-deploy-checksheet.md` を全部埋める
 2. `bash ~/Projects/deepnote-contracts/tools/run_audit.sh`
 3. `python3 ~/Projects/deepnote-contracts/tools/check_release_readiness.py --project backend --strict warning` (Sprint 1) / `critical` (Sprint 2+)
-4. Release Readiness Report が **PASS** であること
+4. **`~/Projects/deepnote-contracts/quality/master-user-pre-deploy-test-instructions.md` の Step 1〜15 を全 PASS**
+   - master uid: `cfdXMsjPXfea8OsidGQtXrSZOfP2`
+   - accountId: `Jwb9VwA4kkfOLQh7PVZ9`
+   - email: `horio.shuhei98@gmail.com`
+   - 必須確認: Firestore folders / `/v1/users/me` plan / `/v1/folders` / legacy `/folders` / `/v1/sessions` / `/v1/config/client` / audit Critical 増加なし
+5. Release Readiness Report が **PASS** であること
 
 PASS でない限り「deploy してよいですか?」と聞いてはいけない。
+**Master User Pre-Deploy Test が PASS でない限り production deploy は禁止**。 PARTIAL は staging / dev tag まで。 FAIL は deploy 禁止。
 
 ## H2. 1 branch = 1 release unit
 
@@ -82,7 +88,8 @@ deploy 後は `GET /version` で `gitCommit` / `cloudRunRevision` / `contractsCo
 
 | ファイル | 用途 |
 |---|---|
-| `regression-pack.md` | REG-BE-* 一覧 (REG-BE-021 plan, REG-BE-022 folders, REG-BE-026 account merge 等は Critical) |
+| `regression-pack.md` | REG-BE-* 一覧 (REG-BE-017 plan, REG-BE-019 folders, REG-BE-023 master user smoke は **Critical**) |
+| **`master-user-pre-deploy-test-instructions.md`** | **production deploy 前必須**。master uid `cfdXMsjPXfea8OsidGQtXrSZOfP2` で全 15 step PASS が条件 |
 | `backend-deploy-checksheet.md` | deploy 前必須 9 章 |
 | `rollback-protected-fixes.md` | rollback で失ってはいけない fix の正本 |
 | `lost-fixes-review.md` | rollback 前テンプレ |
