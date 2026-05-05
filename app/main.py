@@ -284,6 +284,9 @@ app.include_router(integrations_microsoft.oauth_router)
 # DeepNote Clow LINE bot (Phase 1: 1:1 only — webhook + connect HTML + link-token API)
 from app.routes import integrations_line
 app.include_router(integrations_line.router)
+# DeepNote Clow Slack bot (Phase 1: 1:1 DM only — events + OAuth install + link-token API)
+from app.routes import integrations_slack
+app.include_router(integrations_slack.router)
 # Startup soft-check: warn if token_crypto / OAuth not configured
 try:
     from app.services import token_crypto as _token_crypto

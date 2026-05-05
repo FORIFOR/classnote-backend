@@ -3431,6 +3431,81 @@ paths:
           description: Token already used.
         '410':
           description: Token expired.
+  /integrations/slack/link-tokens/{token}:
+    get:
+      tags:
+      - Integrations:Slack
+      summary: Resolve a Slack link token (frontend connect resolver)
+      description: |
+        Returns minimal Slack-side metadata for a link token. Does NOT expose
+        DeepNote user identity. Used by the frontend connect page to display
+        which Slack workspace + user is being linked before the user logs in.
+      parameters:
+      - in: path
+        name: token
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Token is valid and unused.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  teamId:
+                    type: string
+                  slackUserId:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '404':
+          description: Token unknown.
+        '409':
+          description: Token already used.
+        '410':
+          description: Token expired.
+  /integrations/slack/link-tokens/{token}:consume:
+    post:
+      tags:
+      - Integrations:Slack
+      summary: Consume a Slack link token and persist team:user ↔ deepnote uid link
+      description: |
+        Atomically marks the token as used and writes
+        slack_user_links/{teamId}:{slackUserId} with the authenticated DeepNote
+        uid + accountId. Caller must present a Firebase Bearer token.
+      security:
+      - HTTPBearer: []
+      parameters:
+      - in: path
+        name: token
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Linked successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [linked, teamId, slackUserId]
+                properties:
+                  linked: { type: boolean }
+                  teamId: { type: string }
+                  slackUserId: { type: string }
+        '401':
+          description: Missing / invalid Firebase Bearer token.
+        '404':
+          description: Token unknown.
+        '409':
+          description: Token already used.
+        '410':
+          description: Token expired.
   /integrations/line/link-tokens/{token}:consume:
     post:
       tags:
