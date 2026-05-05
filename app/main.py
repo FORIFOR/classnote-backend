@@ -352,6 +352,31 @@ except ImportError as e:
 
 
 
+@app.get("/version")
+async def version():
+    """Build metadata for rollback / triage decisions.
+
+    Production Manager Agent reads this to identify which revision is
+    serving and decide whether a rollback is safe. Values are wired
+    via env vars at deploy time (Cloud Run substitutes them):
+
+      - GIT_COMMIT (short SHA)
+      - GIT_BRANCH
+      - BUILD_TIME (ISO 8601)
+      - K_REVISION (Cloud Run injects this automatically)
+      - CONTRACTS_COMMIT (deepnote-contracts rev pinned at build time)
+    """
+    return {
+        "service": "deepnote-api",
+        "gitCommit": os.getenv("GIT_COMMIT", "unknown"),
+        "gitBranch": os.getenv("GIT_BRANCH", "unknown"),
+        "buildTime": os.getenv("BUILD_TIME", "unknown"),
+        "cloudRunRevision": os.getenv("K_REVISION", "unknown"),
+        "imageDigest": os.getenv("IMAGE_DIGEST", "unknown"),
+        "contractsCommit": os.getenv("CONTRACTS_COMMIT", "unknown"),
+    }
+
+
 @app.get("/health")
 async def health():
     from app.services.stt_circuit_breaker import stt_circuit_breaker
