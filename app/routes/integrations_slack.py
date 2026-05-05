@@ -27,6 +27,7 @@ from app.services import slack_link_tokens
 from app.services import slack_briefing
 from app.services import slack_oauth_state
 from app.services import asset_delivery
+from app.services import bot_audit
 from app.services.integrations import slack_client
 
 logger = logging.getLogger("app.routes.integrations.slack")
@@ -281,6 +282,11 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         if event.get("type") == "app_mention":
             slack_client.post_message(team_id=team_id, channel=channel,
                                       text=M.GROUP_NOT_SUPPORTED, thread_ts=thread_ts)
+        bot_audit.record(
+            provider="slack", source_type=channel_type or "unknown",
+            source_user_id=user, team_id=team_id, command="unsupported",
+            outcome="blocked_unsupported_source",
+        )
         return
 
     link = slack_link_tokens.get_link(team_id, user)
@@ -290,16 +296,33 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         except Exception as e:
             logger.warning("[slack.events] link token issue failed: %s", e)
             slack_client.post_message(team_id=team_id, channel=channel, text=M.CONFIG_MISSING)
+            bot_audit.record(
+                provider="slack", source_type="im",
+                source_user_id=user, team_id=team_id, command="unknown",
+                outcome="config_missing",
+            )
             return
         slack_client.post_message(
             team_id=team_id, channel=channel,
             text=f"{M.NOT_LINKED_INTRO}\n\n{_connect_url(token)}",
+        )
+        bot_audit.record(
+            provider="slack", source_type="im",
+            source_user_id=user, team_id=team_id, command="unknown",
+            outcome="unlinked",
         )
         return
 
     command = _classify_command(_strip_app_mentions(text))
     reply = _build_reply_for_linked(link["accountId"], command)
     slack_client.post_message(team_id=team_id, channel=channel, text=reply)
+    bot_audit.record(
+        provider="slack", source_type="im",
+        source_user_id=user, team_id=team_id,
+        account_id=link.get("accountId"),
+        deepnote_uid=link.get("deepnoteUid"),
+        command=command, outcome="ok",
+    )
 
 
 @router.post("/events", include_in_schema=False)

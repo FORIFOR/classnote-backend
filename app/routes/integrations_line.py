@@ -28,6 +28,7 @@ from app.services import line_link_tokens
 from app.services import line_messaging
 from app.services import line_briefing
 from app.services import asset_delivery
+from app.services import bot_audit
 
 logger = logging.getLogger("app.routes.integrations.line")
 
@@ -266,12 +267,18 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
     message = event.get("message") or {}
     user_text = message.get("text", "") if message.get("type") == "text" else ""
 
+    line_user_id = source.get("userId") or ""
+
     if source_type != "user":
         # Phase 1: groups / rooms get a polite "not supported" reply only.
         line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
+        bot_audit.record(
+            provider="line", source_type=source_type or "unknown",
+            source_user_id=line_user_id, command="unsupported",
+            outcome="blocked_unsupported_source",
+        )
         return
 
-    line_user_id = source.get("userId")
     if not line_user_id:
         return
 
@@ -283,14 +290,31 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         except Exception as e:
             logger.warning("[line.webhook] link token issue failed: %s", e)
             line_messaging.reply(reply_token, [line_messaging.text_message(M.CONFIG_MISSING)])
+            bot_audit.record(
+                provider="line", source_type="user",
+                source_user_id=line_user_id, command="unknown",
+                outcome="config_missing",
+            )
             return
         text = f"{M.NOT_LINKED_INTRO}\n\n{_connect_url(token)}"
         line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+        bot_audit.record(
+            provider="line", source_type="user",
+            source_user_id=line_user_id, command="unknown",
+            outcome="unlinked",
+        )
         return
 
     command = _classify_command(user_text)
     text = _build_reply_for_linked(link["accountId"], command)
     line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+    bot_audit.record(
+        provider="line", source_type="user",
+        source_user_id=line_user_id,
+        account_id=link.get("accountId"),
+        deepnote_uid=link.get("deepnoteUid"),
+        command=command, outcome="ok",
+    )
 
 
 def _handle_follow_event(event: Dict[str, Any]) -> None:
