@@ -281,6 +281,9 @@ app.include_router(integrations_microsoft.router)
 app.include_router(integrations_microsoft.oauth_router)
 # integrations_slack: module file missing from working tree.
 # Restore app/routes/integrations_slack.py + slack_client.py before re-enabling.
+# DeepNote Clow LINE bot (Phase 1: 1:1 only — webhook + connect HTML + link-token API)
+from app.routes import integrations_line
+app.include_router(integrations_line.router)
 # Startup soft-check: warn if token_crypto / OAuth not configured
 try:
     from app.services import token_crypto as _token_crypto

@@ -3392,6 +3392,86 @@ paths:
           content:
             application/json:
               schema: {}
+  /integrations/line/link-tokens/{token}:
+    get:
+      tags:
+      - Integrations:LINE
+      summary: Resolve a LINE link token (frontend connect resolver)
+      description: |
+        Returns minimal LINE-side metadata for a link token. Does NOT expose
+        DeepNote user identity. Used by the frontend connect page to display
+        which LINE userId is being linked before the user logs in.
+      parameters:
+      - in: path
+        name: token
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Token is valid and unused.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  lineUserId:
+                    type: string
+                  lineSourceType:
+                    type: string
+                    enum: [user, group, room]
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '404':
+          description: Token unknown.
+        '409':
+          description: Token already used.
+        '410':
+          description: Token expired.
+  /integrations/line/link-tokens/{token}:consume:
+    post:
+      tags:
+      - Integrations:LINE
+      summary: Consume a LINE link token and persist line ↔ deepnote uid link
+      description: |
+        Atomically marks the token as used and writes line_user_links/{lineUserId}
+        with the authenticated DeepNote uid + accountId. Caller must present
+        a Firebase Bearer token. After this succeeds, future LINE messages
+        from the same userId will be answered with the linked account's data.
+      security:
+      - HTTPBearer: []
+      parameters:
+      - in: path
+        name: token
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Linked successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [linked, lineUserId]
+                properties:
+                  linked:
+                    type: boolean
+                  lineUserId:
+                    type: string
+                  lineSourceType:
+                    type: string
+        '401':
+          description: Missing / invalid Firebase Bearer token.
+        '404':
+          description: Token unknown.
+        '409':
+          description: Token already used.
+        '410':
+          description: Token expired.
 components:
   schemas:
     AdAction:
