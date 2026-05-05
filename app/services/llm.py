@@ -11,23 +11,81 @@ from app.services.profiling import get_profiler, Phase, PROFILING_ENABLED
 # from vertexai.generative_models import GenerativeModel, GenerationConfig
 
 
+async def _generate_with_retry(model, prompt, generation_config, *, label: str = "llm"):
+    """Call `model.generate_content_async` with bounded retry on transient
+    upstream errors.
+
+    Vertex AI / Gemini occasionally returns 503 ServiceUnavailable / 504
+    DeadlineExceeded / 429 ResourceExhausted under load. Without retry the
+    summarize / quick-summary tasks bubble the error up to Cloud Tasks
+    which marks the session as failed even though a 1–2 second pause
+    would have succeeded.
+
+    Retry policy:
+      - max 3 attempts total (1 initial + 2 retries)
+      - exponential backoff: 1.5s, 4.0s
+      - retry only on transient categories; permanent errors (400/404/
+        permission) propagate immediately
+    """
+    import logging
+    logger = logging.getLogger("app.services.llm")
+
+    # Defer import so module-load doesn't require google-api-core
+    try:
+        from google.api_core import exceptions as gax_exc  # type: ignore
+        TRANSIENT = (
+            gax_exc.ServiceUnavailable,    # 503
+            gax_exc.DeadlineExceeded,      # 504 / RPC timeout
+            gax_exc.ResourceExhausted,     # 429
+            gax_exc.InternalServerError,   # 500
+            gax_exc.Aborted,               # 409 transient
+        )
+    except Exception:
+        TRANSIENT = ()  # type: ignore
+
+    delays = [1.5, 4.0]
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 1 + 1 + len(delays)):
+        try:
+            return await model.generate_content_async(prompt, generation_config=generation_config)
+        except Exception as e:
+            last_exc = e
+            if TRANSIENT and isinstance(e, TRANSIENT) and attempt <= len(delays):
+                wait = delays[attempt - 1]
+                logger.warning(
+                    "[LLM] %s transient %s on attempt %d/%d — retry in %.1fs (%s)",
+                    label, type(e).__name__, attempt, 1 + len(delays), wait, str(e)[:120],
+                )
+                await asyncio.sleep(wait)
+                continue
+            # Non-transient or out of retries
+            logger.error(
+                "[LLM] %s gave up after attempt %d/%d: %s",
+                label, attempt, 1 + len(delays), type(e).__name__,
+            )
+            raise
+    if last_exc:
+        raise last_exc
+
+
 async def _timed_llm_call(model, prompt, generation_config, label: str = "llm"):
     """
     Wrapper to time LLM calls and record to profiler.
     Zero overhead when profiling is disabled.
+
+    [FIX 2026-05-05] Wraps the underlying call in `_generate_with_retry` to
+    survive transient Vertex AI 503 / DeadlineExceeded / 429.
     """
     if not PROFILING_ENABLED:
-        response = await model.generate_content_async(prompt, generation_config=generation_config)
-        return response
+        return await _generate_with_retry(model, prompt, generation_config, label=label)
 
     profiler = get_profiler()
     if not profiler:
-        response = await model.generate_content_async(prompt, generation_config=generation_config)
-        return response
+        return await _generate_with_retry(model, prompt, generation_config, label=label)
 
     start = time.perf_counter()
     try:
-        response = await model.generate_content_async(prompt, generation_config=generation_config)
+        response = await _generate_with_retry(model, prompt, generation_config, label=label)
         return response
     finally:
         duration_ms = (time.perf_counter() - start) * 1000

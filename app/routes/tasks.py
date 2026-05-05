@@ -302,6 +302,46 @@ async def _handle_summarize_task_core(request: Request):
             "autoTags": tags,
             "status": "要約済み",
         }
+        # [HOTFIX 2026-05-05] Promote topicSummary to session.title when the
+        # current title is still the auto-generated placeholder (e.g. iOS
+        # default "会議 5/4 16:08", auto-create fallback, "(無題)") and the
+        # user has not edited it. The candidate is sanitised before use so
+        # bullet markers and `[info]/[risk]/[decision]` annotations don't
+        # leak into the visible title.
+        try:
+            import re as _re
+            current_title = (data.get("title") or "").strip()
+            user_edited = bool(data.get("titleUserEdited"))
+            placeholder_re = _re.compile(
+                r"^(?:会議|講義|ミーティング|レコーディング|録音|Meeting|Lecture|Untitled|\(無題\))?\s*"
+                r"(?:\d{1,2}[/\-月]\d{1,2}日?\s*\d{1,2}[:時]\d{1,2}分?\s*)?$"
+            )
+            is_placeholder = (
+                not current_title
+                or current_title == "(無題)"
+                or bool(placeholder_re.match(current_title))
+            )
+
+            def _clean_title_candidate(s: str) -> str:
+                if not s:
+                    return ""
+                t = s.strip()
+                # Drop leading bullet/numbering markers
+                t = _re.sub(r"^[\-\*・●◆▶︎]+\s*", "", t)
+                t = _re.sub(r"^\d+[\.\)]\s*", "", t)
+                # Drop leading bracketed tags like [info] [risk] [decision]
+                t = _re.sub(r"^(?:\[[^\]]+\]\s*)+", "", t)
+                # Drop trailing punctuation that looks structural
+                t = t.strip(" 　:：.。、,")
+                return t[:80]
+
+            candidate = _clean_title_candidate(topic_summary or "")
+            if candidate and is_placeholder and not user_edited:
+                update_payload["title"] = candidate
+                update_payload["titleAutoSet"] = True
+                update_payload["titleAutoSetAt"] = datetime.now(timezone.utc)
+        except Exception as _title_err:
+            logger.warning(f"[Summary] title auto-promote skipped for {session_id}: {_title_err}")
         doc_ref.update(update_payload)
         derived_ref.set({
             "status": "succeeded",

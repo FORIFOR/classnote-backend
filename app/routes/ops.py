@@ -34,8 +34,15 @@ router = APIRouter()
 # ============================================================================
 
 class HeartbeatRequest(BaseModel):
-    """Request model for presence heartbeat"""
-    deviceId: str = Field(..., description="Unique device identifier")
+    """Request model for presence heartbeat.
+
+    [HOTFIX 2026-05-05] `deviceId` made optional. The current ClassnoteX
+    iOS build POSTs heartbeats without this field, which previously
+    returned 422 and made the iOS bootstrap loop ("同期中 / キャッシュで
+    起動しました" stuck on splash). When omitted, the server falls back
+    to a stable per-account "ios" identifier for presence tracking.
+    """
+    deviceId: Optional[str] = Field(None, description="Unique device identifier")
     sessionId: Optional[str] = Field(None, description="Current session ID if any")
     states: List[str] = Field(
         default_factory=list,
@@ -43,6 +50,10 @@ class HeartbeatRequest(BaseModel):
     )
     appVersion: Optional[str] = Field(None, description="App version")
     rev: Optional[str] = Field(None, description="Backend revision: stable or canary")
+    platform: Optional[str] = Field(None, description="Client platform (ios/desktop/web)")
+
+    class Config:
+        extra = "allow"  # tolerate forward-compat fields from iOS
 
 
 class HeartbeatResponse(BaseModel):
@@ -101,25 +112,31 @@ async def presence_heartbeat(
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=PRESENCE_TTL_SECONDS)
 
+    # [HOTFIX 2026-05-05] Tolerate missing deviceId from older iOS builds.
+    # Use a stable per-account fallback so multiple devices on the same
+    # account share a row instead of producing 422.
+    effective_device_id = (req.deviceId or "").strip() or f"ios-{current_user.uid[:12]}"
+
     # Build presence document
     presence_data = {
         "accountId": account_id,
         "userId": current_user.uid,
-        "deviceId": req.deviceId,
+        "deviceId": effective_device_id,
         "sessionId": req.sessionId,
         "states": req.states,
         "appVersion": req.appVersion,
         "rev": req.rev,
+        "platform": getattr(req, "platform", None),
         "updatedAt": now,
         "expiresAt": expires_at,
     }
 
     # Store in presence collection with deviceId as key
     # This allows multiple devices per user
-    doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{req.deviceId}")
+    doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{effective_device_id}")
     doc_ref.set(presence_data)
 
-    logger.debug(f"[Presence] Heartbeat from {account_id}/{req.deviceId}: {req.states}")
+    logger.debug(f"[Presence] Heartbeat from {account_id}/{effective_device_id}: {req.states}")
 
     return HeartbeatResponse(
         ok=True,
