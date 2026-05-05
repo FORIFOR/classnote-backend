@@ -367,7 +367,57 @@ async def alias_system_config(platform: Optional[str] = None):
 
 @router.get("/system/status", include_in_schema=False)
 async def alias_system_status(platform: Optional[str] = None):
-    return {"status": "ok", "platform": platform or "ios"}
+    """Lightweight system status probe used by iOS AppConfigStore.
+
+    Shape MUST match ``ClassnoteX/Core/AppConfig.swift::SystemStatus``.
+    The previous "{status,platform}" stub failed iOS Decodable with
+    ``key 'mode' not found`` on every cold start, leaving the app on
+    cached SystemStatus indefinitely.
+
+    Mode source of truth is the ``SYSTEM_STATUS_MODE`` env var so SRE
+    can flip maintenance / force_update / degraded without redeploying
+    code (`gcloud run services update --update-env-vars`). Optional
+    detail fields are also env-driven; unset → null in the response.
+    """
+    import os
+    valid_modes = {"normal", "notice", "degraded", "maintenance", "force_update"}
+    mode = (os.environ.get("SYSTEM_STATUS_MODE") or "normal").strip().lower()
+    if mode not in valid_modes:
+        mode = "normal"
+
+    def _opt(key: str) -> Optional[str]:
+        v = os.environ.get(key)
+        return v if v else None
+
+    def _int(key: str) -> Optional[int]:
+        v = os.environ.get(key)
+        try:
+            return int(v) if v else None
+        except ValueError:
+            return None
+
+    affected_raw = os.environ.get("SYSTEM_STATUS_AFFECTED")
+    affected = (
+        [a.strip() for a in affected_raw.split(",") if a.strip()]
+        if affected_raw else None
+    )
+
+    cta_label = os.environ.get("SYSTEM_STATUS_CTA_LABEL")
+    cta_url = os.environ.get("SYSTEM_STATUS_CTA_URL")
+    cta = {"label": cta_label, "url": cta_url} if cta_label and cta_url else None
+
+    return {
+        "mode": mode,
+        "title": _opt("SYSTEM_STATUS_TITLE"),
+        "message": _opt("SYSTEM_STATUS_MESSAGE"),
+        "startsAt": _opt("SYSTEM_STATUS_STARTS_AT"),
+        "endsAt": _opt("SYSTEM_STATUS_ENDS_AT"),
+        "etaMinutes": _int("SYSTEM_STATUS_ETA_MINUTES"),
+        "affected": affected,
+        "minAppVersion": _opt("SYSTEM_STATUS_MIN_APP_VERSION"),
+        "cta": cta,
+        "retryAfterSec": _int("SYSTEM_STATUS_RETRY_AFTER_SEC"),
+    }
 
 
 @router.get("/system/orb-theme", include_in_schema=False)
@@ -376,15 +426,17 @@ async def alias_system_orb_theme():
     return await get_orb_theme(uid=None, plan=None, current_user=None)
 
 
-# /users/bootstrap — iOS app init call. Return a richer shape so the
-# iOS bootstrap deserialization succeeds and the "同期中 / キャッシュで
-# 起動しました" splash progresses to the live state.
+# /users/bootstrap — iOS app init call. Response shape MUST match
+# ``ClassnoteX/SessionModels.swift::BootstrapResponse`` so AuthCoordinator's
+# Decodable succeeds. The previous "{ok,user,account,...}" stub failed
+# with ``key 'plan' not found`` on every cold start and put the endpoint
+# on a 2s cooldown via the iOS APIClient failure tracker.
 @router.post("/users/bootstrap", include_in_schema=False)
 async def alias_users_bootstrap(
     body: Any = None,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     uid = current_user.uid
     account_id = getattr(current_user, "account_id", None) or uid
     account_data: dict = {}
@@ -402,39 +454,70 @@ async def alias_users_bootstrap(
     except Exception:
         pass
 
-    plan = account_data.get("plan") or user_data.get("plan") or "free"
-    if plan == "standard":
+    raw_plan = account_data.get("plan") or user_data.get("plan") or "free"
+    if raw_plan in ("basic", "standard"):
         plan = "basic"
-    now_iso = _dt.now(_tz.utc).isoformat()
-    created_at = account_data.get("createdAt") or now_iso
-    if hasattr(created_at, "isoformat"):
-        created_at = created_at.isoformat()
+    elif raw_plan == "premium":
+        plan = "premium"
+    else:
+        plan = "free"
+
+    suspended = bool(account_data.get("suspended", False))
+
+    token_provider = getattr(current_user, "provider", None)
+    token_phone = getattr(current_user, "phone_number", None)
+    phone_in_db = user_data.get("phoneE164")
+    verified_sns_providers = {"google.com", "apple.com", "custom", "line"}
+    is_sns_verified = token_provider in verified_sns_providers
+
+    needs_phone = (not token_phone and not phone_in_db and not is_sns_verified)
+    needs_sns = False
+    if token_provider == "phone":
+        providers_in_db = set(user_data.get("providers", []))
+        if not any(p in providers_in_db for p in verified_sns_providers):
+            needs_sns = True
+
+    cache_valid_until = (_dt.now(_tz.utc) + _td(minutes=5)).isoformat()
 
     return {
-        "ok": True,
+        # Identity
         "uid": uid,
         "accountId": account_id,
-        "user": {
-            "uid": uid,
-            "displayName": user_data.get("displayName") or account_data.get("displayName") or "",
-            "email": user_data.get("email") or "",
-            "photoURL": user_data.get("photoURL") or "",
-            "plan": plan,
-        },
-        "account": {
-            "id": account_id,
-            "plan": plan,
-            "displayName": account_data.get("displayName") or "",
-            "primaryUid": account_data.get("primaryUid") or uid,
-            "createdAt": created_at,
-        },
-        "preferences": user_data.get("preferences") or {},
-        "features": {
+        "plan": plan,
+        # Profile
+        "displayName": user_data.get("displayName")
+            or account_data.get("displayName")
+            or getattr(current_user, "display_name", None)
+            or "User",
+        "username": user_data.get("username"),
+        "hasUsername": bool(user_data.get("hasUsername", False)),
+        "photoUrl": user_data.get("photoURL")
+            or getattr(current_user, "photo_url", None),
+        "provider": token_provider,
+        "providers": user_data.get("providers", []),
+        # Feature gates (plan-based; usage gating happens at request time)
+        "featureGates": {
             "cloudStt": True,
-            "summary": True,
+            "summarization": True,
             "quiz": True,
+            "cloudSync": True,
             "export": True,
-            "chat": True,
+            "share": True,
         },
-        "serverTime": now_iso,
+        # Onboarding flags
+        "needsPhoneVerification": needs_phone,
+        "needsSnsLogin": needs_sns,
+        "suspended": suspended,
+        # Canonicalize result — bootstrap reports current state only;
+        # actual merges still go through the dedicated /auth/canonicalize
+        # endpoint so this never silently changes account membership.
+        "canonicalized": False,
+        "previousAccountId": None,
+        # Custom claims
+        "claimsRefreshRequired": False,
+        # Async repair flags (bootstrap doesn't trigger repairs itself)
+        "repairNeeded": False,
+        "repairTasks": [],
+        # Cache hint
+        "cacheValidUntil": cache_valid_until,
     }
