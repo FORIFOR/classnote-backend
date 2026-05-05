@@ -9,6 +9,13 @@ logger = logging.getLogger("app.services.context_builder")
 MAX_FULL_TRANSCRIPT_CHARS = 10000
 
 
+def detect_answer_language(text: str) -> str:
+    """Detect user's language from input text. Returns '日本語' or 'English'."""
+    if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", text):
+        return "日本語"
+    return "English"
+
+
 def build_session_context(session_data: dict, query: str) -> dict:
     """Build context dict from a Firestore session document.
 
@@ -148,6 +155,7 @@ def build_turn_prompt(
     history_text = "\n".join(history_lines) if history_lines else "(なし)"
 
     # Session context
+    multi_session = len(contexts) > 1
     if contexts:
         context_parts = []
         for c in contexts:
@@ -174,7 +182,19 @@ def build_turn_prompt(
 """
 
     # Detect answer language from user message
-    answer_lang = "日本語" if re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", message) else "English"
+    answer_lang = detect_answer_language(message)
+
+    # Multi-session selection instruction
+    session_selection_rule = ""
+    if multi_session:
+        session_selection_rule = """
+[session_selection_rule]
+複数のセッションが提供されています。ユーザーの質問内容に最も関連するセッションを自動的に選択して回答してください。
+・質問のトピック、キーワード、文脈からどのセッションが最も適切か判断してください
+・関連するセッションが複数ある場合は、それらを組み合わせて回答しても構いません
+・どのセッションにも関連しない質問の場合は、一般知識で回答してください
+・used_sessions には実際に回答の根拠として使用したセッションのみを含めてください
+"""
 
     return f"""[answer_language]
 {answer_lang}
@@ -190,7 +210,7 @@ def build_turn_prompt(
 
 [session_context]
 {context_text}
-
+{session_selection_rule}
 [user_question]
 {message}
 
@@ -264,3 +284,44 @@ def build_stream_prompt(
 Markdown記法（#, *, **など）は使わないでください。
 箇条書きは「・」を使い、順序付きリストは「1. 」「2. 」のように番号を付けてください。見出しは短い自然文で書いて空行で区切ってください。
 簡潔で実用的に、読みやすい改行で構成してください。"""
+
+
+def build_hybrid_prompt(
+    message: str,
+    session_summary: str,
+    history: list,
+    conversation_summary: str | None = None,
+) -> str:
+    """Build a prompt that includes session context for Google Search + session hybrid mode."""
+    answer_lang = detect_answer_language(message)
+
+    parts = []
+    parts.append(f"[answer_language]\n{answer_lang}\n")
+
+    if conversation_summary:
+        parts.append(f"[会話サマリー]\n{conversation_summary}\n")
+
+    if history:
+        parts.append("[会話履歴]")
+        for turn in history[-6:]:
+            role_label = "ユーザー" if turn.get("role") == "user" else "アシスタント"
+            parts.append(f"{role_label}: {turn.get('text', '')}")
+        parts.append("")
+
+    if session_summary:
+        parts.append(f"[セッション情報（会議・講義の内容）]\n{session_summary[:4000]}\n")
+
+    parts.append(f"[ユーザーの質問]\n{message}")
+
+    parts.append(f"""
+[指示]
+まずセッション内容を確認し、必要に応じてGoogle検索で最新情報を補強してください。
+回答は以下の順で構成してください:
+1. セッションで話された内容（あれば）
+2. 最新の外部情報（Web検索結果があれば）
+3. 差分がある場合はその説明
+
+最終回答は必ず{answer_lang}で返してください。
+Markdown記法は使わないでください。""")
+
+    return "\n".join(parts)

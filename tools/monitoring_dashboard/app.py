@@ -703,6 +703,8 @@ def fetch_users_data(project_id, limit=200):
                 "subscriptionStatus": acc_data.get("subscriptionStatus"),
                 "appleEntitlementId": acc_data.get("appleEntitlementId"),
                 "providers": acc_data.get("providers", []),
+                "topupCredits": int(acc_data.get("topupCredits", 0) or 0),
+                "unlimitedCredits": bool(acc_data.get("unlimitedCredits", False)),
             }
 
         # Pre-fetch all entitlements
@@ -870,8 +872,12 @@ def fetch_users_data(project_id, limit=200):
 
             # [FIX] Get providers from account (not user doc)
             acc_providers = []
+            topup_credits = 0
+            unlimited_credits = False
             if account_id and account_id in accounts_map:
                 acc_providers = accounts_map[account_id].get("providers", [])
+                topup_credits = int(accounts_map[account_id].get("topupCredits", 0) or 0)
+                unlimited_credits = bool(accounts_map[account_id].get("unlimitedCredits", False))
 
             users.append({
                 "uid": uid,
@@ -892,6 +898,8 @@ def fetch_users_data(project_id, limit=200):
                 "cloudEntitledCount": len(cloud_entitled_ids),
                 "cloudSttUsedMin": round(cloud_stt_used / 60, 1),
                 "aiCreditsUsed": ai_credits_used,
+                "topupCredits": topup_credits,
+                "unlimitedCredits": unlimited_credits,
                 "summaryUsed": summary_used,
                 "quizUsed": quiz_used,
                 "isBlocked": data.get("isBlocked", False),
@@ -2152,16 +2160,20 @@ with tab_users:
 
         df["Entitlement"] = df.apply(format_entitlement, axis=1)
 
-        # [FIX] Show actual usage instead of limits
+        # [FIX] Show actual usage with topup-aware AI credit limit (matches ai_credits.consume)
         def format_usage(row):
             plan = row["plan"]
             ai_cr = row.get("aiCreditsUsed", 0)
             summary = row.get("summaryUsed", 0)
             quiz = row.get("quizUsed", 0)
+            topup = int(row.get("topupCredits", 0) or 0)
+            unlimited = bool(row.get("unlimitedCredits", False))
+            base = 400 if plan == "basic" else 40
+            ai_limit_str = "∞" if unlimited else str(base + topup)
             if plan == "basic":
-                return f"AI:{ai_cr}/400 S:{summary}/100 Q:{quiz}/100"
+                return f"AI:{ai_cr}/{ai_limit_str} S:{summary}/100 Q:{quiz}/100"
             else:
-                return f"AI:{ai_cr}/40 S:{summary}/3 Q:{quiz}/3"
+                return f"AI:{ai_cr}/{ai_limit_str} S:{summary}/3 Q:{quiz}/3"
 
         df["Usage"] = df.apply(format_usage, axis=1)
 
@@ -2177,8 +2189,12 @@ with tab_users:
         def _format_ai_credits(row):
             used = row.get("aiCreditsUsed", 0)
             plan = row.get("plan", "free")
-            limit = 400 if plan == "basic" else 40
-            return f"{used}/{limit}"
+            topup = int(row.get("topupCredits", 0) or 0)
+            unlimited = bool(row.get("unlimitedCredits", False))
+            if unlimited:
+                return f"{used}/∞"
+            base = 400 if plan == "basic" else 40
+            return f"{used}/{base + topup}"
         df["AIクレジット"] = df.apply(_format_ai_credits, axis=1)
         df["要約"] = df["summaryUsed"].astype(str)
         df["クイズ"] = df["quizUsed"].astype(str)
@@ -2652,133 +2668,262 @@ with tab_db:
 # ---------------------------------------------------------
 with tab_costs:
     st.markdown("## 💰 Costs")
+    st.caption("Cloud STT は非使用 (`cloudStt.available=false`, `featureEnabled=false`)。on-device STT がメイン。Vertex AI が最大のコストドライバー。")
 
-    # ── GCP実績ベースのレート (asia-northeast1, Feb 2026 verified) ──
-    # Cloud Run (cpu-throttling=ON, CPU=1, Memory=2GiB)
-    CR_VCPU_SEC = 0.00002400       # $/vCPU-second
-    CR_MEM_GIB_SEC = 0.00000250    # $/GiB-second
+    # ===================================================================
+    # Google 公式 Pricing (2026-04 時点, asia-northeast1 / us-central1)
+    # ===================================================================
+    # Vertex AI - Gemini (per 1M tokens, USD)
+    GEMINI_PRICING = {
+        "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
+        "gemini-2.5-flash-lite": {"input": 0.10,  "output": 0.40},
+        "gemini-2.5-flash":      {"input": 0.15,  "output": 0.60},
+    }
+    # Grounding with Google Search (合算 free tier: 1500 grounded prompts/day)
+    GROUNDING_FREE_PER_DAY = 1500
+    GROUNDING_PRICE_PER_1K = 35.0
+
+    # Firestore (asia-northeast1)
+    FS_READ_PER_100K  = 0.03   # $/100K reads
+    FS_WRITE_PER_100K = 0.09   # $/100K writes
+    FS_DELETE_PER_100K = 0.01  # $/100K deletes
+    FS_STORAGE_PER_GIB_MONTH = 0.108  # $/GiB/month (multi-region類似値)
+    FS_FREE_READS_DAY = 50000
+    FS_FREE_WRITES_DAY = 20000
+    FS_FREE_DELETES_DAY = 20000
+
+    # Cloud Run (asia-northeast1, request-based billing, cpu-throttling=ON)
+    CR_VCPU_SEC_PRICE = 0.00002400    # $/vCPU-second
+    CR_MEM_GIB_SEC_PRICE = 0.00000250  # $/GiB-second
+    CR_REQ_PRICE_PER_M = 0.40          # $/million requests
     CR_CPU = 1
     CR_MEM_GIB = 2
-    CR_REQ_PER_M = 0.40            # $/million requests
-    CR_PER_SEC = (CR_VCPU_SEC * CR_CPU) + (CR_MEM_GIB_SEC * CR_MEM_GIB)  # $0.0000290/sec
+    CR_FREE_VCPU_SEC_MONTH = 180000
+    CR_FREE_MEM_GIB_SEC_MONTH = 360000
+    CR_FREE_REQ_MONTH = 2_000_000
 
-    # Cloud Speech-to-Text V2 (Chirp 2)
-    STT_RATE_CHIRP = 0.064         # $0.016/15sec = $0.064/min
+    # Cloud Storage (asia-northeast1, Standard)
+    GCS_STORAGE_PER_GIB_MONTH = 0.023  # $/GiB/month
+    GCS_CLASS_A_PER_1K = 0.005          # $/1K (upload/write)
+    GCS_CLASS_B_PER_1K = 0.0004         # $/1K (get/list)
 
-    # Vertex AI (Gemini 2.0 Flash Lite)
-    LLM_RATE_PER_CALL = 0.001      # ~$0.001/call (4K input + 2K output tokens)
-
-    # Fixed overhead (Artifact Registry + Storage + Secret Manager + Build)
-    FIXED_OVERHEAD_DAY_USD = 0.25  # ~$0.25/day ($7.5/month)
+    # Fixed overhead (Logging, Tasks, Scheduler, Artifact Registry, Build, Auth)
+    FIXED_OVERHEAD_DAY_USD = 0.25      # ~$7.5/month (control plane)
 
     JPY_RATE = 150
 
-    # GCP実績比率 (Feb 2026: Cloud Run ≈ 2.19x Speech)
-    CR_TO_SPEECH_RATIO = 2.19
+    # ── 1セッション原価参考値 (Google公式単価ベース) ──
+    # Assist無: 110K input + 33K output tokens = $0.01815
+    # Assist有: +1.5M input + 122.88K output tokens = +$0.14936 (合計 $0.16751)
+    SESSION_NORMAL_USD = 0.01815    # 通常セッション原価
+    SESSION_ASSIST_USD = 0.16751    # Assist多用セッション原価
 
     # ── 使用量データ取得 ──
     usage_data = fetch_monthly_usage_all(selected_project)
 
-    total_stt_sec = 0
     total_summary = 0
     total_quiz = 0
-    total_llm = 0
+    total_llm_calls = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_qa = 0
+    total_diarization = 0
     usage_by_entity = []
 
     for u in usage_data:
-        stt = u.get("cloud_stt_sec", 0) or 0
         summary = u.get("summary_generated", 0) or 0
         quiz = u.get("quiz_generated", 0) or 0
         llm = u.get("llm_calls", 0) or 0
+        in_tok = u.get("llm_input_tokens", 0) or 0
+        out_tok = u.get("llm_output_tokens", 0) or 0
+        qa = u.get("qa_invocations", 0) or 0
+        diar = u.get("diarization_invocations", 0) or 0
 
-        total_stt_sec += stt
         total_summary += summary
         total_quiz += quiz
-        total_llm += llm
+        total_llm_calls += llm
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        total_qa += qa
+        total_diarization += diar
 
         entity_id = u.get("accountId") or u.get("userId") or "unknown"
-        if stt > 0 or summary > 0 or quiz > 0:
+        if summary > 0 or quiz > 0 or in_tok > 0:
             usage_by_entity.append({
                 "Entity": entity_id[:20],
                 "Type": u.get("_type", "unknown"),
-                "STT (min)": round(stt / 60, 1),
                 "Summaries": summary,
                 "Quizzes": quiz,
+                "Q&A": qa,
                 "LLM Calls": llm,
+                "Input Tokens": in_tok,
+                "Output Tokens": out_tok,
             })
 
-    total_stt_min = total_stt_sec / 60
-    total_llm_calls = total_summary + total_quiz + total_llm
-
-    # ── コスト計算 ──
-    # 月初からの日数
+    # ── 月初からの日数 ──
     now = datetime.now()
     days_elapsed = max(now.day, 1)
 
-    # Speech cost (正確: STT分数 × レート)
-    cost_speech = total_stt_min * STT_RATE_CHIRP
+    # ===================================================================
+    # Vertex AI コスト計算 (トークンベース - 実測値があれば正確)
+    # ===================================================================
+    # デフォルトモデル (gemini-2.0-flash-lite) 単価を使用
+    # 実際には複数モデルが混在するが、usage_eventsにmodel名があれば将来拡張可能
+    default_model = GEMINI_PRICING["gemini-2.0-flash-lite"]
+    cost_vertex_input = total_input_tokens / 1_000_000 * default_model["input"]
+    cost_vertex_output = total_output_tokens / 1_000_000 * default_model["output"]
+    cost_vertex = cost_vertex_input + cost_vertex_output
 
-    # Cloud Run cost (GCP実績比率から推定)
-    cost_cloud_run = cost_speech * CR_TO_SPEECH_RATIO
+    # フォールバック: トークン数が記録されていない場合、呼び出し回数から概算
+    # 1回あたり input 8K + output 2K と仮定
+    if total_input_tokens == 0 and total_llm_calls > 0:
+        est_input = total_llm_calls * 8000
+        est_output = total_llm_calls * 2000
+        cost_vertex = (
+            est_input / 1_000_000 * default_model["input"] +
+            est_output / 1_000_000 * default_model["output"]
+        )
 
-    # Vertex AI cost
-    cost_vertex = total_llm_calls * LLM_RATE_PER_CALL
-
-    # Fixed overhead
-    cost_fixed = FIXED_OVERHEAD_DAY_USD * days_elapsed
-
-    # Total
-    cost_total = cost_speech + cost_cloud_run + cost_vertex + cost_fixed
-
-    # ── Session count for unit cost ──
+    # ===================================================================
+    # Firestore コスト計算 (セッション数から推定)
+    # ===================================================================
     overview_data_for_costs = fetch_overview_data(selected_project)
     sessions_month = 0
     if overview_data_for_costs:
-        # Approximate monthly sessions from 7d data
         sessions_7d = overview_data_for_costs.get("sessions_7d", 0)
         sessions_month = max(int(sessions_7d * days_elapsed / 7), 1) if sessions_7d else max(days_elapsed, 1)
+
+    # 1セッション = 約 345 reads + 780 writes (deep-dive 分析値)
+    FS_READS_PER_SESSION = 345
+    FS_WRITES_PER_SESSION = 780
+    est_fs_reads = sessions_month * FS_READS_PER_SESSION
+    est_fs_writes = sessions_month * FS_WRITES_PER_SESSION
+
+    # 無料枠控除 (月次)
+    fs_free_reads_month = FS_FREE_READS_DAY * days_elapsed
+    fs_free_writes_month = FS_FREE_WRITES_DAY * days_elapsed
+    billable_reads = max(0, est_fs_reads - fs_free_reads_month)
+    billable_writes = max(0, est_fs_writes - fs_free_writes_month)
+
+    cost_fs_reads = billable_reads / 100_000 * FS_READ_PER_100K
+    cost_fs_writes = billable_writes / 100_000 * FS_WRITE_PER_100K
+    cost_firestore = cost_fs_reads + cost_fs_writes
+
+    # ===================================================================
+    # Cloud Run コスト計算 (セッション数ベース推定)
+    # ===================================================================
+    # 1セッション = 約 150 リクエスト, 平均 wall time 30秒相当
+    CR_REQS_PER_SESSION = 150
+    CR_WALL_SEC_PER_SESSION = 30
+    est_cr_reqs = sessions_month * CR_REQS_PER_SESSION
+    est_cr_wall_sec = sessions_month * CR_WALL_SEC_PER_SESSION
+
+    # concurrency=15 で共有されるので CPU/Mem は /15 で計上
+    CONCURRENCY = 15
+    est_vcpu_sec = est_cr_wall_sec * CR_CPU / CONCURRENCY
+    est_mem_sec = est_cr_wall_sec * CR_MEM_GIB / CONCURRENCY
+
+    # 無料枠控除
+    billable_vcpu_sec = max(0, est_vcpu_sec - CR_FREE_VCPU_SEC_MONTH * (days_elapsed / 30))
+    billable_mem_sec = max(0, est_mem_sec - CR_FREE_MEM_GIB_SEC_MONTH * (days_elapsed / 30))
+    billable_cr_reqs = max(0, est_cr_reqs - CR_FREE_REQ_MONTH * (days_elapsed / 30))
+
+    cost_cr_cpu = billable_vcpu_sec * CR_VCPU_SEC_PRICE
+    cost_cr_mem = billable_mem_sec * CR_MEM_GIB_SEC_PRICE
+    cost_cr_req = billable_cr_reqs / 1_000_000 * CR_REQ_PRICE_PER_M
+    cost_cloud_run = cost_cr_cpu + cost_cr_mem + cost_cr_req
+
+    # ===================================================================
+    # Cloud Storage コスト (軽微)
+    # ===================================================================
+    # 短期 (7日) 保存なので storage はほぼ無視。操作回数のみ効く。
+    est_class_a = sessions_month * 3   # upload + commit + export など
+    est_class_b = sessions_month * 20  # read, metadata get
+    cost_gcs = (est_class_a / 1000 * GCS_CLASS_A_PER_1K +
+                est_class_b / 1000 * GCS_CLASS_B_PER_1K)
+
+    # ===================================================================
+    # Fixed overhead
+    # ===================================================================
+    cost_fixed = FIXED_OVERHEAD_DAY_USD * days_elapsed
+
+    # ===================================================================
+    # 合計
+    # ===================================================================
+    cost_total = cost_vertex + cost_firestore + cost_cloud_run + cost_gcs + cost_fixed
 
     # ── KPI ──
     st.markdown("### 今月の推定コスト")
     k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric("推定合計", f"¥{cost_total * JPY_RATE:.0f}")
+        st.caption(f"${cost_total:.2f}")
     with k2:
-        st.metric("STT 使用量", f"{total_stt_min:.1f} 分")
+        st.metric("LLM 入力トークン", f"{total_input_tokens/1000:.1f}K")
+        st.caption(f"出力: {total_output_tokens/1000:.1f}K")
     with k3:
-        st.metric("LLM 呼び出し", f"{total_llm_calls} 回")
+        st.metric("LLM 呼び出し", f"{total_llm_calls:,}")
+        st.caption(f"Summary: {total_summary} / Quiz: {total_quiz}")
     with k4:
         daily_cost = cost_total / days_elapsed if days_elapsed > 0 else 0
         monthly_est = daily_cost * 30
         st.metric("月末予測", f"¥{monthly_est * JPY_RATE:.0f}")
+        st.caption(f"${monthly_est:.2f}/month")
 
     st.divider()
 
-    # ── サービス別コスト内訳 ──
+    # ── サービス別コスト内訳 (Google公式単価ベース) ──
     st.markdown("### サービス別コスト内訳")
+    st.caption("Google 公式 Vertex AI / Firestore / Cloud Run / Storage pricing (2026-04) に基づく計算")
 
     cost_rows = []
     services = [
-        ("Cloud Run", cost_cloud_run, f"STT×{CR_TO_SPEECH_RATIO:.1f}倍 (GCP実績比率)", "CPU+Memory+Requests"),
-        ("Cloud Speech API", cost_speech, f"{total_stt_min:.1f} 分 × $0.064", "Chirp 2"),
-        ("Vertex AI", cost_vertex, f"{total_llm_calls} 回 × $0.001", "Gemini 2.0 Flash Lite"),
-        ("その他 (AR/Storage/etc)", cost_fixed, f"{days_elapsed}日 × $0.25", "Artifact Registry + Storage"),
+        (
+            "Vertex AI (Gemini)",
+            cost_vertex,
+            f"In: {total_input_tokens:,} tok × $0.075/1M + Out: {total_output_tokens:,} tok × $0.30/1M",
+            "gemini-2.0-flash-lite (default)",
+        ),
+        (
+            "Firestore",
+            cost_firestore,
+            f"R: {est_fs_reads:,} ($0.03/100K) + W: {est_fs_writes:,} ($0.09/100K)",
+            f"推定 {sessions_month} sessions × 345R/780W",
+        ),
+        (
+            "Cloud Run",
+            cost_cloud_run,
+            f"vCPU: {est_vcpu_sec:.0f}s + Mem: {est_mem_sec:.0f}GiB-s + Req: {est_cr_reqs:,}",
+            f"concurrency={CONCURRENCY}, cpu-throttling=ON",
+        ),
+        (
+            "Cloud Storage",
+            cost_gcs,
+            f"Class A: {est_class_a:,} + Class B: {est_class_b:,}",
+            "音声7日保持、エクスポート1h",
+        ),
+        (
+            "Fixed Overhead",
+            cost_fixed,
+            f"{days_elapsed}日 × $0.25",
+            "Logging/Tasks/Scheduler/AR/Build/Auth",
+        ),
     ]
     for name, cost_usd, usage_str, note in services:
         share = (cost_usd / cost_total * 100) if cost_total > 0 else 0
         cost_rows.append({
             "サービス": name,
             "使用量/計算根拠": usage_str,
-            "コスト (USD)": f"${cost_usd:.2f}",
-            "コスト (JPY)": f"¥{cost_usd * JPY_RATE:.0f}",
-            "構成比": f"{share:.0f}%",
+            "コスト (USD)": f"${cost_usd:.4f}",
+            "コスト (JPY)": f"¥{cost_usd * JPY_RATE:.1f}",
+            "構成比": f"{share:.1f}%",
             "備考": note,
         })
     cost_rows.append({
         "サービス": "合計",
         "使用量/計算根拠": "",
-        "コスト (USD)": f"${cost_total:.2f}",
-        "コスト (JPY)": f"¥{cost_total * JPY_RATE:.0f}",
+        "コスト (USD)": f"${cost_total:.4f}",
+        "コスト (JPY)": f"¥{cost_total * JPY_RATE:.1f}",
         "構成比": "100%",
         "備考": f"{days_elapsed}日間 (月初〜今日)",
     })
@@ -2788,22 +2933,54 @@ with tab_costs:
 
     # ── 単位原価 ──
     st.divider()
-    st.markdown("### 単位原価")
+    st.markdown("### 単位原価 (実測ベース)")
 
     u1, u2, u3 = st.columns(3)
     with u1:
-        speech_per_min = cost_speech / total_stt_min if total_stt_min > 0 else 0
-        total_per_min = cost_total / total_stt_min if total_stt_min > 0 else 0
-        st.metric("STT 1分あたり (Speech のみ)", f"¥{speech_per_min * JPY_RATE:.1f}")
-        st.caption(f"全サービス込み: ¥{total_per_min * JPY_RATE:.1f}/分")
-    with u2:
         cost_per_session = cost_total / sessions_month if sessions_month > 0 else 0
-        st.metric("1セッションあたり", f"¥{cost_per_session * JPY_RATE:.1f}")
-        st.caption(f"推定セッション数: {sessions_month}")
+        st.metric("1セッションあたり (実測)", f"¥{cost_per_session * JPY_RATE:.2f}")
+        st.caption(f"${cost_per_session:.4f} | 推定セッション数: {sessions_month}")
+    with u2:
+        cost_per_1k_tokens = (cost_vertex / (total_input_tokens + total_output_tokens) * 1000) if (total_input_tokens + total_output_tokens) > 0 else 0
+        st.metric("1K tokens あたり (Vertex)", f"¥{cost_per_1k_tokens * JPY_RATE:.3f}")
+        st.caption(f"${cost_per_1k_tokens:.5f}")
     with u3:
         cost_per_day = cost_total / days_elapsed if days_elapsed > 0 else 0
         st.metric("1日あたり", f"¥{cost_per_day * JPY_RATE:.0f}")
         st.caption(f"${cost_per_day:.2f}/day")
+
+    # ── 通常 vs Assist 2系統メーター ──
+    st.divider()
+    st.markdown("### 🎯 セッション原価モデル (通常 vs Assist多用)")
+    st.caption("Google 公式単価に基づく 60分セッションの理論原価")
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric(
+            "通常セッション (60分)",
+            f"¥{SESSION_NORMAL_USD * JPY_RATE:.2f}",
+            help="Summary + Quiz + Playlist + SummaryV2 + TODO + Q&A×5 (110K in + 33K out)",
+        )
+        st.caption(f"${SESSION_NORMAL_USD:.4f} / session")
+    with m2:
+        st.metric(
+            "Assist多用セッション (60分)",
+            f"¥{SESSION_ASSIST_USD * JPY_RATE:.1f}",
+            delta=f"+{(SESSION_ASSIST_USD / SESSION_NORMAL_USD - 1) * 100:.0f}%",
+            delta_color="inverse",
+            help="通常 + update_meeting_state 120回 (1.5M in + 122K out)",
+        )
+        st.caption(f"${SESSION_ASSIST_USD:.4f} / session")
+    with m3:
+        ratio = SESSION_ASSIST_USD / SESSION_NORMAL_USD
+        st.metric("Assist倍率", f"{ratio:.1f}x")
+        st.caption("Assist使用で原価が約9倍に")
+
+    st.info(
+        "💡 **使い分けの目安**: 実測の平均セッション原価が通常モデル ($0.018) に近ければ Assist 未普及、"
+        "$0.05 を超えている場合は Assist が一定比率で使われている可能性。`usage_events` に "
+        "`feature=update_meeting_state` を残せば正確な比率が出せる。"
+    )
 
     # ── コスト構成比チャート ──
     st.divider()
@@ -2814,15 +2991,15 @@ with tab_costs:
     ])
     if not pie_data.empty:
         fig = px.pie(pie_data, values="コスト", names="サービス", hole=0.4)
-        fig.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=300)
+        fig.update_layout(margin=dict(l=20, r=20, t=30, b=20), height=320)
         st.plotly_chart(fig, use_container_width=True)
 
     # ── エンティティ別使用量 ──
     st.divider()
     if usage_by_entity:
-        st.markdown("### エンティティ別使用量")
+        st.markdown("### エンティティ別使用量 (トークン内訳)")
         usage_df = pd.DataFrame(usage_by_entity)
-        usage_df = usage_df.sort_values("STT (min)", ascending=False)
+        usage_df = usage_df.sort_values("Input Tokens", ascending=False)
         st.dataframe(usage_df, use_container_width=True, hide_index=True)
 
     # ── Cloud Run 設定ステータス ──
@@ -2837,15 +3014,40 @@ with tab_costs:
         st.success("0 ✅")
     with opt3:
         st.markdown("**concurrency**")
-        st.info("15")
+        st.info(f"{CONCURRENCY}")
     with opt4:
         st.markdown("**CPU / Memory**")
-        st.info("1 vCPU / 2 GiB")
+        st.info(f"{CR_CPU} vCPU / {CR_MEM_GIB} GiB")
 
     st.markdown("""
-    > **計算方法**: Cloud Run コストは GCP 請求実績の比率（Speech の約2.2倍）から推定。
-    > 正確な値は [GCP Billing Console](https://console.cloud.google.com/billing) で確認。
-    > Cloud Run の SKU 別内訳（CPU/Memory/Requests）は「グループ条件: SKU」で確認可能。
+    ---
+    #### 📖 計算式 (Google公式単価, 2026-04)
+
+    **Vertex AI (Gemini)**
+    ```
+    vertex_cost = (input_tokens / 1M) × input_price + (output_tokens / 1M) × output_price
+    ```
+    | モデル | Input ($/1M) | Output ($/1M) |
+    |---|---|---|
+    | gemini-2.0-flash-lite | 0.075 | 0.30 |
+    | gemini-2.5-flash-lite | 0.10 | 0.40 |
+    | gemini-2.5-flash | 0.15 | 0.60 |
+
+    **Grounding with Google Search** (2.0/2.5 Flash 合算, 1500 prompts/day 無料, 超過 $35/1K)
+
+    **Firestore** (R: $0.03 / 100K, W: $0.09 / 100K, D: $0.01 / 100K, 無料枠 R:50K/W:20K/D:20K per day)
+
+    **Cloud Run** (vCPU-s: $0.000024, GiB-s: $0.0000025, Req: $0.40/1M, 無料枠 180K vCPU-s + 360K GiB-s + 2M req/月)
+
+    **Cloud Storage (Standard)** (Class A: $0.005/1K, Class B: $0.0004/1K, Storage: $0.023/GiB/月)
+
+    ---
+    > **⚠️ 注意**:
+    > - この計算は **Google 公式単価による理論値**です。実際の請求は BigQuery Billing Export で突合してください。
+    > - `llm_input_tokens` / `llm_output_tokens` が `monthly_usage` に記録されていれば実測ベース、
+    >   そうでなければ `llm_calls × 10K tokens` の概算になります。
+    > - Cloud Run の wall_sec / CPU 共有比率は推定値。正確な値は Cloud Monitoring API で取得してください。
+    > - Firestore の無料枠 (50K reads/day) を超える場合のみ課金対象として計算しています。
     """)
 
 # ---------------------------------------------------------

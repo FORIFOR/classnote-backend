@@ -129,3 +129,22 @@ def resolve_transcript_text(
             return transcript
     chunks = get_transcript_chunks(session_id)
     return build_transcript_text_from_chunks(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Async wrapper — offloads sync Firestore reads to a thread
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+
+async def resolve_transcript_text_async(
+    session_id: str,
+    session_data: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """[PERF] Async version of resolve_transcript_text using asyncio.to_thread."""
+    if session_data:
+        transcript = session_data.get("transcriptText")
+        if transcript:
+            return transcript
+    return await asyncio.to_thread(resolve_transcript_text, session_id, session_data)

@@ -6,12 +6,13 @@ from app.services.llm import (
     GEMINI_MODEL_NAME,
     generate_quiz,
     generate_summary_and_tags,
+    generate_quick_summary,
     clean_quiz_markdown,
     answer_question,
     translate_text,
     generate_playlist_timeline,
 )
-from app.services.transcripts import resolve_transcript_text
+from app.services.transcripts import resolve_transcript_text, resolve_transcript_text_async
 from app.services.playlist_utils import normalize_playlist_items
 from app.services.usage import usage_logger
 from app.services.ops_logger import log_job_transition, log_llm_event, log_stt_event, ErrorCode
@@ -33,6 +34,98 @@ logger = logging.getLogger("app.tasks")
 @router.get("/internal/tasks/ping")
 async def ping_task():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc)}
+
+@router.post("/internal/tasks/summarize_quick")
+async def handle_summarize_quick_task(request: Request):
+    """Quick Summary worker: 30-60秒で先出し要約 (highlights + topicSummary)。CostGuard 消費なし。"""
+    if not is_feature_enabled("summarization"):
+        return {"status": "skipped", "reason": "feature_disabled"}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    session_id = payload.get("sessionId")
+    idempotency_key = payload.get("idempotencyKey")
+
+    if not session_id:
+        return {"status": "error", "message": "sessionId required"}
+
+    derived_ref = None
+    try:
+        import os
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        db = firestore.Client(project=project_id)
+
+        doc_ref = db.collection("sessions").document(session_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return {"status": "skipped", "reason": "not_found"}
+
+        data = doc.to_dict()
+        derived_ref = doc_ref.collection("derived").document("summary_quick")
+
+        if idempotency_key:
+            derived_snap = derived_ref.get()
+            if derived_snap.exists:
+                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
+                if current_key and current_key == idempotency_key:
+                    return {"status": "skipped", "reason": "idempotent_hit"}
+
+        transcript = await resolve_transcript_text_async(session_id, data) or ""
+        mode = data.get("mode", "lecture")
+        if mode == "translate" or data.get("importType") == "translate":
+            mode = "translate"
+
+        if not transcript:
+            derived_ref.set({
+                "status": "failed",
+                "errorReason": "Transcript empty",
+                "updatedAt": datetime.now(timezone.utc),
+                "idempotencyKey": idempotency_key,
+            }, merge=True)
+            return {"status": "failed", "reason": "empty_transcript"}
+
+        result = await generate_quick_summary(transcript, mode=mode)
+
+        derived_ref.set({
+            "status": "succeeded",
+            "result": {
+                "markdown": result.get("markdown", ""),
+                "topicSummary": result.get("topicSummary", ""),
+            },
+            "updatedAt": datetime.now(timezone.utc),
+            "idempotencyKey": idempotency_key,
+        }, merge=True)
+
+        if result.get("topicSummary"):
+            try:
+                doc_ref.update({"topicSummary": result["topicSummary"]})
+            except Exception as upd_err:
+                logger.warning(f"[QuickSummary] Failed to update session topicSummary for {session_id}: {upd_err}")
+
+        await publish_session_event(session_id, "assets.updated", {"fields": ["summary_quick"]})
+        logger.info(f"[QuickSummary] Completed for {session_id}")
+        return {"status": "completed"}
+
+    except Exception as e:
+        logger.exception(f"[QuickSummary] Failed for {session_id}")
+        if derived_ref is not None:
+            try:
+                derived_ref.set({
+                    "status": "failed",
+                    "errorReason": str(e),
+                    "updatedAt": datetime.now(timezone.utc),
+                    "idempotencyKey": idempotency_key,
+                }, merge=True)
+            except Exception:
+                pass
+        error_str = str(e)
+        if "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str:
+            raise HTTPException(status_code=503, detail="Transient error, retrying...")
+        return {"status": "failed", "error": error_str}
+
 
 @router.post("/internal/tasks/summarize")
 async def handle_summarize_task(request: Request):
