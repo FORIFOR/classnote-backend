@@ -492,11 +492,15 @@ def list_sessions_in_folder(folder_id: str, current_user: CurrentUser = Depends(
     return _list_sessions_in_folder_impl(current_user.uid, folder_id)
 
 
-# /folders (legacy alias) — 出荷済 client が呼ぶので維持
+# /folders (legacy alias) — 出荷済 client が呼ぶので維持。
+# iOS ``listFolders()`` / ``listFolderSessions()`` は **配列を直接** Decodable
+# として読むため、ここは ``{"folders": [...]}`` ではなく ``[...]`` を返す。
+# ``/v1/folders`` は dict-wrapped を維持し、他クライアント (admin console 等)
+# の互換は維持する。
 
-@legacy_router.get("", response_model=FolderListResponse)
+@legacy_router.get("", response_model=List[FolderResponse])
 def list_folders_legacy(current_user: CurrentUser = Depends(get_current_user)):
-    return _list_folders_impl(current_user.uid)
+    return _list_folders_impl(current_user.uid).folders
 
 
 @legacy_router.post("", response_model=FolderResponse, status_code=201)
@@ -522,7 +526,13 @@ def delete_folder_legacy(folder_id: str, current_user: CurrentUser = Depends(get
 
 @legacy_router.get("/{folder_id}/sessions")
 def list_sessions_in_folder_legacy(folder_id: str, current_user: CurrentUser = Depends(get_current_user)):
-    return _list_sessions_in_folder_impl(current_user.uid, folder_id)
+    """iOS の ``listFolderSessions`` は ``[FolderSessionSnapshot]`` を期待。
+    ``{"sessions": [...]}`` のまま返すと decode error → folder 0 件表示の
+    バグを引き起こすので、ここでは配列を直接返す。"""
+    result = _list_sessions_in_folder_impl(current_user.uid, folder_id)
+    if isinstance(result, dict) and "sessions" in result:
+        return result["sessions"]
+    return result
 
 
 # Bulk import — colon-RPC, dedicated router (prefix の slash 結合を回避)
