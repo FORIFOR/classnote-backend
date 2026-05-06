@@ -370,6 +370,17 @@ async def _handle_summarize_task_core(request: Request):
                 r"^(?:会議|講義|ミーティング|レコーディング|録音|Meeting|Lecture|Untitled|\(無題\))?\s*"
                 r"(?:\d{1,2}[/\-月]\d{1,2}日?\s*\d{1,2}[:時]\d{1,2}分?\s*)?$"
             )
+            # Import-flow defaults that should always be replaced once the
+            # summary names a real topic. ``YouTube取り込み`` is the title
+            # backend assigns when /imports/youtube creates a session
+            # before the transcript / summary pipeline runs; without this
+            # entry the placeholder regex above didn't match and the
+            # auto-promote step was silently skipped.
+            import_defaults = {
+                "YouTube取り込み", "YouTube import",
+                "Audio import", "音声取り込み",
+                "Transcript import", "字幕取り込み",
+            }
             # Treat any prior auto-set title (incl. older "M/D HH:MM_..." or
             # plain topic) as still placeholder-replaceable, so we can upgrade
             # them to the new "YYYYMMDD HH:MM_..." format.
@@ -378,6 +389,7 @@ async def _handle_summarize_task_core(request: Request):
                 not current_title
                 or current_title == "(無題)"
                 or bool(placeholder_re.match(current_title))
+                or current_title in import_defaults
                 or already_auto
             )
 
