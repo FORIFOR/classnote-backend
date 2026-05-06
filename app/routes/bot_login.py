@@ -61,34 +61,55 @@ _PAGE_TEMPLATE = """<!doctype html>
   h1 {{ font-size: 18px; margin: 0 0 16px; }}
   p  {{ margin: 0 0 12px; font-size: 14px; }}
   button {{ width: 100%; margin: 12px 0; padding: 14px 16px; font-size: 15px;
-            background: {accent}; color: #fff; border: none; border-radius: 8px;
-            cursor: pointer; }}
-  button:disabled {{ background: #ccc; }}
+            border: none; border-radius: 8px; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 8px; }}
+  button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  .btn-google {{ background: #ffffff; color: #1a1a1a; border: 1px solid #dadce0; }}
+  .btn-apple  {{ background: #000000; color: #ffffff; }}
+  .btn-line   {{ background: #06c755; color: #ffffff; }}
   #status {{ margin-top: 16px; font-size: 13px; color: #555; min-height: 24px; }}
   .err {{ color: #b00020; }}
   .ok  {{ color: #137333; }}
+  .divider {{ text-align: center; color: #888; font-size: 12px; margin: 8px 0; }}
 </style>
 </head><body>
 <h1>{title}</h1>
 <p>{intro}</p>
-<button id="signin">Google でログインして連携を完了</button>
+<button id="signin-google" class="btn-google">Google でログイン</button>
+<button id="signin-apple"  class="btn-apple">Apple でログイン</button>
+<button id="signin-line"   class="btn-line">LINE でログイン</button>
 <p id="status"></p>
 
 <script type="module">
   import {{ initializeApp }} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
-  import {{ getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult }}
-    from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+  import {{
+    getAuth, GoogleAuthProvider, OAuthProvider,
+    signInWithPopup, signInWithRedirect, getRedirectResult,
+    signInWithCustomToken,
+  }} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
 
   const cfg = {firebase_cfg};
   const provider_label = "{provider_label}";
   const consume_url = "{consume_url}";
+  const link_token = "{link_token}";
+  const provider_slug = "{provider_slug}";
 
   const app = initializeApp(cfg);
   const auth = getAuth(app);
   const goog = new GoogleAuthProvider();
+  const apple = new OAuthProvider("apple.com");
+  apple.addScope("email");
+  apple.addScope("name");
 
   const status = document.getElementById("status");
-  const btn = document.getElementById("signin");
+  const btnG = document.getElementById("signin-google");
+  const btnA = document.getElementById("signin-apple");
+  const btnL = document.getElementById("signin-line");
+  const allBtns = [btnG, btnA, btnL];
+
+  function setBusy(busy) {{
+    allBtns.forEach((b) => {{ b.disabled = busy; }});
+  }}
 
   async function consume(idToken) {{
     status.textContent = "連携を確定しています…";
@@ -100,36 +121,77 @@ _PAGE_TEMPLATE = """<!doctype html>
       status.className = "ok";
       status.textContent = provider_label + " と DeepNote の連携が完了しました。" +
         provider_label + " のチャットに戻ってご利用ください。";
-      btn.disabled = true;
+      setBusy(true);
     }} else {{
       const body = await r.text();
       status.className = "err";
       status.textContent = "連携に失敗しました (" + r.status + "): " + body;
+      setBusy(false);
     }}
   }}
 
-  btn.addEventListener("click", async () => {{
-    btn.disabled = true;
-    status.textContent = "Google ログイン画面を表示します…";
+  async function runProviderLogin(label, providerObj) {{
+    setBusy(true);
+    status.className = "";
+    status.textContent = label + " ログイン画面を表示します…";
     try {{
-      const result = await signInWithPopup(auth, goog);
+      const result = await signInWithPopup(auth, providerObj);
       const tok = await result.user.getIdToken();
       await consume(tok);
     }} catch (e) {{
-      // popup blocked -> fallback to redirect
-      console.warn("popup failed, trying redirect", e);
+      console.warn("popup failed for " + label + ", trying redirect", e);
       try {{
-        await signInWithRedirect(auth, goog);
+        await signInWithRedirect(auth, providerObj);
       }} catch (e2) {{
         status.className = "err";
-        status.textContent = "Google ログインに失敗しました: " + (e2.message || e2);
-        btn.disabled = false;
+        status.textContent = label + " ログインに失敗しました: " + (e2.message || e2);
+        setBusy(false);
       }}
     }}
+  }}
+
+  btnG.addEventListener("click", () => runProviderLogin("Google", goog));
+  btnA.addEventListener("click", () => runProviderLogin("Apple",  apple));
+
+  // LINE login: server-side OAuth → Firebase custom token returned via
+  // ``?customToken=...`` query param on this same page.
+  btnL.addEventListener("click", () => {{
+    setBusy(true);
+    status.className = "";
+    status.textContent = "LINE 認証画面を開きます…";
+    const startUrl = "/auth/line/web?redirect=" + encodeURIComponent(
+      window.location.origin + "/integrations/" + provider_slug +
+      "/login?token=" + encodeURIComponent(link_token) + "&from=line"
+    ) + "&botlink=1";
+    window.location.href = startUrl;
   }});
 
-  // Handle redirect-result on page load (when popup fallback fired earlier).
+  // Pick up ``?lineToken=...`` (LINE redirect from auth/line/web/callback)
+  // and finish sign-in via Firebase custom token.
   (async () => {{
+    const params = new URLSearchParams(window.location.search);
+    const ct = params.get("lineToken") || params.get("customToken");
+    const lineErr = params.get("lineError");
+    if (lineErr) {{
+      status.className = "err";
+      status.textContent = "LINE ログインに失敗しました: " + lineErr;
+      return;
+    }}
+    if (ct) {{
+      setBusy(true);
+      status.textContent = "LINE 認証を確定しています…";
+      try {{
+        const result = await signInWithCustomToken(auth, ct);
+        const tok = await result.user.getIdToken();
+        await consume(tok);
+      }} catch (e) {{
+        status.className = "err";
+        status.textContent = "LINE 認証エラー: " + (e.message || e);
+        setBusy(false);
+      }}
+      return;
+    }}
+    // Handle Google/Apple redirect-result on page load.
     try {{
       const r = await getRedirectResult(auth);
       if (r && r.user) {{
@@ -168,6 +230,8 @@ def _render_login_page(*, provider: str, token: str) -> HTMLResponse:
         firebase_cfg=_json.dumps(cfg),
         provider_label=label,
         consume_url=consume,
+        link_token=token,
+        provider_slug=provider,
     )
     return HTMLResponse(content=html)
 
