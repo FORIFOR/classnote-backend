@@ -92,49 +92,56 @@ class M:
     GROUP_NO_SHARED_DATA = (
         "このグループに共有された会議はまだありません。\n"
         "（プライバシー保護のため、共有マークが付いた会議だけがこちらに表示されます）\n\n"
-        "▼ 1 件だけ共有したい場合\n"
+        "▼ 共有したい会議がある場合\n"
         "DeepNoteアプリ → 会議 → 共有 → 「このグループに共有」\n\n"
-        "▼ これから録音する会議を毎回自動でこのグループに共有\n"
-        "DeepNote と LINE の個人チャットで「自動共有 ON」と送ってください。"
+        "▼ 要約完了の通知だけ受け取りたい場合\n"
+        "個人チャットで「通知 ON」と送ってください（DM のみへ通知。グループには自動投稿しません）。"
     )
 
     GROUP_NO_SHARED_DATA_WITH_HINT = (
         "このグループに共有された会議はまだありません。\n"
         "（最新の会議「{title}」は未共有です）\n\n"
-        "▼ この会議を共有\n"
+        "▼ この会議を共有するには\n"
         "DeepNoteアプリ → 会議「{title}」→ 共有 → 「このグループに共有」\n\n"
-        "▼ 毎回自動でこのグループに共有\n"
-        "個人チャットで「自動共有 ON」と送ってください。"
+        "▼ 要約完了の通知だけ受け取りたい場合\n"
+        "個人チャットで「通知 ON」と送ってください（自動でグループには投稿しません）。"
     )
 
-    AUTO_SHARE_DM_NOT_GROUP = (
-        "「自動共有」コマンドは LINE グループ・トークルームでのみご利用いただけます。\n"
-        "1) LINE グループに DeepNote bot を追加\n"
-        "2) そのグループで「自動共有 ON」と送信\n"
-        "以降の新規会議が自動でそのグループに共有されます。"
+    AUTO_SHARE_DEPRECATED = (
+        "🛑 「自動共有」(グループ自動投稿) は安全のため廃止しました。\n"
+        "AI が生成した要約をユーザー確認なしにグループ投稿すると、誤認識・社外秘・個人情報を意図せず共有してしまう恐れがあるためです。\n\n"
+        "代わりに次の安全な選択肢をご利用ください：\n"
+        "・「通知 ON」(DMのみ): 要約完了をあなたの個人チャットだけに通知\n"
+        "・「自分要約 ON」(DMのみ): 要約 + TODO の概要をあなたの DM に送信\n"
+        "・チームへ共有したい場合は、DeepNoteアプリで明示的にボタンを押して共有してください"
     )
 
-    AUTO_SHARE_ENABLED = (
-        "✅ 自動共有を有効にしました。\n"
-        "今後 DeepNote で記録・要約された会議は、自動でこのグループに共有されます。\n"
-        "（既存の会議は対象外。停止するには「自動共有 OFF」と送信してください）"
+    NOTIFY_ENABLED = (
+        "✅ 要約完了通知を有効にしました。\n"
+        "今後 DeepNote で記録した会議の要約が完了したら、この個人チャットに通知します。\n"
+        "（グループには自動投稿しません。停止するには「通知 OFF」）"
     )
+    NOTIFY_DISABLED = "🛑 要約完了通知を停止しました。"
+    NOTIFY_ALREADY_ON = "要約完了通知は既に有効です。"
+    NOTIFY_ALREADY_OFF = "要約完了通知は既にオフです。"
 
-    AUTO_SHARE_ALREADY_ON = "このグループでの自動共有は既に有効です。"
-
-    AUTO_SHARE_DISABLED = (
-        "🛑 自動共有を停止しました。\n"
-        "以降の新規会議はこのグループに自動共有されません。\n"
-        "（既に共有済みの会議は引き続き表示されます。完全に解除したい場合は DeepNoteアプリから個別に解除してください）"
+    DIGEST_ENABLED = (
+        "✅ 自分要約を有効にしました。\n"
+        "今後の会議の要約 + TODO 概要を、あなたの個人チャットに送信します。\n"
+        "（グループには自動投稿しません。停止するには「自分要約 OFF」）"
     )
+    DIGEST_DISABLED = "🛑 自分要約の自動送信を停止しました。"
+    DIGEST_ALREADY_ON = "自分要約は既に有効です。"
+    DIGEST_ALREADY_OFF = "自分要約は既にオフです。"
 
-    AUTO_SHARE_NOT_ON = "このグループでは自動共有はオフのままです。"
-
-    AUTO_SHARE_HELP = (
-        "▼ 自動共有コマンド (グループ内で送信)\n"
-        "・「自動共有 ON」: 今後の会議をこのグループに自動で共有\n"
-        "・「自動共有 OFF」: 自動共有を停止\n"
-        "・「自動共有」: 現在の状態を確認"
+    SMART_SHARE_HELP = (
+        "▼ Smart Share コマンド (個人チャットで送信)\n"
+        "・「通知 ON」: 要約完了を DM に通知 (内容は短く)\n"
+        "・「自分要約 ON」: 要約 + TODO 概要を DM に送信\n"
+        "・「通知 OFF」「自分要約 OFF」: 各停止\n"
+        "▼ チーム共有はアプリから\n"
+        "DeepNoteアプリ → 会議 → 共有 → 「このグループに共有」を押してください。\n"
+        "プライバシー保護のため、グループへの自動投稿は行いません。"
     )
 
     GROUP_PRIVATE_REJECTED = (
@@ -264,11 +271,20 @@ def _classify_command(text: str) -> str:
     # Auto-share toggle (group-only command). We accept several
     # phrasings so users don't have to remember the exact wording.
     if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
-        if any(on in t for on in (" on", "オン", "有効", "オフ→オン", "enable")):
-            return "auto_share_on"
-        if any(off in t for off in (" off", "オフ", "無効", "停止", "disable")):
-            return "auto_share_off"
-        return "auto_share_status"
+        # Lv4 retired (safety). Always answer with the migration notice.
+        return "auto_share_deprecated"
+    if t.startswith("通知") or t == "通知" or "notify" in t:
+        if any(on in t for on in ("on", "オン", "有効", "enable")):
+            return "notify_on"
+        if any(off in t for off in ("off", "オフ", "無効", "停止", "disable")):
+            return "notify_off"
+        return "notify_status"
+    if "自分要約" in t or "dm digest" in t or "self digest" in t:
+        if any(on in t for on in ("on", "オン", "有効", "enable")):
+            return "digest_on"
+        if any(off in t for off in ("off", "オフ", "無効", "停止", "disable")):
+            return "digest_off"
+        return "digest_status"
     if any(k in t for k in ("クレジット", "残量", "credit")):
         return "credit"
     if any(k in t for k in ("最新", "会議", "summary", "要約")):
@@ -288,12 +304,31 @@ def _classify_command(text: str) -> str:
     return "unknown"
 
 
-def _build_reply_for_linked(account_id: str, command: str) -> str:
+def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "") -> str:
     if command == "help":
-        return M.HELP + "\n\n" + M.AUTO_SHARE_HELP
-    if command in ("auto_share_on", "auto_share_off", "auto_share_status"):
-        # The toggle only makes sense inside a group; in DM we explain.
-        return M.AUTO_SHARE_DM_NOT_GROUP
+        return M.HELP + "\n\n" + M.SMART_SHARE_HELP
+    if command == "auto_share_deprecated":
+        return M.AUTO_SHARE_DEPRECATED
+    if command in ("notify_on", "notify_off", "notify_status"):
+        from app.services import bot_smart_share
+        if command == "notify_on":
+            changed = bot_smart_share.set_notify("line", line_user_id, True)
+            return M.NOTIFY_ENABLED if changed else M.NOTIFY_ALREADY_ON
+        if command == "notify_off":
+            changed = bot_smart_share.set_notify("line", line_user_id, False)
+            return M.NOTIFY_DISABLED if changed else M.NOTIFY_ALREADY_OFF
+        s = bot_smart_share.get_settings("line", line_user_id)
+        return ("✅ 通知: 有効" if s["notifyOnSummaryReady"] else "⏸ 通知: オフ") + "\n\n" + M.SMART_SHARE_HELP
+    if command in ("digest_on", "digest_off", "digest_status"):
+        from app.services import bot_smart_share
+        if command == "digest_on":
+            changed = bot_smart_share.set_dm_digest("line", line_user_id, True)
+            return M.DIGEST_ENABLED if changed else M.DIGEST_ALREADY_ON
+        if command == "digest_off":
+            changed = bot_smart_share.set_dm_digest("line", line_user_id, False)
+            return M.DIGEST_DISABLED if changed else M.DIGEST_ALREADY_OFF
+        s = bot_smart_share.get_settings("line", line_user_id)
+        return ("✅ 自分要約: 有効" if s["dmDigestOnSummary"] else "⏸ 自分要約: オフ") + "\n\n" + M.SMART_SHARE_HELP
     if command == "credit":
         report = line_briefing.get_credit_summary(account_id)
         if not report:
@@ -368,28 +403,26 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             )
             return
         ws_key = f"line:{group_id}"
-        # Auto-share toggle commands are valid in groups (not DM).
-        if cmd in ("auto_share_on", "auto_share_off", "auto_share_status"):
-            from app.services import bot_auto_share
-            if cmd == "auto_share_on":
-                added = bot_auto_share.enable("line", line_user_id, ws_key)
-                text = M.AUTO_SHARE_ENABLED if added else M.AUTO_SHARE_ALREADY_ON
-                outcome = "auto_share_on" if added else "auto_share_already_on"
-            elif cmd == "auto_share_off":
-                removed = bot_auto_share.disable("line", line_user_id, ws_key)
-                text = M.AUTO_SHARE_DISABLED if removed else M.AUTO_SHARE_NOT_ON
-                outcome = "auto_share_off" if removed else "auto_share_not_on"
-            else:
-                on = bot_auto_share.is_enabled("line", line_user_id, ws_key)
-                text = M.AUTO_SHARE_ENABLED if on else M.AUTO_SHARE_NOT_ON
-                text = text + "\n\n" + M.AUTO_SHARE_HELP
-                outcome = "auto_share_status_on" if on else "auto_share_status_off"
-            line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+        # 「自動共有」 (Lv4) is retired for safety. Show the migration notice.
+        if cmd == "auto_share_deprecated":
+            line_messaging.reply(reply_token, [line_messaging.text_message(M.AUTO_SHARE_DEPRECATED)])
             bot_audit.record(
                 provider="line", source_type=source_type,
                 source_user_id=line_user_id,
                 account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
-                command=cmd, outcome=outcome,
+                command=cmd, outcome="auto_share_deprecated",
+            )
+            return
+        # Smart Share notify/digest are DM-only. In a group, redirect.
+        if cmd in ("notify_on", "notify_off", "notify_status",
+                   "digest_on", "digest_off", "digest_status"):
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "Smart Share の通知設定は LINE の個人チャットで設定してください。\n\n" + M.SMART_SHARE_HELP)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                command=cmd, outcome="redirect_to_dm",
             )
             return
 
@@ -452,7 +485,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         return
 
     command = _classify_command(user_text)
-    text = _build_reply_for_linked(link["accountId"], command)
+    text = _build_reply_for_linked(link["accountId"], command, line_user_id=line_user_id)
     line_messaging.reply(reply_token, [line_messaging.text_message(text)])
     bot_audit.record(
         provider="line", source_type="user",

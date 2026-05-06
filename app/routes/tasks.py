@@ -468,19 +468,21 @@ async def _handle_summarize_task_core(request: Request):
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
-        # [Phase 7+ auto-share] If the owner account has any bot link with
-        # ``autoShareToWorkspaces`` set, append those workspace keys to
-        # this session's ``sharedToWorkspaceTeams`` so the LINE / Slack
-        # group bots surface the new meeting automatically. Best-effort:
-        # never fail summarize on auto-share errors.
+        # [Smart Share — DeepNote] Send a *DM-only* notification to every
+        # bot link of the owner account that has opted in to Lv1/Lv2.
+        # This deliberately does NOT auto-post into Slack channels or
+        # LINE groups: pushing un-reviewed AI output (potentially
+        # containing PII / mis-recognised names / confidential decisions)
+        # into a public space requires an explicit human confirmation
+        # step (Lv3 — coming next phase).
         try:
             if owner_account_id:
-                from app.services import bot_auto_share as _auto
-                _added = _auto.apply_to_session(session_id, owner_account_id)
-                if _added:
-                    logger.info("[auto_share] %s appended to session %s sharedToWorkspaceTeams", _added, session_id)
-        except Exception as _auto_err:
-            logger.warning("[auto_share] apply skipped for %s: %s", session_id, _auto_err)
+                from app.services import bot_smart_share as _smart
+                _sent = _smart.notify_after_summary(session_id, owner_account_id, session_data=data)
+                if _sent:
+                    logger.info("[smart_share] DM notifications sent: session=%s sent=%d", session_id, _sent)
+        except Exception as _smart_err:
+            logger.warning("[smart_share] notify skipped for %s: %s", session_id, _smart_err)
 
         # ops_logger: job completed
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)
