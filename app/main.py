@@ -241,6 +241,11 @@ app.include_router(account.router, tags=["Account"])
 app.include_router(account_merge.router, tags=["Account Merge"])
 app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
+# compat_aliases must be included BEFORE sessions so iOS-only paths like
+# ``GET /sessions/search`` are matched before the ``/sessions/{session_id}``
+# catch-all in sessions.py. All other compat aliases are sub-paths of
+# ``/sessions/{id}/...`` so they don't shadow the sessions canonical routes.
+app.include_router(compat_aliases.router)  # MUST be before sessions
 app.include_router(sessions.router, tags=["Sessions"])
 # Folders / Library organisation — canonical /v1/folders + legacy /folders + /sessions/{id}:move
 # See: deepnote-contracts/api/endpoints-map.md (V-017/V-018)
@@ -267,7 +272,7 @@ from app.routes import assist
 app.include_router(assist.router, tags=["Assist"])
 app.include_router(billing.router, tags=["Billing"])
 app.include_router(share.router, tags=["Share"])
-app.include_router(compat_aliases.router)  # iOS hyphen aliases + transcript_segments artifacts alias + playlist:generate
+# (compat_aliases.router was moved up above sessions.router for /sessions/search precedence)
 app.include_router(entity_review.router, tags=["Entity Review"])  # /v1/sessions/{id}/entity-review[/run|/apply|/skip] + /term-hints
 # [DEPRECATED 2026-05-01] Legacy Google OAuth routes (replaced by integrations_google).
 # Kept import to avoid breaking any latent reference, but not registered:
