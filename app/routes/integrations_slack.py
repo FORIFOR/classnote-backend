@@ -249,6 +249,11 @@ def _classify_command(text: str) -> str:
     if not text:
         return "help"
     t = text.strip().lower()
+    if t in {
+        "こんにちは", "こんばんは", "おはよう", "おはよ", "やあ", "どうも",
+        "hello", "hi", "hey",
+    }:
+        return "greeting"
     # Forward any "?" / 「質問」 / "ask" to the Assistant Hub.
     if t.endswith("?") or t.endswith("？") or t.startswith("質問") or t.startswith("ask "):
         return "assistant_qna"
@@ -289,6 +294,11 @@ def _classify_command(text: str) -> str:
 
 
 def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str = "", raw_text: str = "") -> str:
+    if command == "greeting":
+        return (
+            "こんにちは。DeepNote Clow です。\n"
+            "「最新」「TODO」「決定事項」「資料」「PDF」「クレジット」「ヘルプ」と送ってください。"
+        )
     if command == "help":
         return M.HELP + "\n\n" + M.SMART_SHARE_HELP
     if command == "auto_share_deprecated":
@@ -398,6 +408,26 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         if event.get("type") != "app_mention":
             return
         cmd = _classify_command(_strip_app_mentions(text))
+        # Greeting / unknown handling — earlier versions ran the
+        # shared-session lookup unconditionally so even @DeepNote
+        # こんにちは got the "no shared data" reply. Greet politely
+        # instead and explain what's available.
+        if cmd in ("greeting",) or cmd == "unknown":
+            slack_client.post_message(team_id=team_id, channel=channel, thread_ts=thread_ts, text=(
+                "こんにちは。DeepNote Clow です。\n"
+                "このチャンネルでは、共有された会議の要約や TODO を確認できます。\n\n"
+                "▼ 使い方\n"
+                "・「最新」: 共有された最新会議の要約\n"
+                "・「決定事項」: 最新会議の決定事項\n"
+                "・「資料」「PDF」「DOCX」「PPTX」: 資料リンク\n"
+                "・「クレジット」「TODO」: 個人情報のため Slack DM で\n"
+                "・「ヘルプ」: この案内"
+            ))
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id, command=cmd, outcome="greeting",
+            )
+            return
         if cmd in ("credit", "todos"):
             slack_client.post_message(team_id=team_id, channel=channel,
                                       text=M.GROUP_PRIVATE_REJECTED, thread_ts=thread_ts)

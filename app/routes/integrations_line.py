@@ -266,6 +266,13 @@ def _classify_command(text: str) -> str:
     if not text:
         return "help"
     t = text.strip().lower()
+    # Greetings — short conversational openers that previously fell
+    # through to the "no shared data" branch in groups.
+    if t in {
+        "こんにちは", "こんばんは", "おはよう", "おはよ", "やあ", "どうも",
+        "hello", "hi", "hey",
+    }:
+        return "greeting"
     # Q&A passthrough — anything that ends with "?" / "？" or starts with
     # 「質問」 is forwarded to the Assistant Hub so the user gets the
     # same grounded answers in chat as on iOS / Desktop.
@@ -310,6 +317,11 @@ def _classify_command(text: str) -> str:
 
 
 def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "", raw_text: str = "") -> str:
+    if command == "greeting":
+        return (
+            "こんにちは。DeepNote Clow です。\n"
+            "「最新」「TODO」「決定事項」「資料」「PDF」「クレジット」「ヘルプ」と送ってください。"
+        )
     if command == "help":
         return M.HELP + "\n\n" + M.SMART_SHARE_HELP
     if command == "auto_share_deprecated":
@@ -409,8 +421,62 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
                 outcome="blocked_unsupported_source",
             )
             return
-        link = line_link_tokens.get_link(line_user_id)
+        # ──────────────────────────────────────────────────────────────
+        # Group / room: only respond when the user explicitly
+        # addresses DeepNote, OR sends one of the recognised commands.
+        # Earlier versions ran the shared-session lookup unconditionally
+        # so a casual 「こんにちは」 also got "このグループに共有された
+        # 会議はまだありません" — that's spammy in a multi-member group.
+        # ──────────────────────────────────────────────────────────────
+        text_lower = (user_text or "").strip().lower()
+        bot_addressed = (
+            "deepnote" in text_lower
+            or "clow" in text_lower
+            or "ディープノート" in (user_text or "")
+            or "クロウ" in (user_text or "")
+        )
         cmd = _classify_command(user_text)
+        # Recognised commands that warrant a reply even without an
+        # explicit @DeepNote mention.
+        actionable = {
+            "greeting", "help", "latest", "todos", "decisions",
+            "pdf", "docx", "pptx", "assets",
+            "auto_share_deprecated",
+            "notify_on", "notify_off", "notify_status",
+            "digest_on", "digest_off", "digest_status",
+            "credit", "assistant_qna",
+        }
+        if cmd == "unknown" and not bot_addressed:
+            # Stay silent on unrelated chatter so the bot doesn't
+            # interrupt regular group conversation.
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=(line_link_tokens.get_link(line_user_id) or {}).get("accountId"),
+                command="ignored_chatter", outcome="silent",
+            )
+            return
+        # If the user said hi to the bot (mention without command, or
+        # exact 「こんにちは」), greet them and explain what's available.
+        if cmd == "greeting" or (bot_addressed and cmd in ("unknown", "help")):
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "こんにちは。DeepNote Clow です。\n"
+                "このグループでは、共有された会議の要約や TODO を確認できます。\n\n"
+                "▼ 使い方\n"
+                "・「最新」: 共有された最新会議の要約\n"
+                "・「決定事項」: 最新会議の決定事項\n"
+                "・「資料」「PDF」「DOCX」「PPTX」: 資料リンク\n"
+                "・「クレジット」「TODO」: 個人情報のため LINE 個人チャットで\n"
+                "・「ヘルプ」: この案内"
+            )])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=(line_link_tokens.get_link(line_user_id) or {}).get("accountId"),
+                command="greeting", outcome="ok",
+            )
+            return
+        link = line_link_tokens.get_link(line_user_id)
         if cmd in ("credit", "todos"):
             line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_PRIVATE_REJECTED)])
             bot_audit.record(
