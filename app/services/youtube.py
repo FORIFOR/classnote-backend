@@ -40,14 +40,44 @@ except ImportError:
 
 
 def _is_blocked_exception(exc: Exception) -> bool:
-    """True when the exception indicates YouTube blocked our IP/request."""
+    """True when the exception indicates YouTube blocked our IP/request.
+
+    Covers four cases observed in production logs:
+      1. ``RequestBlocked`` (explicit block class)
+      2. ``IpBlocked``      (explicit block class)
+      3. ``VideoUnplayable`` — youtube-transcript-api re-raises a 'this
+         is most likely caused by IP block' message under this class
+         when the playabilityStatus is bad. We treat it as a transient
+         block too because production traffic shows the same video
+         succeeding moments later from a different proxy IP.
+      4. Any exception whose ``args`` text contains the library's
+         IP-block hint phrase ('blocking requests from your IP' or
+         'IP belonging to a cloud provider'). Catches future class
+         renames in ``youtube_transcript_api`` without code changes.
+    """
     name = type(exc).__name__
-    if name in ("RequestBlocked", "IpBlocked"):
+    if name in ("RequestBlocked", "IpBlocked", "VideoUnplayable"):
         return True
     if RequestBlocked is not None and isinstance(exc, RequestBlocked):
         return True
     if IpBlocked is not None and isinstance(exc, IpBlocked):
         return True
+    try:
+        text = " ".join(str(a) for a in (exc.args or ())) + " " + str(exc)
+        if not text:
+            return False
+        markers = (
+            "blocking requests from your IP",
+            "IP belonging to a cloud provider",
+            "IpBlocked",
+            "RequestBlocked",
+            "Could not retrieve a transcript",
+        )
+        for m in markers:
+            if m in text:
+                return True
+    except Exception:
+        pass
     return False
 
 
