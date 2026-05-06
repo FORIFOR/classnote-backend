@@ -448,6 +448,25 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
             )
             return
         ws_key = f"slack:{team_id}"
+        # Phase 0 — channel ACL not implemented yet. Block every command
+        # that would consume the linked user's DeepNote credits while
+        # we design the requester / data_owner / billing_owner split
+        # (see docs/release-units/2026-05-07-bot-group-acl-PLAN.md).
+        PAID_GROUP_ACTIONS = {"assistant_qna"}
+        if cmd in PAID_GROUP_ACTIONS:
+            slack_client.post_message(
+                team_id=team_id, channel=channel, thread_ts=thread_ts,
+                text=("この操作は DeepNote のクレジットを消費するため、現在 Slack チャンネル"
+                      "ではご利用いただけません。\nDeepNote bot との DM で直接お試しください。\n"
+                      "(チャンネルでの管理者権限制御は近日実装予定です。)"),
+            )
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id,
+                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                command=cmd, outcome="blocked_paid_in_group_phase0",
+            )
+            return
         # 「自動共有」 (Lv4) is retired for safety.
         if cmd == "auto_share_deprecated":
             slack_client.post_message(team_id=team_id, channel=channel,
