@@ -86,8 +86,44 @@ class M:
         "DeepNote とのSlack DMでご利用ください。"
     )
     GROUP_NO_SHARED_DATA = (
-        "このチャンネルに共有された会議データが見つかりませんでした。\n"
-        "DeepNote 上で「このワークスペースに共有」を有効にしてからご利用ください。"
+        "このチャンネルに共有された会議はまだありません。\n"
+        "（プライバシー保護のため、共有マークが付いた会議だけがこちらに表示されます）\n\n"
+        "▼ 1 件だけ共有したい場合\n"
+        "DeepNoteアプリ → 会議 → 共有 → 「このワークスペースに共有」\n\n"
+        "▼ 今後の会議を毎回自動でこのチャンネルに共有\n"
+        "DeepNote の Slack DM で「自動共有 ON」と送ってください。"
+    )
+    GROUP_NO_SHARED_DATA_WITH_HINT = (
+        "このチャンネルに共有された会議はまだありません。\n"
+        "（最新の会議「{title}」は未共有です）\n\n"
+        "▼ この会議を共有\n"
+        "DeepNoteアプリ → 会議「{title}」→ 共有 → 「このワークスペースに共有」\n\n"
+        "▼ 毎回自動でこのチャンネルに共有\n"
+        "DM で「自動共有 ON」と送ってください。"
+    )
+    AUTO_SHARE_DM_NOT_GROUP = (
+        "「自動共有」コマンドは Slack チャンネル内で送信してください。\n"
+        "1) 共有したいチャンネルに DeepNote bot を招待\n"
+        "2) そのチャンネルで「自動共有 ON」とメンション or 投稿\n"
+        "以降の新規会議が自動でそのチャンネルに共有されます。"
+    )
+    AUTO_SHARE_ENABLED = (
+        "✅ 自動共有を有効にしました。\n"
+        "今後 DeepNote で記録・要約された会議は、自動でこのチャンネルに共有されます。\n"
+        "（既存の会議は対象外。停止するには「自動共有 OFF」と送信してください）"
+    )
+    AUTO_SHARE_ALREADY_ON = "このチャンネルでの自動共有は既に有効です。"
+    AUTO_SHARE_DISABLED = (
+        "🛑 自動共有を停止しました。\n"
+        "以降の新規会議はこのチャンネルに自動共有されません。\n"
+        "（既に共有済みの会議は引き続き表示されます）"
+    )
+    AUTO_SHARE_NOT_ON = "このチャンネルでは自動共有はオフのままです。"
+    AUTO_SHARE_HELP = (
+        "▼ 自動共有コマンド (チャンネル内で送信)\n"
+        "・「自動共有 ON」: 今後の会議をこのチャンネルに自動で共有\n"
+        "・「自動共有 OFF」: 自動共有を停止\n"
+        "・「自動共有」: 現在の状態を確認"
     )
     GROUP_PRIVATE_REJECTED = (
         "クレジット残量や TODO は個人情報のため、チャンネルでは表示できません。\n"
@@ -206,6 +242,12 @@ def _classify_command(text: str) -> str:
     t = text.strip().lower()
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
+    if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
+        if any(on in t for on in (" on", "オン", "有効", "enable")):
+            return "auto_share_on"
+        if any(off in t for off in (" off", "オフ", "無効", "停止", "disable")):
+            return "auto_share_off"
+        return "auto_share_status"
     if any(k in t for k in ("クレジット", "残量", "credit")):
         return "credit"
     if any(k in t for k in ("最新", "会議", "summary", "要約")):
@@ -227,7 +269,9 @@ def _classify_command(text: str) -> str:
 
 def _build_reply_for_linked(account_id: str, command: str) -> str:
     if command == "help":
-        return M.HELP
+        return M.HELP + "\n\n" + M.AUTO_SHARE_HELP
+    if command in ("auto_share_on", "auto_share_off", "auto_share_status"):
+        return M.AUTO_SHARE_DM_NOT_GROUP
     if command == "credit":
         report = slack_briefing.get_credit_summary(account_id)
         return M.CREDIT_FAILED if not report else _format_credit(report)
@@ -313,16 +357,52 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
             )
             return
         ws_key = f"slack:{team_id}"
+        # Auto-share toggle (channel-only). Slack link doc is keyed on
+        # the same source_user_id as DM via slack_link_tokens.get_link,
+        # so we pass `user` directly to bot_auto_share.
+        if cmd in ("auto_share_on", "auto_share_off", "auto_share_status"):
+            from app.services import bot_auto_share
+            if cmd == "auto_share_on":
+                added = bot_auto_share.enable("slack", user, ws_key)
+                reply_text = M.AUTO_SHARE_ENABLED if added else M.AUTO_SHARE_ALREADY_ON
+                outcome = "auto_share_on" if added else "auto_share_already_on"
+            elif cmd == "auto_share_off":
+                removed = bot_auto_share.disable("slack", user, ws_key)
+                reply_text = M.AUTO_SHARE_DISABLED if removed else M.AUTO_SHARE_NOT_ON
+                outcome = "auto_share_off" if removed else "auto_share_not_on"
+            else:
+                on = bot_auto_share.is_enabled("slack", user, ws_key)
+                reply_text = (M.AUTO_SHARE_ENABLED if on else M.AUTO_SHARE_NOT_ON) + "\n\n" + M.AUTO_SHARE_HELP
+                outcome = "auto_share_status_on" if on else "auto_share_status_off"
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=reply_text, thread_ts=thread_ts)
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id,
+                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                command=cmd, outcome=outcome,
+            )
+            return
+
+        def _no_data_text() -> str:
+            try:
+                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                if latest and latest.get("title"):
+                    return M.GROUP_NO_SHARED_DATA_WITH_HINT.format(title=latest["title"][:40])
+            except Exception:
+                pass
+            return M.GROUP_NO_SHARED_DATA
+
         if cmd == "decisions":
             decisions = group_shared_briefing.get_recent_shared_decisions(
                 link["accountId"], ws_key, limit=3
             )
-            reply_text = _format_decisions(decisions) if decisions else M.GROUP_NO_SHARED_DATA
+            reply_text = _format_decisions(decisions) if decisions else _no_data_text()
         elif cmd in ("latest", "help"):
             shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
-            reply_text = _format_latest(shared) if shared else M.GROUP_NO_SHARED_DATA
+            reply_text = _format_latest(shared) if shared else _no_data_text()
         else:
-            reply_text = M.GROUP_NO_SHARED_DATA
+            reply_text = _no_data_text()
         slack_client.post_message(team_id=team_id, channel=channel,
                                   text=reply_text, thread_ts=thread_ts)
         bot_audit.record(

@@ -90,8 +90,51 @@ class M:
     )
 
     GROUP_NO_SHARED_DATA = (
-        "このグループに共有された会議データが見つかりませんでした。\n"
-        "DeepNote 上で「このワークスペースに共有」を有効にしてからご利用ください。"
+        "このグループに共有された会議はまだありません。\n"
+        "（プライバシー保護のため、共有マークが付いた会議だけがこちらに表示されます）\n\n"
+        "▼ 1 件だけ共有したい場合\n"
+        "DeepNoteアプリ → 会議 → 共有 → 「このグループに共有」\n\n"
+        "▼ これから録音する会議を毎回自動でこのグループに共有\n"
+        "DeepNote と LINE の個人チャットで「自動共有 ON」と送ってください。"
+    )
+
+    GROUP_NO_SHARED_DATA_WITH_HINT = (
+        "このグループに共有された会議はまだありません。\n"
+        "（最新の会議「{title}」は未共有です）\n\n"
+        "▼ この会議を共有\n"
+        "DeepNoteアプリ → 会議「{title}」→ 共有 → 「このグループに共有」\n\n"
+        "▼ 毎回自動でこのグループに共有\n"
+        "個人チャットで「自動共有 ON」と送ってください。"
+    )
+
+    AUTO_SHARE_DM_NOT_GROUP = (
+        "「自動共有」コマンドは LINE グループ・トークルームでのみご利用いただけます。\n"
+        "1) LINE グループに DeepNote bot を追加\n"
+        "2) そのグループで「自動共有 ON」と送信\n"
+        "以降の新規会議が自動でそのグループに共有されます。"
+    )
+
+    AUTO_SHARE_ENABLED = (
+        "✅ 自動共有を有効にしました。\n"
+        "今後 DeepNote で記録・要約された会議は、自動でこのグループに共有されます。\n"
+        "（既存の会議は対象外。停止するには「自動共有 OFF」と送信してください）"
+    )
+
+    AUTO_SHARE_ALREADY_ON = "このグループでの自動共有は既に有効です。"
+
+    AUTO_SHARE_DISABLED = (
+        "🛑 自動共有を停止しました。\n"
+        "以降の新規会議はこのグループに自動共有されません。\n"
+        "（既に共有済みの会議は引き続き表示されます。完全に解除したい場合は DeepNoteアプリから個別に解除してください）"
+    )
+
+    AUTO_SHARE_NOT_ON = "このグループでは自動共有はオフのままです。"
+
+    AUTO_SHARE_HELP = (
+        "▼ 自動共有コマンド (グループ内で送信)\n"
+        "・「自動共有 ON」: 今後の会議をこのグループに自動で共有\n"
+        "・「自動共有 OFF」: 自動共有を停止\n"
+        "・「自動共有」: 現在の状態を確認"
     )
 
     GROUP_PRIVATE_REJECTED = (
@@ -218,6 +261,14 @@ def _classify_command(text: str) -> str:
     t = text.strip().lower()
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
+    # Auto-share toggle (group-only command). We accept several
+    # phrasings so users don't have to remember the exact wording.
+    if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
+        if any(on in t for on in (" on", "オン", "有効", "オフ→オン", "enable")):
+            return "auto_share_on"
+        if any(off in t for off in (" off", "オフ", "無効", "停止", "disable")):
+            return "auto_share_off"
+        return "auto_share_status"
     if any(k in t for k in ("クレジット", "残量", "credit")):
         return "credit"
     if any(k in t for k in ("最新", "会議", "summary", "要約")):
@@ -239,7 +290,10 @@ def _classify_command(text: str) -> str:
 
 def _build_reply_for_linked(account_id: str, command: str) -> str:
     if command == "help":
-        return M.HELP
+        return M.HELP + "\n\n" + M.AUTO_SHARE_HELP
+    if command in ("auto_share_on", "auto_share_off", "auto_share_status"):
+        # The toggle only makes sense inside a group; in DM we explain.
+        return M.AUTO_SHARE_DM_NOT_GROUP
     if command == "credit":
         report = line_briefing.get_credit_summary(account_id)
         if not report:
@@ -314,16 +368,53 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             )
             return
         ws_key = f"line:{group_id}"
+        # Auto-share toggle commands are valid in groups (not DM).
+        if cmd in ("auto_share_on", "auto_share_off", "auto_share_status"):
+            from app.services import bot_auto_share
+            if cmd == "auto_share_on":
+                added = bot_auto_share.enable("line", line_user_id, ws_key)
+                text = M.AUTO_SHARE_ENABLED if added else M.AUTO_SHARE_ALREADY_ON
+                outcome = "auto_share_on" if added else "auto_share_already_on"
+            elif cmd == "auto_share_off":
+                removed = bot_auto_share.disable("line", line_user_id, ws_key)
+                text = M.AUTO_SHARE_DISABLED if removed else M.AUTO_SHARE_NOT_ON
+                outcome = "auto_share_off" if removed else "auto_share_not_on"
+            else:
+                on = bot_auto_share.is_enabled("line", line_user_id, ws_key)
+                text = M.AUTO_SHARE_ENABLED if on else M.AUTO_SHARE_NOT_ON
+                text = text + "\n\n" + M.AUTO_SHARE_HELP
+                outcome = "auto_share_status_on" if on else "auto_share_status_off"
+            line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                command=cmd, outcome=outcome,
+            )
+            return
+
+        # Build a hint message that includes the user's latest unshared
+        # session title so the workspace bot tells you exactly which
+        # meeting you can share next, rather than just "no data".
+        def _no_data_text() -> str:
+            try:
+                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                if latest and latest.get("title"):
+                    return M.GROUP_NO_SHARED_DATA_WITH_HINT.format(title=latest["title"][:40])
+            except Exception:
+                pass
+            return M.GROUP_NO_SHARED_DATA
+
         if cmd == "decisions":
             decisions = group_shared_briefing.get_recent_shared_decisions(
                 link["accountId"], ws_key, limit=3
             )
-            text = _format_decisions(decisions) if decisions else M.GROUP_NO_SHARED_DATA
+            text = _format_decisions(decisions) if decisions else _no_data_text()
         elif cmd == "latest" or cmd == "help":
             shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
-            text = _format_latest(shared) if shared else M.GROUP_NO_SHARED_DATA
+            text = _format_latest(shared) if shared else _no_data_text()
         else:
-            text = M.GROUP_NO_SHARED_DATA
+            text = _no_data_text()
         line_messaging.reply(reply_token, [line_messaging.text_message(text)])
         bot_audit.record(
             provider="line", source_type=source_type,

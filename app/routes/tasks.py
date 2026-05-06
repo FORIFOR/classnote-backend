@@ -468,6 +468,20 @@ async def _handle_summarize_task_core(request: Request):
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
+        # [Phase 7+ auto-share] If the owner account has any bot link with
+        # ``autoShareToWorkspaces`` set, append those workspace keys to
+        # this session's ``sharedToWorkspaceTeams`` so the LINE / Slack
+        # group bots surface the new meeting automatically. Best-effort:
+        # never fail summarize on auto-share errors.
+        try:
+            if owner_account_id:
+                from app.services import bot_auto_share as _auto
+                _added = _auto.apply_to_session(session_id, owner_account_id)
+                if _added:
+                    logger.info("[auto_share] %s appended to session %s sharedToWorkspaceTeams", _added, session_id)
+        except Exception as _auto_err:
+            logger.warning("[auto_share] apply skipped for %s: %s", session_id, _auto_err)
+
         # ops_logger: job completed
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)
         # Log usage success

@@ -73,6 +73,45 @@ def get_latest_shared_session(account_id: str, workspace_key: str) -> Optional[D
     }
 
 
+def get_latest_any_session(account_id: str) -> Optional[Dict[str, Any]]:
+    """Latest session of this account regardless of share status. Used to
+    surface "you have a new meeting; here's how to share it" hints in
+    the group bot when ``sharedToWorkspaceTeams`` matches nothing.
+
+    Privacy: callers MUST only expose the *title* and createdAt — NOT
+    the summary/transcript — so this hint never leaks meeting content
+    into a workspace where it wasn't explicitly shared.
+    """
+    if not account_id:
+        return None
+    try:
+        snaps = (
+            db.collection("sessions")
+            .where("ownerAccountId", "==", account_id)
+            .limit(20)
+            .stream()
+        )
+        rows = []
+        for snap in snaps:
+            data = snap.to_dict() or {}
+            rows.append((snap.id, data))
+        if not rows:
+            return None
+        rows.sort(
+            key=lambda kv: kv[1].get("createdAt") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        sid, d = rows[0]
+        return {
+            "id": sid,
+            "title": d.get("title") or "(無題)",
+            "createdAt": d.get("createdAt"),
+        }
+    except Exception as e:
+        logger.warning("[group_shared] latest_any lookup failed: %s", e)
+        return None
+
+
 def get_recent_shared_decisions(account_id: str, workspace_key: str, *, limit: int = 3) -> List[str]:
     latest = get_latest_shared_session(account_id, workspace_key)
     if not latest:
