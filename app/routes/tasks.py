@@ -470,11 +470,6 @@ async def _handle_summarize_task_core(request: Request):
 
         # [Smart Share — DeepNote] Send a *DM-only* notification to every
         # bot link of the owner account that has opted in to Lv1/Lv2.
-        # This deliberately does NOT auto-post into Slack channels or
-        # LINE groups: pushing un-reviewed AI output (potentially
-        # containing PII / mis-recognised names / confidential decisions)
-        # into a public space requires an explicit human confirmation
-        # step (Lv3 — coming next phase).
         try:
             if owner_account_id:
                 from app.services import bot_smart_share as _smart
@@ -483,6 +478,31 @@ async def _handle_summarize_task_core(request: Request):
                     logger.info("[smart_share] DM notifications sent: session=%s sent=%d", session_id, _sent)
         except Exception as _smart_err:
             logger.warning("[smart_share] notify skipped for %s: %s", session_id, _smart_err)
+
+        # [Phase D — post-meeting follow-up] Schedule a one-shot reminder
+        # 24 hours from now. The scheduled_task is itself the source of
+        # truth, so a Cloud Run cold start or rolling deploy can't lose
+        # it. ``deliver_session_followup`` is DM-only and surfaces ONLY
+        # still-open TODOs; if everything was checked off, no DM fires.
+        try:
+            if owner_account_id:
+                from app.services import scheduled_tasks as _st
+                from datetime import timedelta as _td
+                fire_at = datetime.now(timezone.utc) + _td(hours=24)
+                rrule = (
+                    f"FREQ=DAILY;COUNT=1;BYHOUR={fire_at.hour};BYMINUTE={fire_at.minute}"
+                )
+                _st.create(owner_account_id, body={
+                    "type": "session_followup",
+                    "channel": "any",
+                    "destination": {},
+                    "rrule": rrule,
+                    "timezone": "UTC",
+                    "filters": {"sessionId": session_id},
+                    "output": {"reminder": True},
+                })
+        except Exception as _f_err:
+            logger.warning("[followup.schedule] skipped for %s: %s", session_id, _f_err)
 
         # ops_logger: job completed
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)

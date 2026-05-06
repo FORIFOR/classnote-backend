@@ -17,6 +17,7 @@ we don't fabricate citations that aren't in the structured data.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -258,7 +259,16 @@ async def _answer_freeform(
         summary_text = session_data["summaryMarkdown"]
     summary_text = (summary_text or "")[:2000]
     transcript = (session_data.get("transcriptText") or "")
-    spans = _select_transcript_spans(transcript, question)
+    spans: List[Dict[str, Any]] = []
+    if (os.environ.get("ASSISTANT_EMBEDDING_SEARCH") or "").lower() == "on":
+        try:
+            from app.services import embedding_search
+            spans = embedding_search.select_spans_by_embedding(transcript, question)
+        except Exception as _e:
+            logger.warning("[assistant_qna] embedding search failed, falling back: %s", _e)
+            spans = []
+    if not spans:
+        spans = _select_transcript_spans(transcript, question)
 
     decisions_block = "\n".join(
         f"- {d.get('text') if isinstance(d, dict) else str(d)}"

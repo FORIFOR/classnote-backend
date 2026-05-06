@@ -125,11 +125,29 @@ async def scheduler_tick(
 
 
 def _dispatch(account_id: str, task: Dict[str, Any]) -> None:
-    """Render the task's payload and send it. Phase B keeps delivery
-    DM-only (Smart Share Lv1/Lv2 contract). Channel destinations are
-    accepted in the schema but require Lv3 confirmation flow before we
-    actually post into a public channel — that lands in the next phase.
-    """
+    """Render the task's payload and send it. DM-only delivery."""
+    task_type = (task.get("type") or "").lower()
+
+    # Phase D: dedicated task types delegate to assistant_briefing /
+    # follow-up helpers. They handle their own DM fan-out and never
+    # touch a public channel.
+    if task_type == "pre_meeting_briefing":
+        try:
+            from app.services import assistant_briefing
+            assistant_briefing.deliver_pre_meeting(account_id)
+        except Exception as e:
+            logger.warning("[scheduler.briefing] failed: %s", e)
+        return
+    if task_type == "session_followup":
+        sid = (task.get("filters") or {}).get("sessionId") or ""
+        if sid:
+            try:
+                from app.services import assistant_briefing
+                assistant_briefing.deliver_session_followup(sid, account_id)
+            except Exception as e:
+                logger.warning("[scheduler.followup] failed: %s", e)
+        return
+
     channel = (task.get("channel") or "").lower()
     dest = task.get("destination") or {}
     output = task.get("output") or {}

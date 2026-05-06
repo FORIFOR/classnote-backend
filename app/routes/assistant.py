@@ -253,6 +253,22 @@ async def confirm_share(req: ShareConfirmRequest, current_user: CurrentUser = De
     return {"sessionId": req.sessionId, "channel": req.channel, "posted": posted}
 
 
+class ShareSuggestRequest(BaseModel):
+    sessionId: str = Field(..., description="Session to find share targets for")
+
+
+@router.post("/share:suggest")
+async def suggest_share(req: ShareSuggestRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """AI-assisted share-target suggestion. Ranks workspace destinations
+    by past sharing behaviour for the same account."""
+    account_id = getattr(current_user, "account_id", None) or current_user.uid
+    from app.services import assistant_briefing
+    return {
+        "sessionId": req.sessionId,
+        "suggestions": assistant_briefing.suggest_share_targets(account_id, req.sessionId),
+    }
+
+
 class AssistantAction(BaseModel):
     type: str = Field(..., description="'query' | 'share' | 'schedule' | 'export'")
     payload: dict = Field(default_factory=dict)
