@@ -283,12 +283,28 @@ def _list_sessions_in_folder_impl(uid: str, folder_id: str) -> dict:
                 if sdata.get("ownerUserId") != uid:
                     continue
                 meta = meta_index.get(sid, {})
+                # Shape MUST match iOS ``FolderSessionSnapshot`` in
+                # ``ClassnoteX/APIClient.swift::listFolderSessions``. The legacy
+                # ``{id, title, ...}`` shape rendered every entry as
+                # 「（タイトルなし）」 because iOS reads
+                # ``titleSnapshot ?? "（タイトルなし）"``.
                 items.append({
                     "id": s_snap.id,
+                    "sessionId": s_snap.id,
+                    "folderId": meta.get("folderId") or folder_id,
+                    "titleSnapshot": sdata.get("title"),
+                    "modeSnapshot": sdata.get("mode"),
+                    "statusSnapshot": sdata.get("status"),
+                    "startedAt": sdata.get("startedAt") or sdata.get("createdAt"),
+                    "endedAt": sdata.get("endedAt"),
+                    "updatedAt": sdata.get("updatedAt") or meta.get("updatedAt"),
+                    "ownerUid": sdata.get("ownerUid") or sdata.get("ownerUserId"),
+                    "ownerAccountId": sdata.get("ownerAccountId"),
+                    "ownerUsername": sdata.get("ownerUsername"),
+                    # Preserve the old fields too so any caller that read the
+                    # legacy shape (admin console etc.) keeps working.
                     "title": sdata.get("title"),
                     "createdAt": sdata.get("createdAt"),
-                    "updatedAt": sdata.get("updatedAt"),
-                    "folderId": meta.get("folderId"),
                     "status": sdata.get("status"),
                     "isPinned": meta.get("isPinned", False),
                     "lastOpenedAt": meta.get("lastOpenedAt"),
