@@ -227,60 +227,80 @@ def fetch_youtube_transcript(
     
     logger.info(f"Fetching transcript for video {video_id} with languages {languages}")
     
-    try:
-        # youtube-transcript-api >= 1.0 removed the classmethod
-        # `YouTubeTranscriptApi.get_transcript()` and switched to an
-        # instance-based API. Support both variants so we don't break on
-        # library upgrade.
-        if hasattr(YouTubeTranscriptApi, "get_transcript"):
-            # Legacy (<1.0). Proxy not supported in this codepath.
-            items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-        else:
-            # New API (>=1.0): instance .fetch() with optional proxy_config.
-            # Cloud Run egress IPs are widely blocked by YouTube anti-bot;
-            # WEBSHARE_PROXY_USERNAME/PASSWORD env vars (Webshare datacenter
-            # proxy) are required for production reliability.
-            proxy_config = _build_proxy_config()
-            if proxy_config is not None:
-                logger.info(f"Using proxy for YouTube transcript fetch (video={video_id})")
-            ytt = YouTubeTranscriptApi(proxy_config=proxy_config) if proxy_config is not None else YouTubeTranscriptApi()
-            fetched = ytt.fetch(video_id, languages=languages)
-            # Prefer the library's official to_raw_data() helper when available,
-            # otherwise normalise FetchedTranscriptSnippet objects manually.
-            if hasattr(fetched, "to_raw_data"):
-                items = fetched.to_raw_data()
+    # Webshare datacenter proxy hands us a different egress IP per call.
+    # YouTube's anti-bot blocklist contains *some* of those IPs (rotating
+    # over time), so a single fetch may RequestBlocked while the very
+    # next attempt — landing on a fresh proxy IP — succeeds. We retry up
+    # to 4 times with short backoff to cover that case before surfacing
+    # an error to the user.
+    import time as _time
+    import random as _random
+    MAX_ATTEMPTS = int(os.environ.get("YT_TRANSCRIPT_MAX_ATTEMPTS", "4") or "4")
+    BACKOFF_SECONDS = (1.0, 2.5, 5.0)  # before attempts 2, 3, 4
+    items = None
+    last_block_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            if hasattr(YouTubeTranscriptApi, "get_transcript"):
+                items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
             else:
-                snippets = getattr(fetched, "snippets", None) or list(fetched)
-                items = []
-                for s in snippets:
-                    if isinstance(s, dict):
-                        items.append(s)
-                    else:
-                        items.append({
-                            "text": getattr(s, "text", "") or "",
-                            "start": float(getattr(s, "start", 0.0) or 0.0),
-                            "duration": float(getattr(s, "duration", 0.0) or 0.0),
-                        })
-    except TranscriptsDisabled:
-        raise ValueError("この動画では字幕が無効化されています")
-    except NoTranscriptFound:
-        raise ValueError(f"指定された言語 ({', '.join(languages)}) の字幕が見つかりませんでした")
-    except VideoUnavailable:
-        raise ValueError("動画が利用できません（非公開または削除済み）")
-    except Exception as e:
-        if _is_blocked_exception(e):
-            logger.warning(
-                f"YouTube blocked request for {video_id} from Cloud Run IP "
-                f"(RequestBlocked/IpBlocked). Proxy or YouTube Data API v3 required."
-            )
-            raise ValueError(
-                "YouTube への接続が一時的に制限されています。"
-                "サーバ管理者によるプロキシ設定が必要です（YouTube が"
-                "クラウド環境からのアクセスをブロックしているため）。"
-                "しばらく時間をおいてから再試行してください。"
-            )
-        logger.exception(f"Transcript fetch failed for {video_id}")
-        raise ValueError(f"字幕の取得に失敗しました: {str(e)}")
+                proxy_config = _build_proxy_config()
+                if proxy_config is not None:
+                    logger.info(
+                        f"Using proxy for YouTube transcript fetch "
+                        f"(video={video_id} attempt={attempt}/{MAX_ATTEMPTS})"
+                    )
+                ytt = YouTubeTranscriptApi(proxy_config=proxy_config) if proxy_config is not None else YouTubeTranscriptApi()
+                fetched = ytt.fetch(video_id, languages=languages)
+                if hasattr(fetched, "to_raw_data"):
+                    items = fetched.to_raw_data()
+                else:
+                    snippets = getattr(fetched, "snippets", None) or list(fetched)
+                    items = []
+                    for s in snippets:
+                        if isinstance(s, dict):
+                            items.append(s)
+                        else:
+                            items.append({
+                                "text": getattr(s, "text", "") or "",
+                                "start": float(getattr(s, "start", 0.0) or 0.0),
+                                "duration": float(getattr(s, "duration", 0.0) or 0.0),
+                            })
+            break  # success
+        except TranscriptsDisabled:
+            raise ValueError("この動画では字幕が無効化されています")
+        except NoTranscriptFound:
+            raise ValueError(f"指定された言語 ({', '.join(languages)}) の字幕が見つかりませんでした")
+        except VideoUnavailable:
+            raise ValueError("動画が利用できません（非公開または削除済み）")
+        except Exception as e:
+            if _is_blocked_exception(e):
+                last_block_exc = e
+                if attempt < MAX_ATTEMPTS:
+                    wait = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+                    wait = wait * _random.uniform(0.8, 1.2)  # jitter
+                    logger.warning(
+                        f"YouTube blocked attempt {attempt}/{MAX_ATTEMPTS} for {video_id} — "
+                        f"retrying in {wait:.1f}s with a fresh proxy IP"
+                    )
+                    _time.sleep(wait)
+                    continue
+                logger.warning(
+                    f"YouTube blocked all {MAX_ATTEMPTS} attempts for {video_id}; "
+                    f"every retry rotated to a different Webshare proxy IP yet "
+                    f"none reached YouTube. The proxy pool may be saturated."
+                )
+                raise ValueError(
+                    "YouTube への接続が一時的に制限されています。"
+                    f"({MAX_ATTEMPTS} 回再試行しましたが全てプロキシ経由でもブロックされました。"
+                    "Webshare のプロキシ IP が YouTube に block 登録されている可能性があります。)"
+                    " 別の動画で試すか、しばらく時間をおいて再度お試しください。"
+                )
+            logger.exception(f"Transcript fetch failed for {video_id}")
+            raise ValueError(f"字幕の取得に失敗しました: {str(e) or type(e).__name__}")
+    if items is None:
+        # All attempts blocked — already raised above, but guard for safety.
+        raise ValueError("YouTube transcript fetch failed after retries")
     
     # Detect which language was actually returned
     # youtube-transcript-api returns in priority order, so we got the first available
