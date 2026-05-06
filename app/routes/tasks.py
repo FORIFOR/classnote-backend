@@ -355,12 +355,13 @@ async def _handle_summarize_task_core(request: Request):
             "autoTags": tags,
             "status": "要約済み",
         }
-        # [HOTFIX 2026-05-05] Promote topicSummary to session.title when the
-        # current title is still the auto-generated placeholder (e.g. iOS
-        # default "会議 5/4 16:08", auto-create fallback, "(無題)") and the
-        # user has not edited it. The candidate is sanitised before use so
-        # bullet markers and `[info]/[risk]/[decision]` annotations don't
-        # leak into the visible title.
+        # [HOTFIX 2026-05-05 / 2026-05-06] Promote topicSummary to session.title
+        # when the current title is still the auto-generated placeholder
+        # (e.g. iOS default "会議 5/4 16:08", auto-create fallback, "(無題)") and
+        # the user has not edited it. Final shape: ``YYYYMMDD HH:MM_<topic>``
+        # using the session's startedAt (fallback createdAt) so the list
+        # view stays sortable by visible name and the user can spot the
+        # session by date at a glance.
         try:
             import re as _re
             current_title = (data.get("title") or "").strip()
@@ -369,28 +370,53 @@ async def _handle_summarize_task_core(request: Request):
                 r"^(?:会議|講義|ミーティング|レコーディング|録音|Meeting|Lecture|Untitled|\(無題\))?\s*"
                 r"(?:\d{1,2}[/\-月]\d{1,2}日?\s*\d{1,2}[:時]\d{1,2}分?\s*)?$"
             )
+            # Treat any prior auto-set title (incl. older "M/D HH:MM_..." or
+            # plain topic) as still placeholder-replaceable, so we can upgrade
+            # them to the new "YYYYMMDD HH:MM_..." format.
+            already_auto = bool(data.get("titleAutoSet"))
             is_placeholder = (
                 not current_title
                 or current_title == "(無題)"
                 or bool(placeholder_re.match(current_title))
+                or already_auto
             )
 
             def _clean_title_candidate(s: str) -> str:
                 if not s:
                     return ""
                 t = s.strip()
-                # Drop leading bullet/numbering markers
                 t = _re.sub(r"^[\-\*・●◆▶︎]+\s*", "", t)
                 t = _re.sub(r"^\d+[\.\)]\s*", "", t)
-                # Drop leading bracketed tags like [info] [risk] [decision]
                 t = _re.sub(r"^(?:\[[^\]]+\]\s*)+", "", t)
-                # Drop trailing punctuation that looks structural
                 t = t.strip(" 　:：.。、,")
                 return t[:80]
 
+            def _format_title_prefix(d: dict) -> str:
+                """Return ``YYYYMMDD HH:MM`` from the session's startedAt /
+                createdAt. Falls back to "now" if both are missing so the
+                title still gets a stable prefix.
+                """
+                ts = d.get("startedAt") or d.get("createdAt")
+                if ts is None:
+                    ts = datetime.now(timezone.utc)
+                if hasattr(ts, "to_datetime"):
+                    try:
+                        ts = ts.to_datetime()
+                    except Exception:
+                        ts = datetime.now(timezone.utc)
+                if not isinstance(ts, datetime):
+                    ts = datetime.now(timezone.utc)
+                # JST display per existing iOS UX convention (record times
+                # are presented in user-local; backend stores UTC). +9h.
+                from datetime import timedelta as _td
+                jst = ts + _td(hours=9)
+                return jst.strftime("%Y%m%d %H:%M")
+
             candidate = _clean_title_candidate(topic_summary or "")
             if candidate and is_placeholder and not user_edited:
-                update_payload["title"] = candidate
+                prefix = _format_title_prefix(data)
+                final_title = f"{prefix}_{candidate}"
+                update_payload["title"] = final_title[:120]
                 update_payload["titleAutoSet"] = True
                 update_payload["titleAutoSetAt"] = datetime.now(timezone.utc)
         except Exception as _title_err:
