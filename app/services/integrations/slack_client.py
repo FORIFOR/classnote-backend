@@ -202,6 +202,88 @@ def post_message(*, team_id: str, channel: str, text: str, thread_ts: Optional[s
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Block Kit factories — interactive share confirmation cards
+# ──────────────────────────────────────────────────────────────────────
+
+def post_blocks(*, team_id: str, channel: str, blocks: list, fallback_text: str = "DeepNote") -> bool:
+    """Send a Block Kit message. ``fallback_text`` is what mobile / OS
+    notification surfaces show; required by Slack."""
+    if not channel:
+        return False
+    bot_token = get_bot_token(team_id)
+    if not bot_token:
+        return False
+    payload = {"channel": channel, "text": fallback_text, "blocks": blocks}
+    try:
+        resp = requests.post(
+            SLACK_POST_MESSAGE_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {bot_token}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning("[slack.post_blocks] request failed: %s", e)
+        return False
+    if resp.status_code != 200:
+        logger.warning("[slack.post_blocks] http=%s body=%s", resp.status_code, resp.text[:200])
+        return False
+    body = resp.json()
+    if not body.get("ok"):
+        logger.warning("[slack.post_blocks] error=%s", body.get("error"))
+        return False
+    return True
+
+
+def build_share_confirm_blocks(*, session_id: str, title: str, summary_blurb: str,
+                                decision_count: int, todo_count: int, target_channel: str,
+                                attach_pdf: bool = False) -> list:
+    """Block Kit payload showing the share preview + 2 action buttons.
+    The action buttons include the ``value`` field carrying the
+    encoded confirm payload that ``/integrations/slack/interactions``
+    decodes back into a ``share:confirm`` call.
+    """
+    import json as _json
+    bullet_lines = []
+    if summary_blurb:
+        bullet_lines.append(f"・要約: {summary_blurb[:160]}")
+    if decision_count:
+        bullet_lines.append(f"・決定事項: {decision_count} 件")
+    if todo_count:
+        bullet_lines.append(f"・TODO: {todo_count} 件")
+    if attach_pdf:
+        bullet_lines.append("・PDF を添付")
+    body_text = "\n".join(bullet_lines) or "(共有内容なし)"
+
+    confirm_value = _json.dumps({
+        "action": "share_confirm",
+        "sessionId": session_id,
+        "channel": target_channel,
+        "attachPdf": attach_pdf,
+    })[:1500]
+    cancel_value = _json.dumps({"action": "share_cancel", "sessionId": session_id})
+
+    return [
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": f"*📝 「{title}」を <#{target_channel}> に共有しますか？*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+            "text": "⚠️ チャンネルメンバー全員が閲覧可能になります。"}]},
+        {"type": "actions", "elements": [
+            {"type": "button",
+             "style": "primary",
+             "text": {"type": "plain_text", "text": "✅ 共有する"},
+             "action_id": "deepnote_share_confirm",
+             "value": confirm_value},
+            {"type": "button",
+             "text": {"type": "plain_text", "text": "キャンセル"},
+             "action_id": "deepnote_share_cancel",
+             "value": cancel_value},
+        ]},
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────
 # files.uploadV2 — attach PDF directly into a channel / DM
 # ──────────────────────────────────────────────────────────────────────
 

@@ -522,6 +522,91 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
     )
 
 
+def _handle_postback_event(event: Dict[str, Any]) -> None:
+    """Handle Smart Share Lv3 confirmation postbacks.
+
+    Postback ``data`` is a query-string of the form
+        action=share_confirm&sid=<sessionId>&dest=<groupOrUserId>&attach=0|1
+    The button itself is rendered via a Flex / Template message that
+    integrations_line emits when iOS / Desktop calls
+    ``POST /v1/assistant/share:preview`` with channel="line".
+    """
+    source = event.get("source") or {}
+    line_user_id = source.get("userId")
+    reply_token = event.get("replyToken")
+    raw = (event.get("postback") or {}).get("data") or ""
+    if not raw or not reply_token:
+        return
+    from urllib.parse import parse_qs
+    parsed = parse_qs(raw)
+    action = (parsed.get("action") or [""])[0]
+
+    if action == "share_cancel":
+        line_messaging.reply(reply_token, [line_messaging.text_message("キャンセルしました。")])
+        return
+
+    if action != "share_confirm":
+        return
+
+    sid = (parsed.get("sid") or [""])[0]
+    dest = (parsed.get("dest") or [""])[0]
+    if not sid or not dest:
+        line_messaging.reply(reply_token, [line_messaging.text_message("共有リクエストが不正です。")])
+        return
+
+    # Resolve link → account, ownership-check, build text, push to dest.
+    if not line_user_id:
+        return
+    link = line_link_tokens.get_link(line_user_id)
+    if not link:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "DeepNote と LINE の連携が必要です。個人チャットでセットアップしてください。")])
+        return
+    try:
+        snap = db.collection("sessions").document(sid).get()
+        sd = snap.to_dict() if snap.exists else {}
+    except Exception:
+        sd = {}
+    if not sd or sd.get("ownerAccountId") != link.get("accountId"):
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象会議が見つからない、または共有権限がありません。")])
+        return
+
+    title = sd.get("title") or "(無題)"
+    lines = [f"📝 {title}"]
+    topic = sd.get("topicSummary") or ""
+    if topic:
+        lines.append(topic[:300])
+    for d in ((sd.get("summaryJson") or {}).get("decisions") or [])[:5]:
+        txt = d.get("text") if isinstance(d, dict) else str(d)
+        if txt:
+            lines.append(f"・{txt}")
+    text = "\n".join(lines)
+
+    if line_messaging.is_configured():
+        line_messaging.push(dest, [line_messaging.text_message(text)])
+
+    # Append workspace key so future group-bot 「最新」 surfaces it.
+    try:
+        existing = list(sd.get("sharedToWorkspaceTeams") or [])
+        ws_key = f"line:{dest}"
+        if ws_key not in existing:
+            db.collection("sessions").document(sid).update(
+                {"sharedToWorkspaceTeams": existing + [ws_key]}
+            )
+    except Exception:
+        pass
+
+    bot_audit.record(
+        provider="line", source_type="postback",
+        source_user_id=line_user_id,
+        account_id=link.get("accountId"), deepnote_uid=link.get("deepnoteUid"),
+        command="share_confirm", outcome="ok",
+    )
+    line_messaging.reply(reply_token, [line_messaging.text_message(
+        f"✅ 「{title}」を共有しました。")])
+
+
 def _handle_follow_event(event: Dict[str, Any]) -> None:
     source = event.get("source") or {}
     if source.get("type") != "user":
@@ -583,8 +668,10 @@ async def line_webhook(
                 rt = ev.get("replyToken")
                 if rt:
                     line_messaging.reply(rt, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
+            elif ev_type == "postback":
+                _handle_postback_event(ev)
             else:
-                # postback / unfollow / leave / etc. — log + ignore for Phase 1.
+                # unfollow / leave / etc. — log + ignore.
                 pass
         except Exception as e:
             logger.exception("[line.webhook] event handler failed: %s", e)

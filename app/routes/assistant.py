@@ -253,9 +253,97 @@ async def confirm_share(req: ShareConfirmRequest, current_user: CurrentUser = De
     return {"sessionId": req.sessionId, "channel": req.channel, "posted": posted}
 
 
+class AssistantAction(BaseModel):
+    type: str = Field(..., description="'query' | 'share' | 'schedule' | 'export'")
+    payload: dict = Field(default_factory=dict)
+    idempotencyKey: Optional[str] = None
+
+
 @router.post("/actions")
 async def post_action(
+    req: AssistantAction,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Phase C: tool execution dispatch (export PDF, schedule, etc.)."""
-    raise HTTPException(status_code=501, detail="Assistant actions ship in Phase C")
+    """Phase C: tool execution dispatch.
+
+    Supported types:
+      - ``query``    → forwards payload.question (etc.) to assistant_hub
+      - ``share``    → forwards to share:confirm (requires payload.confirm)
+      - ``schedule`` → forwards to scheduled_tasks.create
+      - ``export``   → enqueues an export job (PDF/DOCX/PPTX). Returns
+                       the export id; download URL becomes available
+                       when the export pipeline completes (existing
+                       /sessions/{id}/exports flow).
+    """
+    account_id = getattr(current_user, "account_id", None) or current_user.uid
+    t = (req.type or "").lower()
+    payload = req.payload or {}
+
+    if t == "query":
+        from app.services import assistant_hub as _hub
+        result = await _hub.handle_message(
+            account_id=account_id,
+            owner_uid=current_user.uid,
+            question=payload.get("question") or "",
+            session_id=payload.get("sessionId"),
+            mode=payload.get("mode") or "session",
+            channel=payload.get("channel") or "ios",
+            idempotency_key=req.idempotencyKey,
+        )
+        return {"action": "query", "result": result}
+
+    if t == "share":
+        if not payload.get("confirm"):
+            raise HTTPException(status_code=400, detail="payload.confirm must be true")
+        sub = ShareConfirmRequest(
+            sessionId=payload.get("sessionId") or "",
+            channel=payload.get("channel") or "",
+            destination=payload.get("destination") or {},
+            includeSummary=bool(payload.get("includeSummary", True)),
+            includeTodos=bool(payload.get("includeTodos", True)),
+            includeDecisions=bool(payload.get("includeDecisions", True)),
+            attachPdf=bool(payload.get("attachPdf", False)),
+            confirm=True,
+        )
+        return await confirm_share(sub, current_user=current_user)
+
+    if t == "schedule":
+        from app.services import scheduled_tasks as _st
+        try:
+            return {"action": "schedule", "result": _st.create(account_id, body=payload)}
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+    if t == "export":
+        # Hand off to the existing exports pipeline rather than re-implementing
+        # the work here. We just enqueue and return the job id; the export
+        # flow already supports ``format=pdf|docx|pptx``.
+        sid = payload.get("sessionId") or ""
+        fmt = (payload.get("format") or "pdf").lower()
+        if fmt not in ("pdf", "docx", "pptx"):
+            raise HTTPException(status_code=400, detail="format must be pdf | docx | pptx")
+        try:
+            from app.task_queue import enqueue_summarize_task  # type: ignore  # noqa: F401  (warm import)
+            from google.cloud import tasks_v2
+            import os, json as _json
+            project = os.environ.get("GCP_PROJECT", "classnote-x-dev")
+            location = os.environ.get("TASKS_LOCATION", "asia-northeast1")
+            queue = os.environ.get("EXPORT_QUEUE", "summarize-queue")
+            url = f"{os.environ.get('CLOUD_RUN_SERVICE_URL', '')}/internal/tasks/export"
+            client = tasks_v2.CloudTasksClient()
+            parent = client.queue_path(project, location, queue)
+            task = {"http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": url,
+                "headers": {"Content-Type": "application/json"},
+                "body": _json.dumps({"sessionId": sid, "format": fmt,
+                                      "userId": current_user.uid,
+                                      "accountId": account_id}).encode(),
+            }}
+            client.create_task(parent=parent, task=task)
+            return {"action": "export", "status": "enqueued", "format": fmt, "sessionId": sid}
+        except Exception as e:
+            logger.warning("[assistant.action.export] enqueue failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"export_enqueue_failed: {e}")
+
+    raise HTTPException(status_code=400, detail=f"unsupported action type: {req.type}")

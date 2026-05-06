@@ -202,6 +202,43 @@ def _extract_assignee_filter(question: str) -> Optional[str]:
 # LLM-backed free-form (small context only)
 # ──────────────────────────────────────────────────────────────────────
 
+def _select_transcript_spans(transcript: str, question: str, *, max_spans: int = 4, line_window: int = 2) -> List[Dict[str, Any]]:
+    """Pick a few transcript line-windows that look relevant to the
+    question. Phase C: simple keyword scoring (no embeddings); good
+    enough to give the LLM concrete grounding without sending the
+    whole transcript and without paying for vector search.
+
+    Returns list of {start_line, end_line, text} dicts (0-indexed lines).
+    """
+    if not transcript or not question:
+        return []
+    q_terms = [t for t in re.split(r"[\s　、。,\.!?！？]+", question) if len(t) >= 2]
+    if not q_terms:
+        return []
+    lines = transcript.splitlines()
+    if len(lines) < 5:
+        return [{"start_line": 0, "end_line": len(lines) - 1, "text": transcript[:600]}]
+    scored: List[Tuple[int, int]] = []
+    for i, ln in enumerate(lines):
+        s = sum(ln.count(t) for t in q_terms)
+        if s:
+            scored.append((s, i))
+    scored.sort(key=lambda kv: -kv[0])
+    picked: List[Dict[str, Any]] = []
+    used_ranges: List[Tuple[int, int]] = []
+    for _, idx in scored[: max_spans * 2]:
+        s = max(0, idx - line_window)
+        e = min(len(lines) - 1, idx + line_window)
+        if any(not (e < us or s > ue) for us, ue in used_ranges):
+            continue
+        used_ranges.append((s, e))
+        text = "\n".join(lines[s : e + 1])[:400]
+        picked.append({"start_line": s, "end_line": e, "text": text})
+        if len(picked) >= max_spans:
+            break
+    return picked
+
+
 async def _answer_freeform(
     question: str,
     session_data: Dict[str, Any],
@@ -209,7 +246,10 @@ async def _answer_freeform(
     decisions: List[Any],
     todos: List[Dict[str, Any]],
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Build a tight context (no full transcript) and ask Gemini once."""
+    """Build a tight context (small summary + selected transcript spans)
+    and ask Gemini once. Spans are scored by keyword overlap so we never
+    push the full transcript to the model.
+    """
     title = session_data.get("title") or "(無題)"
     summary_text = ""
     if summary_v2 and summary_v2.get("markdown"):
@@ -217,6 +257,8 @@ async def _answer_freeform(
     elif session_data.get("summaryMarkdown"):
         summary_text = session_data["summaryMarkdown"]
     summary_text = (summary_text or "")[:2000]
+    transcript = (session_data.get("transcriptText") or "")
+    spans = _select_transcript_spans(transcript, question)
 
     decisions_block = "\n".join(
         f"- {d.get('text') if isinstance(d, dict) else str(d)}"
@@ -229,14 +271,23 @@ async def _answer_freeform(
         for t in (todos or [])[:8]
     )
 
+    spans_block = ""
+    if spans:
+        chunks = []
+        for i, sp in enumerate(spans, 1):
+            chunks.append(f"[span {i} | lines {sp['start_line']+1}-{sp['end_line']+1}]\n{sp['text']}")
+        spans_block = "\n\n".join(chunks)
+
     prompt = (
         f"あなたは DeepNote の議事録アシスタントです。以下の会議情報のみを根拠として、"
         f"日本語で簡潔に回答してください。情報が足りない場合は推測せず、"
-        f"『記録された情報からは判断できません』と答えてください。\n\n"
+        f"『記録された情報からは判断できません』と答えてください。"
+        f"transcript span の番号 [span N] を回答内に括弧で示してください。\n\n"
         f"会議タイトル: {title}\n\n"
         f"=== 要約 ===\n{summary_text or '(なし)'}\n\n"
         f"=== 決定事項 ===\n{decisions_block or '(なし)'}\n\n"
         f"=== TODO ===\n{todo_block or '(なし)'}\n\n"
+        f"=== 関連する書き起こし抜粋 ===\n{spans_block or '(該当箇所なし)'}\n\n"
         f"=== 質問 ===\n{question}\n\n"
         f"=== 回答 ==="
     )
@@ -276,6 +327,12 @@ async def _answer_freeform(
             txt = t.get("title") or t.get("text") or ""
             if txt:
                 cites.append({"type": "todo", "id": t.get("_id") or "", "snippet": txt[:120]})
+        for i, sp in enumerate(spans, 1):
+            cites.append({
+                "type": "transcript_span",
+                "id": f"transcript:{sp['start_line']+1}-{sp['end_line']+1}",
+                "snippet": (sp.get("text") or "")[:160],
+            })
         return text, cites
     except Exception as e:
         logger.warning("[assistant_qna] freeform LLM failed: %s", e)

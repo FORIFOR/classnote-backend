@@ -545,6 +545,113 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Block Kit interactions — Smart Share Lv3 confirm/cancel buttons
+# ──────────────────────────────────────────────────────────────────────
+
+@router.post("/interactions", include_in_schema=False)
+async def slack_interactions(
+    request: Request,
+    x_slack_request_timestamp: Optional[str] = Header(None, alias="X-Slack-Request-Timestamp"),
+    x_slack_signature: Optional[str] = Header(None, alias="X-Slack-Signature"),
+):
+    """Slack POSTs an ``application/x-www-form-urlencoded`` body with a
+    single ``payload=<JSON>`` field whenever a user clicks a button or
+    submits a modal. We verify the same X-Slack-Signature, decode the
+    payload, and dispatch on the action_id.
+    """
+    body = await request.body()
+    if not slack_client.is_configured():
+        raise HTTPException(status_code=503, detail="slack_not_configured")
+    if not slack_client.verify_signature(
+        body=body,
+        timestamp=x_slack_request_timestamp or "",
+        signature=x_slack_signature or "",
+    ):
+        raise HTTPException(status_code=401, detail="invalid_signature")
+
+    from urllib.parse import parse_qs
+    try:
+        form = parse_qs(body.decode("utf-8"))
+        raw_payload = (form.get("payload") or [""])[0]
+        data = json.loads(raw_payload) if raw_payload else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="malformed_payload")
+
+    actions = data.get("actions") or []
+    if not actions:
+        return JSONResponse({"ok": True})
+    action = actions[0]
+    action_id = action.get("action_id") or ""
+    raw_value = action.get("value") or "{}"
+    try:
+        value = json.loads(raw_value)
+    except Exception:
+        value = {}
+
+    user = (data.get("user") or {}).get("id") or ""
+    team_id = (data.get("team") or {}).get("id") or ""
+    response_url = data.get("response_url") or ""
+
+    if action_id == "deepnote_share_confirm" and value.get("action") == "share_confirm":
+        # Resolve the link → account, then post the share into the
+        # destination channel. We re-derive ``sd`` here to keep the
+        # ownership check identical to the REST share:confirm route.
+        link = slack_link_tokens.get_link(team_id, user)
+        if not link:
+            return JSONResponse({"text": "DeepNote と Slack の連携が必要です。", "response_type": "ephemeral"})
+        from app.firebase import db as _db
+        sid = value.get("sessionId") or ""
+        snap = _db.collection("sessions").document(sid).get() if sid else None
+        sd = snap.to_dict() if snap and snap.exists else {}
+        if not sd or sd.get("ownerAccountId") != link.get("accountId"):
+            return JSONResponse({"text": "対象会議が見つからない、または共有権限がありません。",
+                                 "response_type": "ephemeral"})
+        channel = value.get("channel") or ""
+        title = sd.get("title") or "(無題)"
+        lines = [f"📝 {title}"]
+        topic = sd.get("topicSummary") or ""
+        if topic:
+            lines.append(topic[:300])
+        for d in ((sd.get("summaryJson") or {}).get("decisions") or [])[:5]:
+            txt = d.get("text") if isinstance(d, dict) else str(d)
+            if txt:
+                lines.append(f"・{txt}")
+        text = "\n".join(lines)
+        slack_client.post_message(team_id=team_id, channel=channel, text=text)
+
+        # Append workspace key so future group-bot 「最新」 surfaces it.
+        try:
+            existing = list(sd.get("sharedToWorkspaceTeams") or [])
+            ws_key = f"slack:{team_id}"
+            if ws_key not in existing:
+                _db.collection("sessions").document(sid).update(
+                    {"sharedToWorkspaceTeams": existing + [ws_key]}
+                )
+        except Exception:
+            pass
+
+        bot_audit.record(
+            provider="slack", source_type="interaction",
+            source_user_id=user, team_id=team_id,
+            account_id=link.get("accountId"), deepnote_uid=link.get("deepnoteUid"),
+            command="share_confirm", outcome="ok",
+        )
+        # Replace the original card with a confirmation receipt.
+        return JSONResponse({
+            "replace_original": True,
+            "text": f"✅ 会議「{title}」を <#{channel}> に共有しました。",
+        })
+
+    if action_id == "deepnote_share_cancel" and value.get("action") == "share_cancel":
+        return JSONResponse({
+            "replace_original": True,
+            "text": "キャンセルしました。",
+        })
+
+    return JSONResponse({"ok": True})
+
+
 @router.post("/events", include_in_schema=False)
 async def slack_events(
     request: Request,
