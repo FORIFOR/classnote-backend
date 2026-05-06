@@ -266,8 +266,37 @@ async def alias_organization_put(
     body: Any = None,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    # No-op accept — feature not implemented but iOS retries on 4xx.
-    return {"sessionId": session_id, "ok": True, "stored": False}
+    """iOS' ``updateSessionOrganization`` writes ``{folderId: "..."}`` here
+    to attach a session to a folder. The previous stub returned
+    ``{ok: true, stored: false}`` without persisting anything, so every
+    folder assignment from iOS silently disappeared and the folder
+    appeared empty.
+
+    This now delegates to ``_move_session_impl`` which writes
+    ``users/{uid}/sessionMeta/{session_id}.folderId`` — the same path
+    ``GET /folders/{id}/sessions`` reads from.
+    """
+    folder_id: Optional[str] = None
+    if isinstance(body, dict):
+        raw_fid = body.get("folderId")
+        if isinstance(raw_fid, str) and raw_fid:
+            folder_id = raw_fid
+        # Explicit ``{folderId: null}`` removes the linkage.
+    from app.routes.folders import _move_session_impl
+    try:
+        result = _move_session_impl(current_user.uid, session_id, folder_id)
+        return {
+            "sessionId": session_id,
+            "ok": True,
+            "stored": True,
+            "folderId": result.get("folderId") if isinstance(result, dict) else folder_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Don't 500 the iOS sync loop; surface as ok=False so the client
+        # can decide whether to retry.
+        return {"sessionId": session_id, "ok": False, "stored": False, "error": str(e)[:200]}
 
 
 # /sessions/{id}/audio?purpose=playback — iOS expects a GET to receive a

@@ -91,11 +91,21 @@ async def handle_summarize_quick_task(request: Request):
         data = doc.to_dict()
         derived_ref = doc_ref.collection("derived").document("summary_quick")
 
+        # [HOTFIX 2026-05-06] Same fix as the full summarize handler — only
+        # short-circuit if the derived doc shows the previous run actually
+        # SUCCEEDED. /jobs writes the idempotency key with status="running"
+        # before the worker fires, so the old check skipped every retry.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     return {"status": "skipped", "reason": "idempotent_hit"}
 
         transcript = await resolve_transcript_text_async(session_id, data) or ""
@@ -244,11 +254,24 @@ async def _handle_summarize_task_core(request: Request):
         mode = data.get("mode", "lecture")
         derived_ref = doc_ref.collection("derived").document("summary")
 
+        # [HOTFIX 2026-05-06] Only short-circuit if a PRIOR attempt with the
+        # same idempotency key actually completed. Previously this branch
+        # returned "idempotent_hit" whenever the key matched, but
+        # ``POST /sessions/{id}/jobs`` writes derived/summary with the
+        # idempotency key BEFORE the worker runs (so iOS can poll). That
+        # caused every Cloud Tasks invocation to skip itself in ~250ms,
+        # leaving sessions stuck at summaryStatus="running" forever.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     if job_id:
                          db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
@@ -655,15 +678,23 @@ async def _handle_quiz_task_core(request: Request):
         mode = data.get("mode", "lecture")
         derived_ref = doc_ref.collection("derived").document("quiz")
 
+        # [HOTFIX 2026-05-06] Same fix as the summary handlers — only
+        # short-circuit when the previous run actually succeeded.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     if job_id:
                          db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
-        
+
         if not transcript:
             doc_ref.update({"quizStatus": "failed", "quizError": "Transcript empty", "status": "録音済み"})
             if job_id:
