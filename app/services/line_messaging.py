@@ -56,6 +56,25 @@ def verify_signature(*, body: bytes, header_signature: str) -> bool:
     return hmac.compare_digest(expected, header_signature)
 
 
+def confirm_template_message(*, alt_text: str, prompt: str,
+                              yes_label: str, yes_data: str,
+                              no_label: str, no_data: str) -> Dict[str, Any]:
+    """LINE template confirm message with two postback actions.
+    Used by the in-group Lv3 share-confirm card."""
+    return {
+        "type": "template",
+        "altText": (alt_text or "")[:400],
+        "template": {
+            "type": "confirm",
+            "text": (prompt or "")[:240],
+            "actions": [
+                {"type": "postback", "label": (yes_label or "OK")[:20], "data": (yes_data or "")[:300]},
+                {"type": "postback", "label": (no_label or "Cancel")[:20], "data": (no_data or "")[:300]},
+            ],
+        },
+    }
+
+
 def text_message(text: str) -> Dict[str, Any]:
     """Build a single text message body. LINE caps text at 5000 chars."""
     if text is None:

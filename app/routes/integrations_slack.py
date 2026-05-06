@@ -452,18 +452,52 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
                 pass
             return M.GROUP_NO_SHARED_DATA
 
+        def _send_proactive_share_offer() -> bool:
+            try:
+                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                if not latest or not latest.get("id"):
+                    return False
+                blocks = slack_client.build_share_confirm_blocks(
+                    session_id=latest["id"],
+                    title=(latest.get("title") or "(無題)"),
+                    summary_blurb="",
+                    decision_count=0,
+                    todo_count=0,
+                    target_channel=channel,
+                    attach_pdf=False,
+                )
+                ok = slack_client.post_blocks(
+                    team_id=team_id, channel=channel,
+                    blocks=blocks,
+                    fallback_text=f"「{latest.get('title') or '(無題)'}」をこのチャンネルに共有しますか？",
+                )
+                return bool(ok)
+            except Exception as _e:
+                logger.warning("[slack.proactive] offer failed: %s", _e)
+                return False
+
+        sent_blocks = False
         if cmd == "decisions":
             decisions = group_shared_briefing.get_recent_shared_decisions(
                 link["accountId"], ws_key, limit=3
             )
-            reply_text = _format_decisions(decisions) if decisions else _no_data_text()
+            if decisions:
+                reply_text = _format_decisions(decisions)
+            else:
+                sent_blocks = _send_proactive_share_offer()
+                reply_text = "" if sent_blocks else _no_data_text()
         elif cmd in ("latest", "help"):
             shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
-            reply_text = _format_latest(shared) if shared else _no_data_text()
+            if shared:
+                reply_text = _format_latest(shared)
+            else:
+                sent_blocks = _send_proactive_share_offer()
+                reply_text = "" if sent_blocks else _no_data_text()
         else:
             reply_text = _no_data_text()
-        slack_client.post_message(team_id=team_id, channel=channel,
-                                  text=reply_text, thread_ts=thread_ts)
+        if not sent_blocks:
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=reply_text, thread_ts=thread_ts)
         bot_audit.record(
             provider="slack", source_type=channel_type or "unknown",
             source_user_id=user, team_id=team_id,

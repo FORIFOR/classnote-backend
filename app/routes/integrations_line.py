@@ -452,9 +452,31 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             )
             return
 
-        # Build a hint message that includes the user's latest unshared
-        # session title so the workspace bot tells you exactly which
-        # meeting you can share next, rather than just "no data".
+        # Phase D+: when a group bot has nothing to show, proactively
+        # offer Smart Share Lv3 in-group. The user types 「最新」 and we
+        # respond with a confirm template ("Want to share your latest
+        # meeting?"), so they can finish the share without leaving LINE.
+        def _send_proactive_share_offer_or_text() -> bool:
+            try:
+                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                if not latest or not latest.get("id"):
+                    return False
+                from urllib.parse import urlencode as _qs
+                yes_data = "action=share_confirm&" + _qs({"sid": latest["id"], "dest": group_id, "attach": "0"})
+                no_data = "action=share_cancel&sid=" + latest["id"]
+                title_short = (latest.get("title") or "(無題)")[:40]
+                msg = line_messaging.confirm_template_message(
+                    alt_text=f"会議「{title_short}」をこのグループに共有しますか？",
+                    prompt=f"会議「{title_short}」をこのグループに共有しますか？",
+                    yes_label="✅ 共有する", yes_data=yes_data,
+                    no_label="キャンセル",   no_data=no_data,
+                )
+                line_messaging.reply(reply_token, [msg])
+                return True
+            except Exception as _e:
+                logger.warning("[line.proactive] offer failed: %s", _e)
+                return False
+
         def _no_data_text() -> str:
             try:
                 latest = group_shared_briefing.get_latest_any_session(link["accountId"])
@@ -468,13 +490,25 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             decisions = group_shared_briefing.get_recent_shared_decisions(
                 link["accountId"], ws_key, limit=3
             )
-            text = _format_decisions(decisions) if decisions else _no_data_text()
+            if decisions:
+                text = _format_decisions(decisions)
+                line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+            else:
+                if not _send_proactive_share_offer_or_text():
+                    line_messaging.reply(reply_token, [line_messaging.text_message(_no_data_text())])
+                text = M.GROUP_NO_SHARED_DATA
         elif cmd == "latest" or cmd == "help":
             shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
-            text = _format_latest(shared) if shared else _no_data_text()
+            if shared:
+                text = _format_latest(shared)
+                line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+            else:
+                if not _send_proactive_share_offer_or_text():
+                    line_messaging.reply(reply_token, [line_messaging.text_message(_no_data_text())])
+                text = M.GROUP_NO_SHARED_DATA
         else:
             text = _no_data_text()
-        line_messaging.reply(reply_token, [line_messaging.text_message(text)])
+            line_messaging.reply(reply_token, [line_messaging.text_message(text)])
         bot_audit.record(
             provider="line", source_type=source_type,
             source_user_id=line_user_id,
