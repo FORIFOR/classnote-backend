@@ -263,7 +263,7 @@ async def alias_organization_get(
 @router.put("/sessions/{session_id}/organization", include_in_schema=False)
 async def alias_organization_put(
     session_id: str,
-    body: Any = None,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """iOS' ``updateSessionOrganization`` writes ``{folderId: "..."}`` here
@@ -276,12 +276,19 @@ async def alias_organization_put(
     ``users/{uid}/sessionMeta/{session_id}.folderId`` — the same path
     ``GET /folders/{id}/sessions`` reads from.
     """
+    # Parse the body manually — using ``body: Any = None`` does not actually
+    # bind the JSON payload in FastAPI for this endpoint shape, so a previous
+    # version always saw body=None and treated every PUT as "clear folder".
     folder_id: Optional[str] = None
-    if isinstance(body, dict):
-        raw_fid = body.get("folderId")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        raw_fid = payload.get("folderId")
         if isinstance(raw_fid, str) and raw_fid:
             folder_id = raw_fid
-        # Explicit ``{folderId: null}`` removes the linkage.
+        # Explicit ``{folderId: null}`` is the unset signal — folder_id stays None.
     from app.routes.folders import _move_session_impl
     try:
         result = _move_session_impl(current_user.uid, session_id, folder_id)
@@ -294,8 +301,6 @@ async def alias_organization_put(
     except HTTPException:
         raise
     except Exception as e:
-        # Don't 500 the iOS sync loop; surface as ok=False so the client
-        # can decide whether to retry.
         return {"sessionId": session_id, "ok": False, "stored": False, "error": str(e)[:200]}
 
 
