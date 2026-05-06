@@ -29,6 +29,7 @@ from app.services import slack_oauth_state
 from app.services import asset_delivery
 from app.services import bot_audit
 from app.services import group_shared_briefing
+from app.services import group_acl
 from app.services.integrations import slack_client
 
 logger = logging.getLogger("app.routes.integrations.slack")
@@ -259,6 +260,19 @@ def _classify_command(text: str) -> str:
         return "assistant_qna"
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
+    # Phase 1 channel ACL commands. Require an explicit DeepNote/Clow
+    # mention so bare 「接続」 in chatter doesn't trigger admin ops.
+    has_bot = any(k in t for k in ("deepnote", "ディープノート", "clow", "クロウ"))
+    if has_bot and any(k in t for k in ("接続", "connect", "リンク", "link")):
+        return "group_connect"
+    if has_bot and any(k in t for k in ("切断", "解除", "disconnect", "unlink")):
+        return "group_disconnect"
+    if has_bot and any(k in t for k in ("メンバー追加", "管理者追加", "promote", "member add", "admin add")):
+        return "group_member_add"
+    if has_bot and any(k in t for k in ("メンバー削除", "管理者削除", "demote", "member remove", "admin remove")):
+        return "group_member_remove"
+    if has_bot and any(k in t for k in ("状態", "ステータス", "status")):
+        return "group_status"
     if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
         # Lv4 retired (safety). Always answer with the migration notice.
         return "auto_share_deprecated"
@@ -389,6 +403,198 @@ def _strip_app_mentions(text: str) -> str:
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Phase 1 channel ACL command handlers (Slack)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Slack workspace_id format = ``f"{team_id}:{channel_id}"`` so each
+# channel inside a workspace gets its own ACL row — same shape as
+# LINE groups.
+
+def _slack_workspace_id(team_id: str, channel_id: str) -> str:
+    return f"{team_id}:{channel_id}"
+
+
+def _slack_post(team_id: str, channel: str, text: str, thread_ts: Optional[str] = None) -> None:
+    slack_client.post_message(team_id=team_id, channel=channel, text=text, thread_ts=thread_ts)
+
+
+def _handle_slack_group_connect(team_id: str, channel: str, user: str, thread_ts: Optional[str]) -> None:
+    requester = slack_link_tokens.get_link(team_id, user)
+    if not requester:
+        _slack_post(team_id, channel,
+            "DeepNote と Slack の連携が必要です。\n"
+            "DM で DeepNote と連携した後、もう一度このチャンネルで「DeepNote 接続」と送ってください。",
+            thread_ts)
+        bot_audit.record(provider="slack", source_type="channel",
+                         source_user_id=user, team_id=team_id,
+                         command="group_connect", outcome="requester_not_linked")
+        return
+    ws_id = _slack_workspace_id(team_id, channel)
+    existing = group_acl.get_group_link("slack", ws_id)
+    if existing:
+        _slack_post(team_id, channel,
+            "このチャンネルは既に DeepNote と接続されています。\n"
+            "「DeepNote 状態」で現在の設定を確認できます。", thread_ts)
+        bot_audit.record(provider="slack", source_type="channel",
+                         source_user_id=user, team_id=team_id,
+                         account_id=existing.get("ownerAccountId"),
+                         command="group_connect", outcome="already_connected")
+        return
+    try:
+        group_acl.create_group_link(
+            "slack", ws_id,
+            owner_deepnote_uid=requester.get("deepnoteUid", ""),
+            owner_account_id=requester["accountId"],
+            created_by_source_user_id=user,
+        )
+    except Exception as e:
+        logger.warning("[slack.group_connect] create_link failed: %s", e)
+        _slack_post(team_id, channel,
+            "チャンネル接続に失敗しました。少し時間をおいてから再度お試しください。", thread_ts)
+        return
+    limits = group_acl.daily_limits()
+    _slack_post(team_id, channel,
+        "✅ DeepNote をこのチャンネルに接続しました。\n"
+        f"・代表アカウント: {requester['accountId'][:8]}…\n"
+        f"・1日の利用上限: {limits['max_runs']} 回 (うち AI 質問は {limits['max_paid_runs']} 回まで)\n"
+        "・他のメンバーは「最新」「決定事項」など読み取り操作のみ可能です\n"
+        "・AI 質問はオーナー / 管理者のみ実行できます\n"
+        "「DeepNote メンバー追加 @user」で管理者を追加できます。", thread_ts)
+    bot_audit.record(provider="slack", source_type="channel",
+                     source_user_id=user, team_id=team_id,
+                     account_id=requester["accountId"],
+                     deepnote_uid=requester.get("deepnoteUid"),
+                     command="group_connect", outcome="ok")
+
+
+def _handle_slack_group_status(team_id: str, channel: str, user: str, thread_ts: Optional[str]) -> None:
+    ws_id = _slack_workspace_id(team_id, channel)
+    glink = group_acl.get_group_link("slack", ws_id)
+    if not glink:
+        _slack_post(team_id, channel,
+            "このチャンネルはまだ DeepNote と接続されていません。\n"
+            "「DeepNote 接続」と送って代表アカウントを登録してください。", thread_ts)
+        return
+    me = group_acl.get_member("slack", ws_id, user)
+    role = (me or {}).get("role", "未登録")
+    members = group_acl.list_members("slack", ws_id, limit=20)
+    owner_count = sum(1 for m in members if m.get("role") == "owner")
+    admin_count = sum(1 for m in members if m.get("role") == "admin")
+    member_count = sum(1 for m in members if m.get("role") == "member")
+    limits = group_acl.daily_limits()
+    _slack_post(team_id, channel,
+        "📋 DeepNote 接続状態\n"
+        f"・代表アカウント: {glink.get('ownerAccountId', '')[:8]}…\n"
+        f"・あなたのロール: {role}\n"
+        f"・メンバー数: owner {owner_count} / admin {admin_count} / member {member_count}\n"
+        f"・1日の利用上限: {limits['max_runs']} 回 / AI 質問 {limits['max_paid_runs']} 回\n"
+        f"・1人当たり上限: {limits['max_runs_per_user']} 回",
+        thread_ts)
+    bot_audit.record(provider="slack", source_type="channel",
+                     source_user_id=user, team_id=team_id,
+                     account_id=glink.get("ownerAccountId"),
+                     command="group_status", outcome="ok")
+
+
+def _handle_slack_group_disconnect(team_id: str, channel: str, user: str, thread_ts: Optional[str]) -> None:
+    ws_id = _slack_workspace_id(team_id, channel)
+    glink = group_acl.get_group_link("slack", ws_id)
+    if not glink:
+        _slack_post(team_id, channel, "このチャンネルは接続されていません。", thread_ts)
+        return
+    me = group_acl.get_member("slack", ws_id, user)
+    if not me or me.get("role") != "owner":
+        _slack_post(team_id, channel, "切断は owner ロールのみ実行できます。", thread_ts)
+        bot_audit.record(provider="slack", source_type="channel",
+                         source_user_id=user, team_id=team_id,
+                         account_id=glink.get("ownerAccountId"),
+                         command="group_disconnect", outcome="blocked_not_owner")
+        return
+    group_acl.deactivate_group_link("slack", ws_id)
+    _slack_post(team_id, channel,
+        "✅ DeepNote とこのチャンネルの接続を解除しました。\n"
+        "再度接続したい場合は「DeepNote 接続」と送ってください。", thread_ts)
+    bot_audit.record(provider="slack", source_type="channel",
+                     source_user_id=user, team_id=team_id,
+                     account_id=glink.get("ownerAccountId"),
+                     command="group_disconnect", outcome="ok")
+
+
+def _extract_slack_user_mention(text: str) -> Optional[str]:
+    """``<@U0123ABCDE>`` → ``"U0123ABCDE"`` (Slack mention syntax)."""
+    import re
+    m = re.search(r"<@([A-Z0-9]+)(?:\|[^>]*)?>", text or "")
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(U[A-Z0-9]{8,})\b", text or "")
+    return m2.group(1) if m2 else None
+
+
+def _handle_slack_group_member_add(team_id: str, channel: str, user: str, text: str, thread_ts: Optional[str]) -> None:
+    ws_id = _slack_workspace_id(team_id, channel)
+    glink = group_acl.get_group_link("slack", ws_id)
+    if not glink:
+        _slack_post(team_id, channel,
+            "先に「DeepNote 接続」でチャンネルを接続してください。", thread_ts)
+        return
+    me = group_acl.get_member("slack", ws_id, user)
+    if not me or me.get("role") != "owner":
+        _slack_post(team_id, channel,
+            "メンバー追加は owner ロールのみ実行できます。", thread_ts)
+        return
+    target = _extract_slack_user_mention(text)
+    if not target:
+        _slack_post(team_id, channel,
+            "対象ユーザーを @メンション で指定してください。\n"
+            "例: 「@DeepNote メンバー追加 @taka」", thread_ts)
+        return
+    target_link = slack_link_tokens.get_link(team_id, target)
+    group_acl.set_member_role(
+        "slack", ws_id, target,
+        role="admin",
+        deepnote_uid=(target_link or {}).get("deepnoteUid"),
+        added_by=user,
+    )
+    _slack_post(team_id, channel,
+        f"✅ <@{target}> を admin として追加しました。\n"
+        "admin は AI 質問などクレジットを消費する操作も実行できます。", thread_ts)
+    bot_audit.record(provider="slack", source_type="channel",
+                     source_user_id=user, team_id=team_id,
+                     account_id=glink.get("ownerAccountId"),
+                     command="group_member_add", outcome="ok")
+
+
+def _handle_slack_group_member_remove(team_id: str, channel: str, user: str, text: str, thread_ts: Optional[str]) -> None:
+    ws_id = _slack_workspace_id(team_id, channel)
+    glink = group_acl.get_group_link("slack", ws_id)
+    if not glink:
+        _slack_post(team_id, channel,
+            "先に「DeepNote 接続」でチャンネルを接続してください。", thread_ts)
+        return
+    me = group_acl.get_member("slack", ws_id, user)
+    if not me or me.get("role") != "owner":
+        _slack_post(team_id, channel,
+            "メンバー削除は owner ロールのみ実行できます。", thread_ts)
+        return
+    target = _extract_slack_user_mention(text)
+    if not target:
+        _slack_post(team_id, channel, "対象ユーザーを @メンション で指定してください。", thread_ts)
+        return
+    if target == user:
+        _slack_post(team_id, channel,
+            "自分自身を owner から外すことはできません。先に「DeepNote 切断」をご検討ください。", thread_ts)
+        return
+    if group_acl.remove_member("slack", ws_id, target):
+        _slack_post(team_id, channel, f"✅ <@{target}> のロールを解除しました。", thread_ts)
+    else:
+        _slack_post(team_id, channel, "対象メンバーは登録されていません。", thread_ts)
+    bot_audit.record(provider="slack", source_type="channel",
+                     source_user_id=user, team_id=team_id,
+                     account_id=glink.get("ownerAccountId"),
+                     command="group_member_remove", outcome="ok")
+
+
 def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
     channel = event.get("channel")
     channel_type = event.get("channel_type")
@@ -437,36 +643,54 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
                 outcome="blocked_private_in_group",
             )
             return
-        link = slack_link_tokens.get_link(team_id, user)
-        if not link:
-            slack_client.post_message(team_id=team_id, channel=channel,
-                                      text=M.GROUP_NOT_SUPPORTED, thread_ts=thread_ts)
-            bot_audit.record(
-                provider="slack", source_type=channel_type or "unknown",
-                source_user_id=user, team_id=team_id, command=cmd,
-                outcome="blocked_unsupported_source",
-            )
+
+        # Phase 1 admin commands (connect / disconnect / status / member ops).
+        # Connect / status / disconnect / member-* bypass the ACL gate.
+        if cmd == "group_connect":
+            _handle_slack_group_connect(team_id, channel, user, thread_ts)
             return
-        ws_key = f"slack:{team_id}"
-        # Phase 0 — channel ACL not implemented yet. Block every command
-        # that would consume the linked user's DeepNote credits while
-        # we design the requester / data_owner / billing_owner split
-        # (see docs/release-units/2026-05-07-bot-group-acl-PLAN.md).
-        PAID_GROUP_ACTIONS = {"assistant_qna"}
-        if cmd in PAID_GROUP_ACTIONS:
-            slack_client.post_message(
-                team_id=team_id, channel=channel, thread_ts=thread_ts,
-                text=("この操作は DeepNote のクレジットを消費するため、現在 Slack チャンネル"
-                      "ではご利用いただけません。\nDeepNote bot との DM で直接お試しください。\n"
-                      "(チャンネルでの管理者権限制御は近日実装予定です。)"),
-            )
+        if cmd == "group_status":
+            _handle_slack_group_status(team_id, channel, user, thread_ts)
+            return
+        if cmd == "group_disconnect":
+            _handle_slack_group_disconnect(team_id, channel, user, thread_ts)
+            return
+        if cmd == "group_member_add":
+            _handle_slack_group_member_add(team_id, channel, user, text, thread_ts)
+            return
+        if cmd == "group_member_remove":
+            _handle_slack_group_member_remove(team_id, channel, user, text, thread_ts)
+            return
+
+        link = slack_link_tokens.get_link(team_id, user)
+        ws_id = _slack_workspace_id(team_id, channel)
+        ctx = group_acl.resolve_group_execution_context(
+            provider="slack", workspace_id=ws_id,
+            source_user_id=user, intent=cmd,
+        )
+        if isinstance(ctx, group_acl.RequireGroupConnect):
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=ctx.connect_hint, thread_ts=thread_ts)
             bot_audit.record(
                 provider="slack", source_type=channel_type or "unknown",
                 source_user_id=user, team_id=team_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
-                command=cmd, outcome="blocked_paid_in_group_phase0",
+                account_id=(link or {}).get("accountId"),
+                command=cmd, outcome=ctx.audit_outcome,
             )
             return
+        if isinstance(ctx, group_acl.Denied):
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=ctx.reason, thread_ts=thread_ts)
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id,
+                account_id=(link or {}).get("accountId"),
+                command=cmd, outcome=ctx.audit_outcome,
+            )
+            return
+        data_account_id = ctx.data_owner_account_id
+        data_uid = ctx.data_owner_deepnote_uid
+        ws_key = f"slack:{team_id}"
         # 「自動共有」 (Lv4) is retired for safety.
         if cmd == "auto_share_deprecated":
             slack_client.post_message(team_id=team_id, channel=channel,
@@ -474,7 +698,7 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
             bot_audit.record(
                 provider="slack", source_type=channel_type or "unknown",
                 source_user_id=user, team_id=team_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                account_id=data_account_id, deepnote_uid=data_uid,
                 command=cmd, outcome="auto_share_deprecated",
             )
             return
@@ -487,14 +711,51 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
             bot_audit.record(
                 provider="slack", source_type=channel_type or "unknown",
                 source_user_id=user, team_id=team_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                account_id=data_account_id, deepnote_uid=data_uid,
                 command=cmd, outcome="redirect_to_dm",
+            )
+            return
+        # Paid action: route to assistant_hub charging billing_owner.
+        if cmd == "assistant_qna":
+            q = (text or "").strip()
+            for prefix in ("質問:", "質問：", "質問", "ask "):
+                if q.startswith(prefix):
+                    q = q[len(prefix):].strip()
+                    break
+            # bot mention will leave a leading "<@Uxxx> " — strip that too
+            q = _strip_app_mentions(q)
+            if not q:
+                slack_client.post_message(team_id=team_id, channel=channel,
+                    text="質問を入力してください。例: 「決定事項は？」「TODO は？」",
+                    thread_ts=thread_ts)
+                return
+            try:
+                import asyncio
+                from app.services import assistant_hub
+                result = asyncio.run(assistant_hub.handle_message(
+                    account_id=ctx.billing_owner_account_id,
+                    owner_uid=ctx.billing_owner_deepnote_uid,
+                    question=q, session_id=None, mode="session",
+                    channel="slack", idempotency_key=None,
+                ))
+                answer = result.get("answer") or "回答を生成できませんでした。"
+            except Exception as _e:
+                logger.warning("[slack.qna.group] hub call failed: %s", _e)
+                answer = "Assistant へのリクエストに失敗しました。少し時間をおいて再度お試しください。"
+            slack_client.post_message(team_id=team_id, channel=channel,
+                                      text=answer, thread_ts=thread_ts)
+            bot_audit.record(
+                provider="slack", source_type=channel_type or "unknown",
+                source_user_id=user, team_id=team_id,
+                account_id=ctx.billing_owner_account_id,
+                deepnote_uid=ctx.billing_owner_deepnote_uid,
+                command=cmd, outcome="ok_paid",
             )
             return
 
         def _no_data_text() -> str:
             try:
-                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                latest = group_shared_briefing.get_latest_any_session(data_account_id)
                 if latest and latest.get("title"):
                     return M.GROUP_NO_SHARED_DATA_WITH_HINT.format(title=latest["title"][:40])
             except Exception:
@@ -503,7 +764,7 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
 
         def _send_proactive_share_offer() -> bool:
             try:
-                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                latest = group_shared_briefing.get_latest_any_session(data_account_id)
                 if not latest or not latest.get("id"):
                     return False
                 blocks = slack_client.build_share_confirm_blocks(
@@ -528,7 +789,7 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         sent_blocks = False
         if cmd == "decisions":
             decisions = group_shared_briefing.get_recent_shared_decisions(
-                link["accountId"], ws_key, limit=3
+                data_account_id, ws_key, limit=3
             )
             if decisions:
                 reply_text = _format_decisions(decisions)
@@ -536,7 +797,7 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
                 sent_blocks = _send_proactive_share_offer()
                 reply_text = "" if sent_blocks else _no_data_text()
         elif cmd in ("latest", "help"):
-            shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
+            shared = group_shared_briefing.get_latest_shared_session(data_account_id, ws_key)
             if shared:
                 reply_text = _format_latest(shared)
             else:
@@ -550,7 +811,7 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         bot_audit.record(
             provider="slack", source_type=channel_type or "unknown",
             source_user_id=user, team_id=team_id,
-            account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+            account_id=data_account_id, deepnote_uid=data_uid,
             command=cmd,
             outcome="ok_shared_only" if "共有" not in reply_text else "no_shared_data",
         )

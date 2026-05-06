@@ -30,6 +30,7 @@ from app.services import line_briefing
 from app.services import asset_delivery
 from app.services import bot_audit
 from app.services import group_shared_briefing
+from app.services import group_acl
 
 logger = logging.getLogger("app.routes.integrations.line")
 
@@ -280,6 +281,20 @@ def _classify_command(text: str) -> str:
         return "assistant_qna"
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
+    # Phase 1 group ACL commands. Require an explicit DeepNote/Clow
+    # mention so that bare 「接続」「切断」 in group chatter doesn't
+    # accidentally trigger admin operations.
+    has_bot = any(k in t for k in ("deepnote", "ディープノート", "clow", "クロウ"))
+    if has_bot and any(k in t for k in ("接続", "connect", "リンク", "link")):
+        return "group_connect"
+    if has_bot and any(k in t for k in ("切断", "解除", "disconnect", "unlink")):
+        return "group_disconnect"
+    if has_bot and any(k in t for k in ("メンバー追加", "管理者追加", "promote", "member add", "admin add")):
+        return "group_member_add"
+    if has_bot and any(k in t for k in ("メンバー削除", "管理者削除", "demote", "member remove", "admin remove")):
+        return "group_member_remove"
+    if has_bot and any(k in t for k in ("状態", "ステータス", "status")):
+        return "group_status"
     # Auto-share toggle (group-only command). We accept several
     # phrasings so users don't have to remember the exact wording.
     if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
@@ -398,6 +413,211 @@ def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str 
     return M.UNKNOWN_COMMAND
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Phase 1 group ACL command handlers (LINE)
+# ──────────────────────────────────────────────────────────────────────
+
+def _handle_group_connect(reply_token: str, group_id: str, line_user_id: str, _user_text: str) -> None:
+    """`DeepNote 接続` — register the speaker as the group's data /
+    billing owner. Speaker must already be DM-linked so we know which
+    DeepNote account to use."""
+    requester = line_link_tokens.get_link(line_user_id)
+    if not requester:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "DeepNote と LINE の連携が必要です。\n"
+            "個人チャットで DeepNote と連携した後、もう一度このグループで「DeepNote 接続」と送ってください。"
+        )])
+        bot_audit.record(
+            provider="line", source_type="group", source_user_id=line_user_id,
+            command="group_connect", outcome="requester_not_linked",
+        )
+        return
+    existing = group_acl.get_group_link("line", group_id)
+    if existing:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "このグループは既に DeepNote と接続されています。\n"
+            "「DeepNote 状態」で現在の設定を確認できます。"
+        )])
+        bot_audit.record(
+            provider="line", source_type="group", source_user_id=line_user_id,
+            account_id=existing.get("ownerAccountId"),
+            command="group_connect", outcome="already_connected",
+        )
+        return
+    try:
+        group_acl.create_group_link(
+            "line", group_id,
+            owner_deepnote_uid=requester.get("deepnoteUid", ""),
+            owner_account_id=requester["accountId"],
+            created_by_source_user_id=line_user_id,
+        )
+    except Exception as e:
+        logger.warning("[line.group_connect] create_link failed: %s", e)
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "グループ接続に失敗しました。少し時間をおいてから再度お試しください。"
+        )])
+        return
+    limits = group_acl.daily_limits()
+    line_messaging.reply(reply_token, [line_messaging.text_message(
+        "✅ DeepNote をこのグループに接続しました。\n"
+        f"・代表アカウント: {requester['accountId'][:8]}…\n"
+        f"・1日の利用上限: {limits['max_runs']} 回 (うち AI 質問は {limits['max_paid_runs']} 回まで)\n"
+        "・他のメンバーは「最新」「決定事項」など読み取り操作のみ可能です\n"
+        "・AI 質問はオーナー / 管理者のみ実行できます\n"
+        "「DeepNote メンバー追加 <LINEユーザーID>」で管理者を追加できます。"
+    )])
+    bot_audit.record(
+        provider="line", source_type="group", source_user_id=line_user_id,
+        account_id=requester["accountId"], deepnote_uid=requester.get("deepnoteUid"),
+        command="group_connect", outcome="ok",
+    )
+
+
+def _handle_group_status(reply_token: str, group_id: str, line_user_id: str) -> None:
+    glink = group_acl.get_group_link("line", group_id)
+    if not glink:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "このグループはまだ DeepNote と接続されていません。\n"
+            "「DeepNote 接続」と送って代表アカウントを登録してください。"
+        )])
+        return
+    member = group_acl.get_member("line", group_id, line_user_id)
+    role = (member or {}).get("role", "未登録")
+    members = group_acl.list_members("line", group_id, limit=20)
+    owner_count = sum(1 for m in members if m.get("role") == "owner")
+    admin_count = sum(1 for m in members if m.get("role") == "admin")
+    member_count = sum(1 for m in members if m.get("role") == "member")
+    limits = group_acl.daily_limits()
+    line_messaging.reply(reply_token, [line_messaging.text_message(
+        "📋 DeepNote 接続状態\n"
+        f"・代表アカウント: {glink.get('ownerAccountId', '')[:8]}…\n"
+        f"・あなたのロール: {role}\n"
+        f"・メンバー数: owner {owner_count} / admin {admin_count} / member {member_count}\n"
+        f"・1日の利用上限: {limits['max_runs']} 回 / AI 質問 {limits['max_paid_runs']} 回\n"
+        f"・1人当たり上限: {limits['max_runs_per_user']} 回"
+    )])
+    bot_audit.record(
+        provider="line", source_type="group", source_user_id=line_user_id,
+        account_id=glink.get("ownerAccountId"),
+        command="group_status", outcome="ok",
+    )
+
+
+def _handle_group_disconnect(reply_token: str, group_id: str, line_user_id: str) -> None:
+    glink = group_acl.get_group_link("line", group_id)
+    if not glink:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "このグループは接続されていません。"
+        )])
+        return
+    member = group_acl.get_member("line", group_id, line_user_id)
+    if not member or member.get("role") != "owner":
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "切断は owner ロールのみ実行できます。"
+        )])
+        bot_audit.record(
+            provider="line", source_type="group", source_user_id=line_user_id,
+            account_id=glink.get("ownerAccountId"),
+            command="group_disconnect", outcome="blocked_not_owner",
+        )
+        return
+    group_acl.deactivate_group_link("line", group_id)
+    line_messaging.reply(reply_token, [line_messaging.text_message(
+        "✅ DeepNote とこのグループの接続を解除しました。\n"
+        "再度接続したい場合は「DeepNote 接続」と送ってください。"
+    )])
+    bot_audit.record(
+        provider="line", source_type="group", source_user_id=line_user_id,
+        account_id=glink.get("ownerAccountId"),
+        command="group_disconnect", outcome="ok",
+    )
+
+
+def _extract_target_line_user_id(text: str) -> Optional[str]:
+    """Pick out a LINE user id (Uxxxxx... 33 chars) from the message text."""
+    import re
+    m = re.search(r"\b(U[0-9a-f]{32})\b", text or "")
+    return m.group(1) if m else None
+
+
+def _handle_group_member_add(reply_token: str, group_id: str, line_user_id: str, user_text: str) -> None:
+    glink = group_acl.get_group_link("line", group_id)
+    if not glink:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "先に「DeepNote 接続」でグループを接続してください。"
+        )])
+        return
+    me = group_acl.get_member("line", group_id, line_user_id)
+    if not me or me.get("role") != "owner":
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "メンバー追加は owner ロールのみ実行できます。"
+        )])
+        return
+    target = _extract_target_line_user_id(user_text)
+    if not target:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象の LINE ユーザー ID を指定してください。\n"
+            "例: 「DeepNote メンバー追加 U1234567890abcdef…」\n"
+            "(LINE ユーザー ID は対象者の DeepNote 連携画面で確認できます)"
+        )])
+        return
+    target_link = line_link_tokens.get_link(target)
+    group_acl.set_member_role(
+        "line", group_id, target,
+        role="admin",
+        deepnote_uid=(target_link or {}).get("deepnoteUid"),
+        added_by=line_user_id,
+    )
+    line_messaging.reply(reply_token, [line_messaging.text_message(
+        f"✅ {target[:8]}… を admin として追加しました。\n"
+        "admin は AI 質問などクレジットを消費する操作も実行できます。"
+    )])
+    bot_audit.record(
+        provider="line", source_type="group", source_user_id=line_user_id,
+        account_id=glink.get("ownerAccountId"),
+        command="group_member_add", outcome="ok",
+    )
+
+
+def _handle_group_member_remove(reply_token: str, group_id: str, line_user_id: str, user_text: str) -> None:
+    glink = group_acl.get_group_link("line", group_id)
+    if not glink:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "先に「DeepNote 接続」でグループを接続してください。"
+        )])
+        return
+    me = group_acl.get_member("line", group_id, line_user_id)
+    if not me or me.get("role") != "owner":
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "メンバー削除は owner ロールのみ実行できます。"
+        )])
+        return
+    target = _extract_target_line_user_id(user_text)
+    if not target:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象の LINE ユーザー ID を指定してください。"
+        )])
+        return
+    if target == line_user_id:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "自分自身を owner から外すことはできません。先に「DeepNote 切断」をご検討ください。"
+        )])
+        return
+    if group_acl.remove_member("line", group_id, target):
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            f"✅ {target[:8]}… のロールを解除しました。"
+        )])
+    else:
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象メンバーは登録されていません。"
+        )])
+    bot_audit.record(
+        provider="line", source_type="group", source_user_id=line_user_id,
+        account_id=glink.get("ownerAccountId"),
+        command="group_member_remove", outcome="ok",
+    )
+
+
 def _handle_message_event(event: Dict[str, Any]) -> None:
     source = event.get("source") or {}
     source_type = source.get("type")
@@ -486,43 +706,65 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
                 command=cmd, outcome="blocked_private_in_group",
             )
             return
-        if not link:
-            line_messaging.reply(reply_token, [line_messaging.text_message(M.GROUP_NOT_SUPPORTED)])
-            bot_audit.record(
-                provider="line", source_type=source_type,
-                source_user_id=line_user_id, command=cmd,
-                outcome="blocked_unsupported_source",
-            )
+
+        # Phase 1 admin commands (connect / disconnect / status / member ops).
+        # Connect needs a personally-linked requester but bypasses the
+        # ACL gate because the group has no link yet.
+        if cmd == "group_connect":
+            _handle_group_connect(reply_token, group_id, line_user_id, user_text)
             return
-        ws_key = f"line:{group_id}"
-        # Phase 0 — group ACL not implemented yet. Block every command
-        # that would consume the linked user's DeepNote credits while
-        # we design the proper requester / data_owner / billing_owner
-        # split (see docs/release-units/2026-05-07-bot-group-acl-PLAN.md).
-        # Read-only commands (latest / decisions / pdf-link / help / etc.)
-        # remain available because they don't fire LLM credits.
-        PAID_GROUP_ACTIONS = {"assistant_qna"}
-        if cmd in PAID_GROUP_ACTIONS:
-            line_messaging.reply(reply_token, [line_messaging.text_message(
-                "この操作は DeepNote のクレジットを消費するため、現在 LINE グループでは"
-                "ご利用いただけません。\n"
-                "個人チャットで DeepNote と直接やり取りしてお試しください。\n"
-                "(グループでの管理者権限制御は近日実装予定です。)"
-            )])
+        if cmd == "group_status":
+            _handle_group_status(reply_token, group_id, line_user_id)
+            return
+        if cmd == "group_disconnect":
+            _handle_group_disconnect(reply_token, group_id, line_user_id)
+            return
+        if cmd == "group_member_add":
+            _handle_group_member_add(reply_token, group_id, line_user_id, user_text)
+            return
+        if cmd == "group_member_remove":
+            _handle_group_member_remove(reply_token, group_id, line_user_id, user_text)
+            return
+
+        # Phase 1 — every other command goes through the group ACL gate.
+        # The gate decides: connect required? private blocked? paid
+        # admin-only? daily cap hit? On success it returns the
+        # data_owner / billing_owner UID + accountId pair the rest of
+        # this branch must use (NOT the requester's link).
+        ctx = group_acl.resolve_group_execution_context(
+            provider="line", workspace_id=group_id,
+            source_user_id=line_user_id, intent=cmd,
+        )
+        if isinstance(ctx, group_acl.RequireGroupConnect):
+            line_messaging.reply(reply_token, [line_messaging.text_message(ctx.connect_hint)])
             bot_audit.record(
                 provider="line", source_type=source_type,
                 source_user_id=line_user_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
-                command=cmd, outcome="blocked_paid_in_group_phase0",
+                account_id=(link or {}).get("accountId"),
+                command=cmd, outcome=ctx.audit_outcome,
             )
             return
+        if isinstance(ctx, group_acl.Denied):
+            line_messaging.reply(reply_token, [line_messaging.text_message(ctx.reason)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=(link or {}).get("accountId"),
+                command=cmd, outcome=ctx.audit_outcome,
+            )
+            return
+        # ctx is now an ExecutionContext.
+        data_account_id = ctx.data_owner_account_id
+        data_uid = ctx.data_owner_deepnote_uid
+        ws_key = f"line:{group_id}"
+
         # 「自動共有」 (Lv4) is retired for safety. Show the migration notice.
         if cmd == "auto_share_deprecated":
             line_messaging.reply(reply_token, [line_messaging.text_message(M.AUTO_SHARE_DEPRECATED)])
             bot_audit.record(
                 provider="line", source_type=source_type,
                 source_user_id=line_user_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                account_id=data_account_id, deepnote_uid=data_uid,
                 command=cmd, outcome="auto_share_deprecated",
             )
             return
@@ -534,8 +776,44 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             bot_audit.record(
                 provider="line", source_type=source_type,
                 source_user_id=line_user_id,
-                account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+                account_id=data_account_id, deepnote_uid=data_uid,
                 command=cmd, outcome="redirect_to_dm",
+            )
+            return
+        # Paid action: route to assistant_hub charging billing_owner
+        # (Phase 1 = data_owner). The hub doesn't accept the trio yet,
+        # so we pass billing_owner as the account / uid pair — that's
+        # the correct cost_guard target.
+        if cmd == "assistant_qna":
+            q = (user_text or "").strip()
+            for prefix in ("質問:", "質問：", "質問", "ask "):
+                if q.startswith(prefix):
+                    q = q[len(prefix):].strip()
+                    break
+            if not q:
+                line_messaging.reply(reply_token, [line_messaging.text_message(
+                    "質問を入力してください。例: 「決定事項は？」「TODO は？」")])
+                return
+            try:
+                import asyncio
+                from app.services import assistant_hub
+                result = asyncio.run(assistant_hub.handle_message(
+                    account_id=ctx.billing_owner_account_id,
+                    owner_uid=ctx.billing_owner_deepnote_uid,
+                    question=q, session_id=None, mode="session",
+                    channel="line", idempotency_key=None,
+                ))
+                answer = result.get("answer") or "回答を生成できませんでした。"
+            except Exception as _e:
+                logger.warning("[line.qna.group] hub call failed: %s", _e)
+                answer = "Assistant へのリクエストに失敗しました。少し時間をおいて再度お試しください。"
+            line_messaging.reply(reply_token, [line_messaging.text_message(answer)])
+            bot_audit.record(
+                provider="line", source_type=source_type,
+                source_user_id=line_user_id,
+                account_id=ctx.billing_owner_account_id,
+                deepnote_uid=ctx.billing_owner_deepnote_uid,
+                command=cmd, outcome="ok_paid",
             )
             return
 
@@ -545,7 +823,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         # meeting?"), so they can finish the share without leaving LINE.
         def _send_proactive_share_offer_or_text() -> bool:
             try:
-                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                latest = group_shared_briefing.get_latest_any_session(data_account_id)
                 if not latest or not latest.get("id"):
                     return False
                 from urllib.parse import urlencode as _qs
@@ -566,7 +844,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
 
         def _no_data_text() -> str:
             try:
-                latest = group_shared_briefing.get_latest_any_session(link["accountId"])
+                latest = group_shared_briefing.get_latest_any_session(data_account_id)
                 if latest and latest.get("title"):
                     return M.GROUP_NO_SHARED_DATA_WITH_HINT.format(title=latest["title"][:40])
             except Exception:
@@ -575,7 +853,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
 
         if cmd == "decisions":
             decisions = group_shared_briefing.get_recent_shared_decisions(
-                link["accountId"], ws_key, limit=3
+                data_account_id, ws_key, limit=3
             )
             if decisions:
                 text = _format_decisions(decisions)
@@ -585,7 +863,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
                     line_messaging.reply(reply_token, [line_messaging.text_message(_no_data_text())])
                 text = M.GROUP_NO_SHARED_DATA
         elif cmd == "latest" or cmd == "help":
-            shared = group_shared_briefing.get_latest_shared_session(link["accountId"], ws_key)
+            shared = group_shared_briefing.get_latest_shared_session(data_account_id, ws_key)
             if shared:
                 text = _format_latest(shared)
                 line_messaging.reply(reply_token, [line_messaging.text_message(text)])
@@ -599,7 +877,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         bot_audit.record(
             provider="line", source_type=source_type,
             source_user_id=line_user_id,
-            account_id=link["accountId"], deepnote_uid=link.get("deepnoteUid"),
+            account_id=data_account_id, deepnote_uid=data_uid,
             command=cmd,
             outcome="ok_shared_only" if "共有" not in text else "no_shared_data",
         )
