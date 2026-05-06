@@ -249,6 +249,113 @@ async def alias_reactions_get(
         return {"sessionId": session_id, "reactions": []}
 
 
+@router.put("/sessions/{session_id}/reactions", include_in_schema=False)
+async def alias_reactions_put(
+    session_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """iOS APIClient.swift writes ``PUT /sessions/{id}/reactions`` (plural).
+    Canonical handler is ``PUT /sessions/{id}/reaction`` (singular). Forward
+    the JSON body so the user's emoji actually persists instead of 404'ing.
+    """
+    from app.routes.reactions import set_reaction, SetReactionRequest
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    try:
+        req = SetReactionRequest(**(payload if isinstance(payload, dict) else {}))
+    except Exception:
+        req = SetReactionRequest(emoji=None)
+    return await set_reaction(session_id, req, current_user)
+
+
+# /accounts/merges (REST plural) → /accounts/merge:start (RPC colon).
+# iOS APIClient.swift posts to "accounts/merges" / "accounts/merges/{id}:commit".
+@router.post("/accounts/merges", include_in_schema=False)
+async def alias_accounts_merges_start(
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+):
+    from app.routes.account import start_merge, MergeStartRequest
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        req = MergeStartRequest(**payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid MergeStartRequest body")
+    return start_merge(req, user=user)
+
+
+@router.post("/accounts/merges/{merge_id}:commit", include_in_schema=False)
+async def alias_accounts_merges_commit(
+    merge_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """iOS embeds the mergeJobId in the path; canonical endpoint expects
+    ``{"mergeJobId": ...}`` in the body. Re-shape and delegate."""
+    from app.routes.account import commit_merge, MergeCommitRequest
+    return commit_merge(MergeCommitRequest(mergeJobId=merge_id), user=user)
+
+
+# /accounts/migrations (REST plural) → /account/migrate (RPC singular).
+@router.post("/accounts/migrations", include_in_schema=False)
+async def alias_accounts_migrations(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """The canonical handler declares ``new_uid: str = Depends(...)`` but
+    that dependency actually yields a ``CurrentUser`` — passing the bare
+    object into Firestore ``.document()`` would fail at runtime. We
+    extract ``.uid`` here so the migration query keys correctly while
+    leaving the canonical signature alone.
+    """
+    from app.routes.account import migrate, MigrateReq
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        req = MigrateReq(**payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid MigrateReq body")
+    return migrate(req, new_uid=current_user.uid)
+
+
+# /sessions/search → /search/sessions. iOS appends q/mode/tag/from_date/to_date/limit
+# query parameters; we forward them by re-invoking the canonical handler with
+# the same query string.
+@router.get("/sessions/search", include_in_schema=False)
+async def alias_sessions_search(
+    request: Request,
+    q: Optional[str] = None,
+    mode: Optional[str] = None,
+    tag: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    limit: int = 20,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    from app.routes.search import search_sessions
+    return await search_sessions(
+        request=request,
+        q=q,
+        mode=mode,
+        tag=tag,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
+        current_user=current_user,
+    )
+
+
 # /sessions/{id}/organization — not implemented server-side. Return an
 # empty-but-valid shape so iOS treats it as "no organization linked" and
 # proceeds with the rest of the sync.
