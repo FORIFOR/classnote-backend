@@ -56,7 +56,13 @@ def _is_blocked_exception(exc: Exception) -> bool:
          renames in ``youtube_transcript_api`` without code changes.
     """
     name = type(exc).__name__
-    if name in ("RequestBlocked", "IpBlocked", "VideoUnplayable"):
+    if name in (
+        "RequestBlocked", "IpBlocked", "VideoUnplayable",
+        # urllib3 / requests redirect-loop into Google's anti-bot
+        # /sorry/index page when the egress IP is rate-limited.
+        "RetryError", "MaxRetryError", "ResponseError",
+        "TooManyRedirects",
+    ):
         return True
     if RequestBlocked is not None and isinstance(exc, RequestBlocked):
         return True
@@ -72,6 +78,14 @@ def _is_blocked_exception(exc: Exception) -> bool:
             "IpBlocked",
             "RequestBlocked",
             "Could not retrieve a transcript",
+            # Redirect / 429 CAPTCHA wall (Google's /sorry/index page is the
+            # explicit anti-bot challenge — every fetch landing there is a
+            # block from YouTube's side, no matter which exception class
+            # the underlying http stack chose to raise.)
+            "/sorry/index",
+            "too many 429",
+            "429 error responses",
+            "Max retries exceeded",
         )
         for m in markers:
             if m in text:
