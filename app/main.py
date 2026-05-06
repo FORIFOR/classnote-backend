@@ -323,6 +323,9 @@ app.include_router(admin.router, tags=["Admin"])
 from app.routes import dashboard_public
 app.include_router(dashboard_public.router, tags=["Dashboard Public"])
 app.include_router(ops.router, tags=["Ops"])  # Deployment safety & presence
+# DeepNote Assistant Hub (Phase A): POST /v1/assistant/messages
+from app.routes import assistant as _assistant
+app.include_router(_assistant.router)
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)
