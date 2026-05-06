@@ -6128,6 +6128,30 @@ async def get_summary_v2(
     derived_snap = derived_ref.get()
 
     if not derived_snap.exists:
+        # Phase B fallback: when summary_v2 was never explicitly
+        # generated (it requires an explicit ``:generate`` call) but
+        # the regular summary pipeline already finished, synthesise
+        # a SummaryV2-shaped response from the session doc so clients
+        # don't poll forever waiting for a job that will never run.
+        if (data or {}).get("summaryStatus") == "completed":
+            md = (data or {}).get("summaryMarkdown") or (data or {}).get("topicSummary") or ""
+            if md:
+                try:
+                    synth = SummaryV2(
+                        version=1,
+                        generatedAt=(data or {}).get("summaryUpdatedAt"),
+                        renderedMarkdown=md,
+                        items=[],
+                    )
+                except Exception:
+                    synth = None
+                if synth is not None:
+                    return SummaryV2Response(
+                        status="ready",
+                        summary=synth,
+                        jobId=None,
+                        updatedAt=(data or {}).get("summaryUpdatedAt"),
+                    )
         return SummaryV2Response(
             status="pending",
             summary=None,
