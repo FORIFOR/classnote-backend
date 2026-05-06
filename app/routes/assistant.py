@@ -330,6 +330,65 @@ async def post_action(
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
+    if t == "email":
+        provider = (payload.get("provider") or "google").lower()
+        to = payload.get("to") or []
+        subject = payload.get("subject") or ""
+        body_text = payload.get("bodyText") or ""
+        body_html = payload.get("bodyHtml")
+        cc = payload.get("cc") or None
+        bcc = payload.get("bcc") or None
+        if not to:
+            raise HTTPException(status_code=400, detail="payload.to is required")
+        try:
+            if provider == "google":
+                from app.services.integrations import google_client
+                res = google_client.send_gmail_message(
+                    uid=current_user.uid, to=to, subject=subject,
+                    body_text=body_text, cc=cc, bcc=bcc, body_html=body_html,
+                )
+                return {"action": "email", "provider": "google", "result": res}
+            if provider == "microsoft":
+                from app.services.integrations import microsoft_client
+                res = microsoft_client.send_mail(
+                    uid=current_user.uid, to=to, subject=subject,
+                    body_text=body_text, cc=cc, bcc=bcc, body_html=body_html,
+                )
+                return {"action": "email", "provider": "microsoft", "result": res}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"email_send_failed: {e}")
+        raise HTTPException(status_code=400, detail=f"unsupported email provider: {provider}")
+
+    if t == "calendar_event":
+        provider = (payload.get("provider") or "google").lower()
+        summary = payload.get("summary") or payload.get("subject") or ""
+        start = payload.get("start") or ""
+        end = payload.get("end") or ""
+        attendees = payload.get("attendees") or None
+        location = payload.get("location") or None
+        description = payload.get("description") or payload.get("bodyText") or None
+        if not summary or not start or not end:
+            raise HTTPException(status_code=400, detail="summary/start/end are required")
+        try:
+            if provider == "google":
+                from app.services.integrations import google_client
+                res = google_client.create_calendar_event(
+                    uid=current_user.uid, summary=summary, start=start, end=end,
+                    description=description, attendees=attendees, location=location,
+                )
+                return {"action": "calendar_event", "provider": "google", "result": res}
+            if provider == "microsoft":
+                from app.services.integrations import microsoft_client
+                res = microsoft_client.create_calendar_event(
+                    uid=current_user.uid, subject=summary, start=start, end=end,
+                    body_text=description, attendees=attendees, location=location,
+                    timezone_name=payload.get("timezone") or "Asia/Tokyo",
+                )
+                return {"action": "calendar_event", "provider": "microsoft", "result": res}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"calendar_create_failed: {e}")
+        raise HTTPException(status_code=400, detail=f"unsupported calendar provider: {provider}")
+
     if t == "export":
         # Hand off to the existing exports pipeline rather than re-implementing
         # the work here. We just enqueue and return the job id; the export

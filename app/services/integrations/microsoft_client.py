@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -131,6 +131,35 @@ def _ensure_access_token(uid: str) -> str:
     return refreshed["access_token"]
 
 
+def _api_post(uid: str, url: str, *, json_body: Optional[Dict[str, Any]] = None,
+              params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """POST with auto-refresh-on-401. Used by Outlook send + Calendar create."""
+    token = _ensure_access_token(uid)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, params=params or {}, json=json_body or {}, headers=headers, timeout=20)
+    if resp.status_code == 401:
+        bundle = integ_store.get_decrypted_tokens(uid, PROVIDER) or {}
+        if bundle.get("refreshToken"):
+            refreshed = refresh_access_token(bundle["refreshToken"])
+            integ_store.update_access_token(
+                uid=uid, provider=PROVIDER,
+                access_token=refreshed["access_token"],
+                expires_in=refreshed.get("expires_in"),
+                scope=refreshed.get("scope"),
+            )
+            headers["Authorization"] = f"Bearer {refreshed['access_token']}"
+            resp = requests.post(url, params=params or {}, json=json_body or {}, headers=headers, timeout=20)
+    if resp.status_code not in (200, 201, 202, 204):
+        integ_store.mark_error(uid, PROVIDER, f"POST {url} -> {resp.status_code}: {resp.text[:200]}")
+        raise MicrosoftApiError(resp.status_code, resp.text)
+    if not resp.content:
+        return {}
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
 def _api_get(uid: str, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     token = _ensure_access_token(uid)
     resp = requests.get(url, params=params or {}, headers={"Authorization": f"Bearer {token}"}, timeout=15)
@@ -207,3 +236,67 @@ def get_mail_message(uid: str, message_id: str) -> Dict[str, Any]:
     return _api_get(uid, f"{GRAPH_BASE}/me/messages/{message_id}", params={
         "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,bodyPreview,isRead,webLink",
     })
+
+
+# --- Phase E: Outlook send + Calendar create -----------------------------
+
+def send_mail(
+    uid: str,
+    *,
+    to: List[str],
+    subject: str,
+    body_text: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    body_html: Optional[str] = None,
+    save_to_sent_items: bool = True,
+) -> Dict[str, Any]:
+    """Send via Microsoft Graph (``POST /me/sendMail``). Requires
+    ``Mail.Send`` scope."""
+    if not to:
+        raise MicrosoftApiError(400, "to is required")
+    body = {
+        "contentType": "HTML" if body_html else "Text",
+        "content": body_html or (body_text or ""),
+    }
+    msg: Dict[str, Any] = {
+        "subject": subject or "(no subject)",
+        "body": body,
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to if a],
+    }
+    if cc:
+        msg["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc if a]
+    if bcc:
+        msg["bccRecipients"] = [{"emailAddress": {"address": a}} for a in bcc if a]
+    payload = {"message": msg, "saveToSentItems": bool(save_to_sent_items)}
+    return _api_post(uid, f"{GRAPH_BASE}/me/sendMail", json_body=payload)
+
+
+def create_calendar_event(
+    uid: str,
+    *,
+    subject: str,
+    start: str,                # ISO 8601 e.g. "2026-05-06T10:00:00"
+    end: str,
+    timezone_name: str = "Asia/Tokyo",
+    body_text: Optional[str] = None,
+    attendees: Optional[List[str]] = None,
+    location: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a calendar event via Microsoft Graph
+    (``POST /me/events``). Requires ``Calendars.ReadWrite`` scope."""
+    body: Dict[str, Any] = {
+        "subject": subject,
+        "start": {"dateTime": start, "timeZone": timezone_name},
+        "end": {"dateTime": end, "timeZone": timezone_name},
+    }
+    if body_text:
+        body["body"] = {"contentType": "Text", "content": body_text}
+    if location:
+        body["location"] = {"displayName": location}
+    if attendees:
+        body["attendees"] = [
+            {"emailAddress": {"address": a}, "type": "required"}
+            for a in attendees if a
+        ]
+    return _api_post(uid, f"{GRAPH_BASE}/me/events", json_body=body)

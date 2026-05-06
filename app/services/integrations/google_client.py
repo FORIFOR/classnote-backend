@@ -125,6 +125,38 @@ def _ensure_access_token(uid: str) -> str:
     return refreshed["access_token"]
 
 
+def _api_post(uid: str, url: str, *, json_body: Optional[Dict[str, Any]] = None,
+              params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Same auto-refresh-on-401 pattern as ``_api_get`` but for POST.
+    Used by Gmail send / Calendar create. Returns parsed JSON body
+    (may be empty for some endpoints — caller decides what to do).
+    """
+    token = _ensure_access_token(uid)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, params=params or {}, json=json_body or {}, headers=headers, timeout=20)
+    if resp.status_code == 401:
+        bundle = integ_store.get_decrypted_tokens(uid, PROVIDER) or {}
+        if bundle.get("refreshToken"):
+            refreshed = refresh_access_token(bundle["refreshToken"])
+            integ_store.update_access_token(
+                uid=uid, provider=PROVIDER,
+                access_token=refreshed["access_token"],
+                expires_in=refreshed.get("expires_in"),
+                scope=refreshed.get("scope"),
+            )
+            headers["Authorization"] = f"Bearer {refreshed['access_token']}"
+            resp = requests.post(url, params=params or {}, json=json_body or {}, headers=headers, timeout=20)
+    if resp.status_code not in (200, 201, 202, 204):
+        integ_store.mark_error(uid, PROVIDER, f"POST {url} -> {resp.status_code}: {resp.text[:200]}")
+        raise GoogleApiError(resp.status_code, resp.text)
+    if not resp.content:
+        return {}
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
 def _api_get(uid: str, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     token = _ensure_access_token(uid)
     resp = requests.get(url, params=params or {}, headers={"Authorization": f"Bearer {token}"}, timeout=15)
@@ -201,3 +233,78 @@ def get_gmail_message(uid: str, message_id: str, *, format: str = "metadata") ->
     if format == "metadata":
         params["metadataHeaders"] = ["From", "To", "Subject", "Date"]
     return _api_get(uid, f"{GMAIL_BASE}/messages/{message_id}", params=params)
+
+
+# --- Phase E: Gmail send + Calendar create -------------------------------
+
+def send_gmail_message(
+    uid: str,
+    *,
+    to: List[str],
+    subject: str,
+    body_text: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    from_alias: Optional[str] = None,
+    body_html: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send a plain-text (or html) email via the Gmail API.
+    Requires OAuth scope ``https://www.googleapis.com/auth/gmail.send``.
+    """
+    import base64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    if not to:
+        raise GoogleApiError(400, "to is required")
+
+    if body_html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body_text or "", "plain", "utf-8")
+
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc)
+    msg["Subject"] = subject or "(no subject)"
+    if from_alias:
+        msg["From"] = from_alias
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+    return _api_post(uid, f"{GMAIL_BASE}/messages/send", json_body={"raw": raw})
+
+
+def create_calendar_event(
+    uid: str,
+    *,
+    calendar_id: str = "primary",
+    summary: str,
+    start: str,           # RFC3339 e.g. "2026-05-06T10:00:00+09:00"
+    end: str,
+    description: Optional[str] = None,
+    attendees: Optional[List[str]] = None,
+    location: Optional[str] = None,
+    send_updates: str = "none",  # "all" | "externalOnly" | "none"
+) -> Dict[str, Any]:
+    """Insert a calendar event. Requires scope
+    ``https://www.googleapis.com/auth/calendar.events``.
+    """
+    body: Dict[str, Any] = {
+        "summary": summary,
+        "start": {"dateTime": start},
+        "end": {"dateTime": end},
+    }
+    if description:
+        body["description"] = description
+    if location:
+        body["location"] = location
+    if attendees:
+        body["attendees"] = [{"email": a} for a in attendees if a]
+    return _api_post(
+        uid, f"{CAL_BASE}/calendars/{calendar_id}/events",
+        json_body=body, params={"sendUpdates": send_updates},
+    )
