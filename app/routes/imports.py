@@ -36,6 +36,15 @@ except ImportError:
 async def check_youtube_transcript(req: YouTubeCheckRequest):
     """
     [vNext] Verifies if a YouTube video has available transcripts before import.
+
+    The pre-flight check MUST go through the same Webshare proxy as the
+    actual fetch. Cloud Run egress IPs are on YouTube's anti-bot block-
+    list, so a direct ``YouTubeTranscriptApi.list_transcripts`` call
+    raises RequestBlocked / VideoUnplayable and we used to return
+    ``available=False`` — which made the desktop client refuse to start
+    the import even when the video really did have captions. Routing
+    the listing call through the same proxy + retry path keeps the
+    pre-flight check honest.
     """
     if not YT_TRANSCRIPT_AVAILABLE:
         raise HTTPException(status_code=503, detail="youtube-transcript-api is not installed")
@@ -45,34 +54,62 @@ async def check_youtube_transcript(req: YouTubeCheckRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    try:
-        # Utilizing the library to list available transcripts
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        tracks = []
-        for t in transcript_list:
-            tracks.append(YouTubeTrack(
-                language=t.language,
-                language_code=t.language_code,
-                is_generated=t.is_generated,
-                is_translatable=t.is_translatable
-            ))
-            
-        return YouTubeCheckResponse(
-            videoId=video_id,
-            available=len(tracks) > 0,
-            tracks=tracks
-        )
+    from app.services.youtube import _build_proxy_config, _is_blocked_exception
+    import time as _time
+    import random as _random
 
-    except TranscriptsDisabled:
-        return YouTubeCheckResponse(videoId=video_id, available=False, reason="transcripts_disabled")
-    except NoTranscriptFound:
-        return YouTubeCheckResponse(videoId=video_id, available=False, reason="no_transcript")
-    except VideoUnavailable:
-        return YouTubeCheckResponse(videoId=video_id, available=False, reason="video_unavailable")
-    except Exception as e:
-        logger.error(f"Unexpected error checking YouTube video {video_id}: {e}")
-        return YouTubeCheckResponse(videoId=video_id, available=False, reason="internal_error")
+    MAX_ATTEMPTS = 4
+    BACKOFF = (1.0, 2.5, 5.0)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+                # Legacy classmethod (<1.0). No proxy support upstream.
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            else:
+                proxy_config = _build_proxy_config()
+                if proxy_config is not None:
+                    logger.info(
+                        f"Using proxy for YouTube list_transcripts "
+                        f"(video={video_id} attempt={attempt}/{MAX_ATTEMPTS})"
+                    )
+                ytt = YouTubeTranscriptApi(proxy_config=proxy_config) if proxy_config is not None else YouTubeTranscriptApi()
+                transcript_list = ytt.list(video_id)
+
+            tracks = []
+            for t in transcript_list:
+                tracks.append(YouTubeTrack(
+                    language=t.language,
+                    language_code=t.language_code,
+                    is_generated=t.is_generated,
+                    is_translatable=t.is_translatable
+                ))
+            return YouTubeCheckResponse(
+                videoId=video_id,
+                available=len(tracks) > 0,
+                tracks=tracks
+            )
+        except TranscriptsDisabled:
+            return YouTubeCheckResponse(videoId=video_id, available=False, reason="transcripts_disabled")
+        except NoTranscriptFound:
+            return YouTubeCheckResponse(videoId=video_id, available=False, reason="no_transcript")
+        except VideoUnavailable:
+            return YouTubeCheckResponse(videoId=video_id, available=False, reason="video_unavailable")
+        except Exception as e:
+            if _is_blocked_exception(e) and attempt < MAX_ATTEMPTS:
+                wait = BACKOFF[min(attempt - 1, len(BACKOFF) - 1)] * _random.uniform(0.8, 1.2)
+                logger.warning(
+                    f"YouTube blocked check attempt {attempt}/{MAX_ATTEMPTS} for {video_id}; "
+                    f"retrying in {wait:.1f}s with a fresh proxy IP"
+                )
+                _time.sleep(wait)
+                continue
+            logger.error(f"Unexpected error checking YouTube video {video_id}: {e}")
+            return YouTubeCheckResponse(
+                videoId=video_id,
+                available=False,
+                reason="proxy_blocked" if _is_blocked_exception(e) else "internal_error",
+            )
+    return YouTubeCheckResponse(videoId=video_id, available=False, reason="proxy_blocked")
 
 
 
