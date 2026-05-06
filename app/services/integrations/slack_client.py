@@ -37,6 +37,10 @@ DEFAULT_SCOPES = ",".join([
     "im:read",
     "im:write",
     "users:read",
+    # Phase B: PDF upload via files.getUploadURLExternal /
+    # files.completeUploadExternal so DeepNote can attach exported
+    # meeting minutes PDFs directly to a Slack channel / DM.
+    "files:write",
 ])
 
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID")
@@ -195,3 +199,97 @@ def post_message(*, team_id: str, channel: str, text: str, thread_ts: Optional[s
     body = resp.json()
     if not body.get("ok"):
         logger.warning("[slack] post_message error=%s", body.get("error"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# files.uploadV2 — attach PDF directly into a channel / DM
+# ──────────────────────────────────────────────────────────────────────
+
+def upload_file(
+    *,
+    team_id: str,
+    channel: str,
+    file_bytes: bytes,
+    filename: str,
+    title: Optional[str] = None,
+    initial_comment: Optional[str] = None,
+) -> bool:
+    """Upload an arbitrary file (typically a PDF) to ``channel`` (channel
+    id or user id for DM) via the V2 flow:
+
+      1. files.getUploadURLExternal → upload_url + file_id
+      2. POST raw bytes to upload_url
+      3. files.completeUploadExternal → share into the target channel
+
+    Returns True on success. Soft-fails (logs + returns False) on any
+    error so the caller can fall back to a URL-only message.
+    """
+    if not channel or not file_bytes:
+        return False
+    bot_token = get_bot_token(team_id)
+    if not bot_token:
+        logger.warning("[slack] no bot token for team=%s; cannot upload file", team_id)
+        return False
+
+    headers = {"Authorization": f"Bearer {bot_token}"}
+
+    # Step 1: get upload URL
+    try:
+        r1 = requests.get(
+            "https://slack.com/api/files.getUploadURLExternal",
+            params={"filename": filename, "length": str(len(file_bytes))},
+            headers=headers,
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning("[slack] files.getUploadURLExternal request failed: %s", e)
+        return False
+    if r1.status_code != 200 or not r1.json().get("ok"):
+        logger.warning("[slack] files.getUploadURLExternal failed: %s", r1.text[:300])
+        return False
+    body1 = r1.json()
+    upload_url = body1.get("upload_url")
+    file_id = body1.get("file_id")
+    if not upload_url or not file_id:
+        logger.warning("[slack] files.getUploadURLExternal missing fields: %s", body1)
+        return False
+
+    # Step 2: upload bytes
+    try:
+        r2 = requests.post(upload_url, data=file_bytes, timeout=60)
+    except Exception as e:
+        logger.warning("[slack] upload_url POST failed: %s", e)
+        return False
+    if r2.status_code not in (200, 201, 204):
+        logger.warning("[slack] upload_url returned %s: %s", r2.status_code, r2.text[:200])
+        return False
+
+    # Step 3: complete + share to channel
+    files_meta = [{"id": file_id}]
+    if title:
+        files_meta[0]["title"] = title
+    payload: Dict[str, Any] = {
+        "files": files_meta,
+        "channel_id": channel,
+    }
+    if initial_comment:
+        payload["initial_comment"] = initial_comment[:1500]
+    try:
+        r3 = requests.post(
+            "https://slack.com/api/files.completeUploadExternal",
+            json=payload,
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning("[slack] files.completeUploadExternal request failed: %s", e)
+        return False
+    if r3.status_code != 200:
+        logger.warning("[slack] files.completeUploadExternal http=%s body=%s",
+                       r3.status_code, r3.text[:300])
+        return False
+    body3 = r3.json()
+    if not body3.get("ok"):
+        logger.warning("[slack] files.completeUploadExternal error=%s", body3.get("error"))
+        return False
+    return True

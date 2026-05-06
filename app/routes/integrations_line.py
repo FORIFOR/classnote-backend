@@ -266,6 +266,11 @@ def _classify_command(text: str) -> str:
     if not text:
         return "help"
     t = text.strip().lower()
+    # Q&A passthrough — anything that ends with "?" / "？" or starts with
+    # 「質問」 is forwarded to the Assistant Hub so the user gets the
+    # same grounded answers in chat as on iOS / Desktop.
+    if t.endswith("?") or t.endswith("？") or t.startswith("質問") or t.startswith("ask "):
+        return "assistant_qna"
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
     # Auto-share toggle (group-only command). We accept several
@@ -304,11 +309,32 @@ def _classify_command(text: str) -> str:
     return "unknown"
 
 
-def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "") -> str:
+def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "", raw_text: str = "") -> str:
     if command == "help":
         return M.HELP + "\n\n" + M.SMART_SHARE_HELP
     if command == "auto_share_deprecated":
         return M.AUTO_SHARE_DEPRECATED
+    if command == "assistant_qna":
+        # Strip leading 「質問」 / "ask" so the hub sees the actual question.
+        q = raw_text.strip()
+        for prefix in ("質問:", "質問：", "質問", "ask "):
+            if q.startswith(prefix):
+                q = q[len(prefix):].strip()
+                break
+        if not q:
+            return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
+        try:
+            import asyncio
+            from app.services import assistant_hub
+            result = asyncio.run(assistant_hub.handle_message(
+                account_id=account_id, owner_uid=line_user_id, question=q,
+                session_id=None, mode="session", channel="line",
+                idempotency_key=None,
+            ))
+            return result.get("answer") or "回答を生成できませんでした。"
+        except Exception as _e:
+            logger.warning("[line.qna] hub call failed: %s", _e)
+            return "Assistant へのリクエストに失敗しました。少し時間をおいて再度お試しください。"
     if command in ("notify_on", "notify_off", "notify_status"):
         from app.services import bot_smart_share
         if command == "notify_on":
@@ -485,7 +511,7 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         return
 
     command = _classify_command(user_text)
-    text = _build_reply_for_linked(link["accountId"], command, line_user_id=line_user_id)
+    text = _build_reply_for_linked(link["accountId"], command, line_user_id=line_user_id, raw_text=user_text or "")
     line_messaging.reply(reply_token, [line_messaging.text_message(text)])
     bot_audit.record(
         provider="line", source_type="user",

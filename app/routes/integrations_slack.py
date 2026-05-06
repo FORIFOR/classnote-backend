@@ -249,6 +249,9 @@ def _classify_command(text: str) -> str:
     if not text:
         return "help"
     t = text.strip().lower()
+    # Forward any "?" / 「質問」 / "ask" to the Assistant Hub.
+    if t.endswith("?") or t.endswith("？") or t.startswith("質問") or t.startswith("ask "):
+        return "assistant_qna"
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
     if "自動共有" in t or "auto share" in t or "auto-share" in t or "autoshare" in t:
@@ -285,11 +288,31 @@ def _classify_command(text: str) -> str:
     return "unknown"
 
 
-def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str = "") -> str:
+def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str = "", raw_text: str = "") -> str:
     if command == "help":
         return M.HELP + "\n\n" + M.SMART_SHARE_HELP
     if command == "auto_share_deprecated":
         return M.AUTO_SHARE_DEPRECATED
+    if command == "assistant_qna":
+        q = (raw_text or "").strip()
+        for prefix in ("質問:", "質問：", "質問", "ask "):
+            if q.startswith(prefix):
+                q = q[len(prefix):].strip()
+                break
+        if not q:
+            return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
+        try:
+            import asyncio
+            from app.services import assistant_hub
+            result = asyncio.run(assistant_hub.handle_message(
+                account_id=account_id, owner_uid=slack_user_id, question=q,
+                session_id=None, mode="session", channel="slack",
+                idempotency_key=None,
+            ))
+            return result.get("answer") or "回答を生成できませんでした。"
+        except Exception as _e:
+            logger.warning("[slack.qna] hub call failed: %s", _e)
+            return "Assistant へのリクエストに失敗しました。少し時間をおいて再度お試しください。"
     if command in ("notify_on", "notify_off", "notify_status"):
         from app.services import bot_smart_share
         if command == "notify_on":
@@ -475,7 +498,43 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
         return
 
     command = _classify_command(_strip_app_mentions(text))
-    reply = _build_reply_for_linked(link["accountId"], command, slack_user_id=user)
+
+    # Phase B: ``pdf`` in Slack DM uploads the PDF directly into the
+    # conversation via files.uploadV2. We fall back to the URL-only
+    # text reply if upload fails (no token, files:write missing, etc.).
+    if command == "pdf":
+        try:
+            bundle = asset_delivery.get_latest_export_links(link["accountId"])
+        except Exception:
+            bundle = None
+        if bundle and (bundle.get("links") or {}).get("pdf"):
+            pdf_url = bundle["links"]["pdf"]
+            title = bundle.get("title") or "DeepNote 議事録"
+            try:
+                import requests as _rq
+                rr = _rq.get(pdf_url, timeout=30)
+                if rr.status_code == 200 and rr.content:
+                    ok = slack_client.upload_file(
+                        team_id=team_id, channel=channel,
+                        file_bytes=rr.content,
+                        filename=f"{title[:60]}.pdf",
+                        title=title,
+                        initial_comment=f"📄 最新会議「{title}」の PDF を添付します",
+                    )
+                    if ok:
+                        bot_audit.record(
+                            provider="slack", source_type="im",
+                            source_user_id=user, team_id=team_id,
+                            account_id=link.get("accountId"),
+                            deepnote_uid=link.get("deepnoteUid"),
+                            command=command, outcome="ok_pdf_attached",
+                        )
+                        return
+            except Exception as _e:
+                logger.warning("[slack.pdf] direct attach failed, falling back to URL: %s", _e)
+        # fall-through → URL reply
+
+    reply = _build_reply_for_linked(link["accountId"], command, slack_user_id=user, raw_text=text or "")
     slack_client.post_message(team_id=team_id, channel=channel, text=reply)
     bot_audit.record(
         provider="slack", source_type="im",

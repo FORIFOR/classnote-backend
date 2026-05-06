@@ -326,6 +326,10 @@ app.include_router(ops.router, tags=["Ops"])  # Deployment safety & presence
 # DeepNote Assistant Hub (Phase A): POST /v1/assistant/messages
 from app.routes import assistant as _assistant
 app.include_router(_assistant.router)
+# Scheduled Tasks (Phase B): user-defined cron-style automations
+from app.routes import scheduled_tasks_routes as _st_routes
+app.include_router(_st_routes.router)
+app.include_router(_st_routes.internal_router, include_in_schema=False)
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)

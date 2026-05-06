@@ -112,13 +112,31 @@ async def handle_message(
         # Phase A; Phase D will introduce general mode handling.
         pass
 
-    qa = await assistant_qna.answer(
-        question=question,
-        session_id=resolved_session_id or "",
-        owner_account_id=account_id,
-    )
+    # Phase B: General mode is gated behind an env flag (off by default).
+    # Off → falls back to session mode automatically (no LLM call without
+    # a session context).
+    import os as _os
+    general_mode_allowed = _os.environ.get("ASSISTANT_GENERAL_MODE", "off").lower() == "on"
+    if mode == "general" and general_mode_allowed:
+        try:
+            from app.services import assistant_general as _ag
+            qa = await _ag.answer(question=question)
+        except Exception as _gerr:
+            logger.warning("[hub] general mode failed: %s", _gerr)
+            qa = {"intent": "ask_general_failed", "answer": "一般質問への回答に失敗しました。",
+                  "citations": [], "tokenUsage": {"prompt": 0, "completion": 0}}
+    else:
+        qa = await assistant_qna.answer(
+            question=question,
+            session_id=resolved_session_id or "",
+            owner_account_id=account_id,
+        )
 
     msg_id = f"msg_{uuid.uuid4().hex[:16]}"
+    # Phase B: conversation grouping. We default to one conversation per
+    # (account, channel, sessionId) so successive Q&A on the same meeting
+    # share a thread without the client needing to manage IDs.
+    conversation_id = f"conv_{(channel or 'default')}_{(resolved_session_id or 'no_session')}_{account_id[:8]}"
     record = {
         "accountId": account_id,
         "ownerUid": owner_uid,
@@ -127,6 +145,7 @@ async def handle_message(
         "answer": (qa.get("answer") or "")[:4000],
         "intent": qa.get("intent"),
         "sessionId": resolved_session_id,
+        "conversationId": conversation_id,
         "citations": qa.get("citations") or [],
         "tokenUsage": qa.get("tokenUsage") or {"prompt": 0, "completion": 0},
         "idempotencyKey": idempotency_key,
@@ -143,6 +162,31 @@ async def handle_message(
         "answer": qa.get("answer"),
         "citations": qa.get("citations") or [],
         "sessionId": resolved_session_id,
+        "conversationId": conversation_id,
         "tokenUsage": qa.get("tokenUsage") or {"prompt": 0, "completion": 0},
         "createdAt": record["createdAt"].isoformat(),
     }
+
+
+def list_conversation_messages(conversation_id: str, account_id: str, limit: int = 50) -> list:
+    """Return prior messages in a conversation. Phase B: simple
+    chronological list scoped to the caller's account.
+    """
+    if not conversation_id or not account_id:
+        return []
+    out = []
+    try:
+        q = (
+            db.collection(MESSAGES_COLLECTION)
+            .where("accountId", "==", account_id)
+            .where("conversationId", "==", conversation_id)
+            .limit(limit)
+        )
+        for s in q.stream():
+            d = s.to_dict() or {}
+            d["messageId"] = s.id
+            out.append(d)
+        out.sort(key=lambda r: r.get("createdAt") or _now())
+    except Exception as e:
+        logger.warning("[hub.list_conversation] failed: %s", e)
+    return out
