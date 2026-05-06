@@ -289,9 +289,15 @@ app.include_router(integrations_microsoft.oauth_router)
 # DeepNote Clow LINE bot (Phase 1: 1:1 only — webhook + connect HTML + link-token API)
 from app.routes import integrations_line
 app.include_router(integrations_line.router)
+# v1-prefixed alias so LINE Developer Console webhook URLs configured as
+# ``/v1/integrations/line/webhook`` also reach the same handlers. Without
+# this, deepnote-contracts canonical paths return 404 and the bot stops
+# replying entirely.
+app.include_router(integrations_line.router, prefix="/v1", include_in_schema=False)
 # DeepNote Clow Slack bot (Phase 1: 1:1 DM only — events + OAuth install + link-token API)
 from app.routes import integrations_slack
 app.include_router(integrations_slack.router)
+app.include_router(integrations_slack.router, prefix="/v1", include_in_schema=False)
 # DeepNote Clow scheduled digests (Phase 3 — Cloud Scheduler hits this internal route)
 from app.routes import digests as _digests
 app.include_router(_digests.router, include_in_schema=False)
