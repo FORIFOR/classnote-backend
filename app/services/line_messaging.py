@@ -75,6 +75,20 @@ def confirm_template_message(*, alt_text: str, prompt: str,
     }
 
 
+def flex_message(*, alt_text: str, contents: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap an arbitrary Flex bubble / carousel into the LINE message envelope.
+
+    Phase 1.5 picker / connect-confirm cards build their own ``contents``
+    JSON because the layouts are tailored (multi-row session picker, etc.)
+    rather than the symmetric two-button confirm template.
+    """
+    return {
+        "type": "flex",
+        "altText": (alt_text or "")[:400],
+        "contents": contents,
+    }
+
+
 def text_message(text: str) -> Dict[str, Any]:
     """Build a single text message body. LINE caps text at 5000 chars."""
     if text is None:

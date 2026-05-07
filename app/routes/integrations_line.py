@@ -417,10 +417,163 @@ def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str 
 # Phase 1 group ACL command handlers (LINE)
 # ──────────────────────────────────────────────────────────────────────
 
+def _build_session_picker_bubble(candidates: List[Dict[str, Any]],
+                                 *, group_id: str) -> Dict[str, Any]:
+    """Phase 1.5: Flex bubble listing 3–5 recent meetings the data_owner
+    can share into this group. Each row's button posts back
+    ``share_confirm`` with the chosen ``sid`` so the picker tap is the
+    explicit share consent.
+
+    The ``group_id`` is encoded in each button's postback ``dest`` so the
+    existing ``share_confirm`` handler (which re-validates session
+    ownership server-side) does not need to consult external state.
+    """
+    from urllib.parse import urlencode as _qs
+
+    rows: List[Dict[str, Any]] = []
+    for s in candidates[:5]:
+        sid = str(s.get("id") or "")
+        if not sid:
+            continue
+        title = (s.get("title") or "(無題)")[:40]
+        created = s.get("createdAt")
+        try:
+            date_str = created.strftime("%Y-%m-%d %H:%M") if created else ""
+        except Exception:
+            date_str = ""
+        post_data = "action=share_confirm&" + _qs({
+            "sid": sid, "dest": group_id, "attach": "0",
+        })
+        rows.append({
+            "type": "box", "layout": "vertical", "spacing": "xs",
+            "paddingAll": "sm",
+            "borderColor": "#E0E0E0", "borderWidth": "1px",
+            "cornerRadius": "md",
+            "contents": [
+                {"type": "text", "text": f"📝 {title}",
+                 "weight": "bold", "size": "sm", "wrap": True},
+                {"type": "text", "text": date_str or " ",
+                 "size": "xxs", "color": "#888888"},
+                {"type": "button", "style": "primary", "color": "#1A73E8",
+                 "height": "sm",
+                 "action": {
+                     "type": "postback",
+                     "label": "この会議を共有",
+                     "data": post_data[:300],
+                     "displayText": f"「{title}」を共有",
+                 }},
+            ],
+        })
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "共有する会議を選択",
+                 "weight": "bold", "size": "lg", "color": "#1A73E8"},
+                {"type": "text", "size": "xs", "color": "#888888", "wrap": True,
+                 "text": "選択した会議だけがグループに共有されます。要約・決定事項・資料リンクが他のメンバーから参照可能になります。"},
+            ],
+            "paddingAll": "md", "spacing": "xs",
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "md",
+            "contents": rows or [
+                {"type": "text", "size": "sm",
+                 "text": "共有可能な会議が見つかりません。"}
+            ],
+            "paddingAll": "lg",
+        },
+    }
+
+
+def _build_group_connect_confirm_card(*, account_id_short: str, max_runs: int,
+                                      max_paid: int, line_user_id: str) -> Dict[str, Any]:
+    """Phase 1.5: Flex bubble that *requires* the speaker to tap ✅
+    before the group binding is created. The card spells out the
+    consequences (session access + credit consumption + owner role)
+    so the speaker is making an informed decision."""
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "DeepNote 接続確認",
+                 "weight": "bold", "size": "lg", "color": "#1A73E8"},
+            ],
+            "paddingAll": "md",
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "wrap": True, "size": "sm",
+                 "text": (
+                     f"このグループを DeepNote アカウント "
+                     f"{account_id_short}… に接続します。"
+                 )},
+                {"type": "separator"},
+                {"type": "text", "weight": "bold", "size": "sm",
+                 "text": "⚠️ 接続後の影響"},
+                {"type": "text", "wrap": True, "size": "xs", "color": "#555555",
+                 "text": (
+                     "・このアカウントの 議事録（共有許可されたもの）が"
+                     "グループから参照されます\n"
+                     "・グループの AI 質問は このアカウントのクレジットを"
+                     "消費します\n"
+                     f"・1日 {max_runs} 回 / うち AI 質問 {max_paid} 回まで"
+                 )},
+                {"type": "separator"},
+                {"type": "text", "weight": "bold", "size": "sm",
+                 "text": "あなたが owner として登録されます"},
+                {"type": "text", "wrap": True, "size": "xs", "color": "#555555",
+                 "text": (
+                     "・admin / member の追加・削除を実行できます\n"
+                     "・AI 質問の実行とクレジット消費の責任を持ちます\n"
+                     "・「DeepNote 切断」でいつでも解除できます"
+                 )},
+            ],
+            "paddingAll": "lg",
+        },
+        "footer": {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {
+                     "type": "postback",
+                     "label": "キャンセル",
+                     "data": f"action=group_connect_cancel&u={line_user_id}",
+                     "displayText": "キャンセル",
+                 }},
+                {"type": "button", "style": "primary", "color": "#1A73E8", "height": "sm",
+                 "action": {
+                     "type": "postback",
+                     "label": "✅ 接続する",
+                     "data": f"action=group_connect_confirm&u={line_user_id}",
+                     "displayText": "接続する",
+                 }},
+            ],
+            "paddingAll": "md",
+        },
+    }
+
+
 def _handle_group_connect(reply_token: str, group_id: str, line_user_id: str, _user_text: str) -> None:
-    """`DeepNote 接続` — register the speaker as the group's data /
-    billing owner. Speaker must already be DM-linked so we know which
-    DeepNote account to use."""
+    """`DeepNote 接続` — Phase 1.5: send a confirm card; the actual
+    binding happens only when the requester taps ✅ (postback
+    ``action=group_connect_confirm``).
+
+    Pre-flight checks (DM-linked / already connected) still run here so
+    we can short-circuit and avoid showing a card that would lead to a
+    failed confirm. The card itself encodes the requester's
+    ``line_user_id`` so the postback handler can verify the same user is
+    pressing the button."""
     requester = line_link_tokens.get_link(line_user_id)
     if not requester:
         line_messaging.reply(reply_token, [line_messaging.text_message(
@@ -429,7 +582,7 @@ def _handle_group_connect(reply_token: str, group_id: str, line_user_id: str, _u
         )])
         bot_audit.record(
             provider="line", source_type="group", source_user_id=line_user_id,
-            command="group_connect", outcome="requester_not_linked",
+            command="group_connect_request", outcome="requester_not_linked",
         )
         return
     existing = group_acl.get_group_link("line", group_id)
@@ -441,35 +594,25 @@ def _handle_group_connect(reply_token: str, group_id: str, line_user_id: str, _u
         bot_audit.record(
             provider="line", source_type="group", source_user_id=line_user_id,
             account_id=existing.get("ownerAccountId"),
-            command="group_connect", outcome="already_connected",
+            command="group_connect_request", outcome="already_connected",
         )
         return
-    try:
-        group_acl.create_group_link(
-            "line", group_id,
-            owner_deepnote_uid=requester.get("deepnoteUid", ""),
-            owner_account_id=requester["accountId"],
-            created_by_source_user_id=line_user_id,
-        )
-    except Exception as e:
-        logger.warning("[line.group_connect] create_link failed: %s", e)
-        line_messaging.reply(reply_token, [line_messaging.text_message(
-            "グループ接続に失敗しました。少し時間をおいてから再度お試しください。"
-        )])
-        return
+
     limits = group_acl.daily_limits()
-    line_messaging.reply(reply_token, [line_messaging.text_message(
-        "✅ DeepNote をこのグループに接続しました。\n"
-        f"・代表アカウント: {requester['accountId'][:8]}…\n"
-        f"・1日の利用上限: {limits['max_runs']} 回 (うち AI 質問は {limits['max_paid_runs']} 回まで)\n"
-        "・他のメンバーは「最新」「決定事項」など読み取り操作のみ可能です\n"
-        "・AI 質問はオーナー / 管理者のみ実行できます\n"
-        "「DeepNote メンバー追加 <LINEユーザーID>」で管理者を追加できます。"
+    bubble = _build_group_connect_confirm_card(
+        account_id_short=requester["accountId"][:8],
+        max_runs=limits["max_runs"],
+        max_paid=limits["max_paid_runs"],
+        line_user_id=line_user_id,
+    )
+    line_messaging.reply(reply_token, [line_messaging.flex_message(
+        alt_text="DeepNote 接続確認 — このグループを連携しますか?",
+        contents=bubble,
     )])
     bot_audit.record(
         provider="line", source_type="group", source_user_id=line_user_id,
         account_id=requester["accountId"], deepnote_uid=requester.get("deepnoteUid"),
-        command="group_connect", outcome="ok",
+        command="group_connect_request", outcome="card_shown",
     )
 
 
@@ -817,32 +960,38 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
             )
             return
 
-        # Phase D+: when a group bot has nothing to show, proactively
-        # offer Smart Share Lv3 in-group. The user types 「最新」 and we
-        # respond with a confirm template ("Want to share your latest
-        # meeting?"), so they can finish the share without leaving LINE.
+        # Phase 1.5: when a group bot has nothing to show, surface a
+        # *picker* of recent 3-5 sessions (instead of auto-offering only
+        # the latest 1). The picker buttons each carry a share_confirm
+        # postback so the tap itself = explicit consent. The share
+        # handler re-validates session ownership at execution time.
         def _send_proactive_share_offer_or_text() -> bool:
             try:
-                latest = group_shared_briefing.get_latest_any_session(data_account_id)
-                if not latest or not latest.get("id"):
-                    return False
-                from urllib.parse import urlencode as _qs
-                yes_data = "action=share_confirm&" + _qs({"sid": latest["id"], "dest": group_id, "attach": "0"})
-                no_data = "action=share_cancel&sid=" + latest["id"]
-                title_short = (latest.get("title") or "(無題)")[:40]
-                msg = line_messaging.confirm_template_message(
-                    alt_text=f"会議「{title_short}」をこのグループに共有しますか？",
-                    prompt=f"会議「{title_short}」をこのグループに共有しますか？",
-                    yes_label="✅ 共有する", yes_data=yes_data,
-                    no_label="キャンセル",   no_data=no_data,
+                candidates = group_shared_briefing.get_recent_any_sessions(
+                    data_account_id, limit=5,
                 )
-                line_messaging.reply(reply_token, [msg])
+                if not candidates:
+                    return False
+                bubble = _build_session_picker_bubble(candidates, group_id=group_id)
+                line_messaging.reply(reply_token, [line_messaging.flex_message(
+                    alt_text="共有する会議を選んでください",
+                    contents=bubble,
+                )])
+                bot_audit.record(
+                    provider="line", source_type=source_type,
+                    source_user_id=line_user_id,
+                    account_id=data_account_id, deepnote_uid=data_uid,
+                    command="session_picker",
+                    outcome=f"shown_{len(candidates)}",
+                )
                 return True
             except Exception as _e:
-                logger.warning("[line.proactive] offer failed: %s", _e)
+                logger.warning("[line.picker] picker render failed: %s", _e)
                 return False
 
         def _no_data_text() -> str:
+            # Reused as the *fallback* string when the picker can't be
+            # rendered (e.g. no sessions at all on the data_owner side).
             try:
                 latest = group_shared_briefing.get_latest_any_session(data_account_id)
                 if latest and latest.get("title"):
@@ -922,16 +1071,25 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
 
 
 def _handle_postback_event(event: Dict[str, Any]) -> None:
-    """Handle Smart Share Lv3 confirmation postbacks.
+    """Handle confirmation postbacks.
 
-    Postback ``data`` is a query-string of the form
-        action=share_confirm&sid=<sessionId>&dest=<groupOrUserId>&attach=0|1
-    The button itself is rendered via a Flex / Template message that
-    integrations_line emits when iOS / Desktop calls
-    ``POST /v1/assistant/share:preview`` with channel="line".
+    Phase 1.5 actions added:
+      ``action=group_connect_confirm&u=<line_user_id>`` — finalise the
+        group binding (only after the speaker has tapped ✅ on the
+        confirm card emitted by ``DeepNote 接続``).
+      ``action=group_connect_cancel&u=<line_user_id>`` — abandon the
+        connect flow without writing anything.
+
+    Lv3 share actions (existing):
+      ``action=share_confirm&sid=<sessionId>&dest=<groupOrUserId>&attach=0|1``
+      ``action=share_cancel&sid=...``
+
+    The session picker (Phase 1.5) emits ``share_confirm`` directly so
+    the user's tap is the explicit consent — no intermediate step.
     """
     source = event.get("source") or {}
     line_user_id = source.get("userId")
+    group_id = source.get("groupId") or source.get("roomId")
     reply_token = event.get("replyToken")
     raw = (event.get("postback") or {}).get("data") or ""
     if not raw or not reply_token:
@@ -940,8 +1098,98 @@ def _handle_postback_event(event: Dict[str, Any]) -> None:
     parsed = parse_qs(raw)
     action = (parsed.get("action") or [""])[0]
 
+    # ── Phase 1.5: group connect confirmation ────────────────────────
+    if action in ("group_connect_confirm", "group_connect_cancel"):
+        intended_user = (parsed.get("u") or [""])[0]
+        # Verify the user pressing the button is the same one who
+        # originally typed ``DeepNote 接続`` — prevents random group
+        # members from registering the original speaker as owner.
+        if not line_user_id or not group_id:
+            return
+        if intended_user and intended_user != line_user_id:
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "この確認は接続を依頼した本人のみが操作できます。"
+            )])
+            bot_audit.record(
+                provider="line", source_type="postback",
+                source_user_id=line_user_id,
+                command="group_connect", outcome="confirm_user_mismatch",
+            )
+            return
+
+        if action == "group_connect_cancel":
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "接続をキャンセルしました。"
+            )])
+            bot_audit.record(
+                provider="line", source_type="postback",
+                source_user_id=line_user_id,
+                command="group_connect", outcome="cancelled",
+            )
+            return
+
+        # group_connect_confirm: re-run pre-flight before writing
+        requester = line_link_tokens.get_link(line_user_id)
+        if not requester:
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "DeepNote 連携が解除されたため接続できません。再度 DM で連携してから「DeepNote 接続」と送ってください。"
+            )])
+            bot_audit.record(
+                provider="line", source_type="postback",
+                source_user_id=line_user_id,
+                command="group_connect", outcome="requester_not_linked_at_confirm",
+            )
+            return
+        existing = group_acl.get_group_link("line", group_id)
+        if existing:
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "このグループは既に接続されています。"
+            )])
+            bot_audit.record(
+                provider="line", source_type="postback",
+                source_user_id=line_user_id,
+                account_id=existing.get("ownerAccountId"),
+                command="group_connect", outcome="already_connected_at_confirm",
+            )
+            return
+        try:
+            group_acl.create_group_link(
+                "line", group_id,
+                owner_deepnote_uid=requester.get("deepnoteUid", ""),
+                owner_account_id=requester["accountId"],
+                created_by_source_user_id=line_user_id,
+            )
+        except Exception as e:
+            logger.warning("[line.group_connect] confirm create_link failed: %s", e)
+            line_messaging.reply(reply_token, [line_messaging.text_message(
+                "グループ接続に失敗しました。少し時間をおいてから再度お試しください。"
+            )])
+            return
+        limits = group_acl.daily_limits()
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "✅ DeepNote をこのグループに接続しました。\n"
+            f"・代表アカウント: {requester['accountId'][:8]}…\n"
+            f"・1日の利用上限: {limits['max_runs']} 回 (うち AI 質問は {limits['max_paid_runs']} 回まで)\n"
+            "・他のメンバーは「最新」「決定事項」など読み取り操作のみ可能です\n"
+            "・AI 質問はオーナー / 管理者のみ実行できます\n"
+            "「DeepNote メンバー追加 <LINEユーザーID>」で管理者を追加できます。"
+        )])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id,
+            account_id=requester["accountId"],
+            deepnote_uid=requester.get("deepnoteUid"),
+            command="group_connect", outcome="ok",
+        )
+        return
+
     if action == "share_cancel":
         line_messaging.reply(reply_token, [line_messaging.text_message("キャンセルしました。")])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id or "",
+            command="share_confirm", outcome="cancelled",
+        )
         return
 
     if action != "share_confirm":
@@ -960,16 +1208,70 @@ def _handle_postback_event(event: Dict[str, Any]) -> None:
     if not link:
         line_messaging.reply(reply_token, [line_messaging.text_message(
             "DeepNote と LINE の連携が必要です。個人チャットでセットアップしてください。")])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id,
+            command="share_confirm", outcome="requester_not_linked",
+        )
         return
     try:
         snap = db.collection("sessions").document(sid).get()
         sd = snap.to_dict() if snap.exists else {}
     except Exception:
         sd = {}
-    if not sd or sd.get("ownerAccountId") != link.get("accountId"):
+    # Phase 1.5: tighten owner re-verification at execution time.
+    # Reject (a) missing session, (b) soft-deleted session, (c) session
+    # whose ``ownerAccountId`` does not match the requester's link, and
+    # (d) (when ``dest`` is a group) requester missing from the group
+    # ACL — they may have been removed between picker render and tap.
+    if not sd:
         line_messaging.reply(reply_token, [line_messaging.text_message(
-            "対象会議が見つからない、または共有権限がありません。")])
+            "対象会議が見つかりません。")])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id,
+            account_id=link.get("accountId"),
+            command="share_confirm", outcome="session_not_found",
+        )
         return
+    if sd.get("isDeleted") or sd.get("deletedAt"):
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象会議は既に削除されています。")])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id,
+            account_id=link.get("accountId"),
+            command="share_confirm", outcome="session_deleted",
+        )
+        return
+    if sd.get("ownerAccountId") != link.get("accountId"):
+        line_messaging.reply(reply_token, [line_messaging.text_message(
+            "対象会議の共有権限がありません。")])
+        bot_audit.record(
+            provider="line", source_type="postback",
+            source_user_id=line_user_id,
+            account_id=link.get("accountId"),
+            command="share_confirm", outcome="ownership_mismatch",
+        )
+        return
+    # If sharing into a group/room, require that the requester is on
+    # the ACL (auto-promoted to ``member`` on first sight by
+    # resolve_group_execution_context, so missing == they were
+    # explicitly removed by an owner).
+    if dest.startswith(("C", "G", "R")) and dest != line_user_id:
+        glink = group_acl.get_group_link("line", dest)
+        if glink:
+            member = group_acl.get_member("line", dest, line_user_id)
+            if not member:
+                line_messaging.reply(reply_token, [line_messaging.text_message(
+                    "このグループでの共有権限が解除されています。")])
+                bot_audit.record(
+                    provider="line", source_type="postback",
+                    source_user_id=line_user_id,
+                    account_id=link.get("accountId"),
+                    command="share_confirm", outcome="not_on_group_acl",
+                )
+                return
 
     title = sd.get("title") or "(無題)"
     lines = [f"📝 {title}"]
