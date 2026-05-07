@@ -272,6 +272,54 @@ def send_mail(
     return _api_post(uid, f"{GRAPH_BASE}/me/sendMail", json_body=payload)
 
 
+def create_outlook_draft(
+    uid: str,
+    *,
+    to: List[str],
+    subject: str,
+    body_text: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    body_html: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an Outlook draft via Microsoft Graph (``POST /me/messages``).
+    The created message is a draft until the user explicitly sends it
+    from Outlook. Requires ``Mail.ReadWrite`` scope.
+
+    Returns the message resource (includes ``id`` and ``webLink`` so the
+    caller can render an ``openUrl``).
+    """
+    if not to:
+        raise MicrosoftApiError(400, "to is required")
+    body = {
+        "contentType": "HTML" if body_html else "Text",
+        "content": body_html or (body_text or ""),
+    }
+    msg: Dict[str, Any] = {
+        "subject": subject or "(no subject)",
+        "body": body,
+        "toRecipients": [{"emailAddress": {"address": a}} for a in to if a],
+    }
+    if cc:
+        msg["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc if a]
+    if bcc:
+        msg["bccRecipients"] = [{"emailAddress": {"address": a}} for a in bcc if a]
+    return _api_post(uid, f"{GRAPH_BASE}/me/messages", json_body=msg)
+
+
+def delete_outlook_draft(uid: str, message_id: str) -> None:
+    """Delete an Outlook draft. Used by readiness probe."""
+    if not message_id:
+        return
+    import requests
+    token = _ensure_access_token(uid)
+    r = requests.delete(f"{GRAPH_BASE}/me/messages/{message_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=10)
+    if r.status_code >= 400 and r.status_code != 404:
+        raise MicrosoftApiError(r.status_code, r.text[:200])
+
+
 def create_calendar_event(
     uid: str,
     *,

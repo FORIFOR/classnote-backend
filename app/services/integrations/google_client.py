@@ -278,6 +278,72 @@ def send_gmail_message(
     return _api_post(uid, f"{GMAIL_BASE}/messages/send", json_body={"raw": raw})
 
 
+def create_gmail_draft(
+    uid: str,
+    *,
+    to: List[str],
+    subject: str,
+    body_text: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    from_alias: Optional[str] = None,
+    body_html: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a Gmail draft (NOT sent). Returns the draft resource.
+
+    The draft is created in the user's Gmail "Drafts" folder; the user
+    must explicitly press Send in Gmail to deliver. This is the
+    DeepNote V-041 default — auto-send is forbidden in this phase.
+
+    Requires OAuth scope ``https://www.googleapis.com/auth/gmail.compose``.
+    Response includes ``id`` (draft id) and ``message.id`` so the caller
+    can render an ``openUrl`` like ``https://mail.google.com/mail/u/0/#drafts``.
+    """
+    import base64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    if not to:
+        raise GoogleApiError(400, "to is required")
+
+    if body_html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body_text or "", "plain", "utf-8")
+
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc)
+    msg["Subject"] = subject or "(no subject)"
+    if from_alias:
+        msg["From"] = from_alias
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+    return _api_post(uid, f"{GMAIL_BASE}/drafts",
+                     json_body={"message": {"raw": raw}})
+
+
+def delete_gmail_draft(uid: str, draft_id: str) -> None:
+    """Delete a Gmail draft. Used by the readiness ``:test`` probe to
+    create-then-delete without leaving a stub draft in the user's
+    inbox."""
+    if not draft_id:
+        return
+    # Gmail uses DELETE — _api_post supports POST only, so call _api_get with
+    # a small request shim. Easiest: use _ensure_access_token + raw requests.
+    import requests
+    token = _ensure_access_token(uid)
+    r = requests.delete(f"{GMAIL_BASE}/drafts/{draft_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=10)
+    if r.status_code >= 400:
+        raise GoogleApiError(r.status_code, r.text[:200])
+
+
 def create_calendar_event(
     uid: str,
     *,
