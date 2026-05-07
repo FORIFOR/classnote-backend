@@ -112,6 +112,51 @@ def get_latest_any_session(account_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_recent_any_sessions(account_id: str, *, limit: int = 5) -> List[Dict[str, Any]]:
+    """Recent ``limit`` sessions of this account, regardless of share status.
+
+    Used by the in-group session picker (Phase 1.5) so the user can choose
+    *which* meeting to share rather than always defaulting to the latest.
+
+    Privacy: callers MUST only expose ``title`` / ``createdAt`` / ``id``
+    — NOT summary / transcript — so this list never leaks meeting content
+    into a workspace where it wasn't explicitly shared. Sessions still
+    require explicit user consent (postback) before any push.
+    """
+    if not account_id:
+        return []
+    try:
+        snaps = (
+            db.collection("sessions")
+            .where("ownerAccountId", "==", account_id)
+            .limit(40)  # over-fetch so the Python sort below is meaningful
+            .stream()
+        )
+        rows = []
+        for snap in snaps:
+            data = snap.to_dict() or {}
+            if data.get("isDeleted") or data.get("deletedAt"):
+                continue
+            rows.append((snap.id, data))
+        if not rows:
+            return []
+        rows.sort(
+            key=lambda kv: kv[1].get("createdAt") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        out = []
+        for sid, d in rows[: max(1, min(limit, 10))]:
+            out.append({
+                "id": sid,
+                "title": d.get("title") or "(無題)",
+                "createdAt": d.get("createdAt"),
+            })
+        return out
+    except Exception as e:
+        logger.warning("[group_shared] recent_any lookup failed: %s", e)
+        return []
+
+
 def get_recent_shared_decisions(account_id: str, workspace_key: str, *, limit: int = 3) -> List[str]:
     latest = get_latest_shared_session(account_id, workspace_key)
     if not latest:
