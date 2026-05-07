@@ -284,6 +284,9 @@ app.include_router(integrations_google.oauth_router)
 app.include_router(integrations_google.auth_alias_router)
 app.include_router(integrations_microsoft.router)
 app.include_router(integrations_microsoft.oauth_router)
+# V-041-B unified /v1/integrations surface (status / :test / :disconnect / mail/drafts / calendar/events)
+from app.routes import integrations_v1 as _integrations_v1
+app.include_router(_integrations_v1.router)
 # integrations_slack: module file missing from working tree.
 # Restore app/routes/integrations_slack.py + slack_client.py before re-enabling.
 # DeepNote Clow LINE bot (Phase 1: 1:1 only — webhook + connect HTML + link-token API)
