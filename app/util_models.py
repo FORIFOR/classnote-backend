@@ -482,7 +482,19 @@ class ShareResponse(BaseModel):
     sharedUserIds: List[str]
 
 class ShareLinkResponse(BaseModel):
+    """Share-link response with parallel URL alias keys (P0 #3).
+
+    iOS decodes the first key it finds out of a 12-候補 list, so the
+    server emits the canonical ``url`` plus the legacy aliases all
+    pointing at the same value. Add-only — never remove existing keys.
+    """
     url: str
+    shareUrl: Optional[str] = None
+    share_url: Optional[str] = None
+    shareLink: Optional[str] = None
+    share_link: Optional[str] = None
+    link: Optional[str] = None
+    publicUrl: Optional[str] = None
 
 class PublicUser(BaseModel):
     uid: str

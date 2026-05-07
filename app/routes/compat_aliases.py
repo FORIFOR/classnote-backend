@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from app.dependencies import CurrentUser, get_current_user
 from app.firebase import db
+from app.adapters.compat import log_legacy_api_called
 
 logger = logging.getLogger("app.routes.compat_aliases")
 
@@ -498,11 +499,28 @@ async def reconcile_session_cache(
 # can boot without 404 popups; real values come from /v1/app_config later.
 @router.get("/system/config", include_in_schema=False)
 async def alias_system_config(platform: Optional[str] = None):
+    """iOS AppConfig.swift Decodable requires ``status`` + ``generatedAt``.
+
+    P0 #2: omit the keys → cold-start decode error. We add them on top
+    of the existing legacy keys (add-only, never remove). ``status`` is
+    derived from the same SYSTEM_STATUS_MODE env that drives /system/status
+    so SRE can flip maintenance from a single switch.
+    """
+    import os
+    raw_mode = (os.environ.get("SYSTEM_STATUS_MODE") or "normal").strip().lower()
+    if raw_mode == "maintenance":
+        status = "maintenance"
+    elif raw_mode in ("degraded", "drain"):
+        status = "degraded"
+    else:
+        status = "ok"
     return {
         "platform": platform or "ios",
-        "maintenance": False,
+        "maintenance": status == "maintenance",
         "minSupportedVersion": "1.0",
         "features": {},
+        "status": status,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -521,7 +539,11 @@ async def alias_system_status(platform: Optional[str] = None):
     detail fields are also env-driven; unset → null in the response.
     """
     import os
-    valid_modes = {"normal", "notice", "degraded", "maintenance", "force_update"}
+    # P0 #2: include "drain" so SRE can signal iOS to back off scheduling
+    # work without redeploy. The OpenAPI hotfix spec lists the canonical
+    # set as {normal, degraded, drain, maintenance}; we keep server
+    # extensions {notice, force_update} for backwards compatibility.
+    valid_modes = {"normal", "notice", "degraded", "drain", "maintenance", "force_update"}
     mode = (os.environ.get("SYSTEM_STATUS_MODE") or "normal").strip().lower()
     if mode not in valid_modes:
         mode = "normal"
@@ -565,6 +587,68 @@ async def alias_system_status(platform: Optional[str] = None):
 async def alias_system_orb_theme():
     from app.routes.orb_theme import get_orb_theme
     return await get_orb_theme(uid=None, plan=None, current_user=None)
+
+
+# ---------------------------------------------------------------------------
+# P0 #4 — /users/me/delete{,/preflight,/status} slash-form aliases.
+#
+# Desktop calls the slash form; canonical (per spec) is the colon form
+# `/users/me:delete*`. We expose all 3 slash variants and delegate to
+# the canonical handler in `app/routes/users.py` so the response shape
+# is byte-identical. ``include_in_schema=False`` keeps OpenAPI clean.
+#
+# Sunset: 2026-12-31 (tracked by `removeNotBefore` in the legacy log).
+# ---------------------------------------------------------------------------
+
+_USERS_ME_DELETE_SUNSET = "2026-12-31"
+
+
+@router.post("/users/me/delete", include_in_schema=False, deprecated=True)
+async def alias_users_me_delete_slash(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    from app.routes.users import request_account_deletion as _canonical
+    log_legacy_api_called(
+        method="POST", path="/users/me/delete",
+        canonical_path="/users/me:delete",
+        headers=request.headers,
+        account_id=getattr(current_user, "account_id", None),
+        remove_not_before=_USERS_ME_DELETE_SUNSET,
+    )
+    return await _canonical(current_user=current_user)
+
+
+@router.get("/users/me/delete/preflight", include_in_schema=False, deprecated=True)
+async def alias_users_me_delete_preflight_slash(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    from app.routes.users import preflight_account_deletion as _canonical
+    log_legacy_api_called(
+        method="GET", path="/users/me/delete/preflight",
+        canonical_path="/users/me:delete/preflight",
+        headers=request.headers,
+        account_id=getattr(current_user, "account_id", None),
+        remove_not_before=_USERS_ME_DELETE_SUNSET,
+    )
+    return await _canonical(current_user=current_user)
+
+
+@router.get("/users/me/delete/status", include_in_schema=False, deprecated=True)
+async def alias_users_me_delete_status_slash(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    from app.routes.users import get_deletion_status as _canonical
+    log_legacy_api_called(
+        method="GET", path="/users/me/delete/status",
+        canonical_path="/users/me:delete/status",
+        headers=request.headers,
+        account_id=getattr(current_user, "account_id", None),
+        remove_not_before=_USERS_ME_DELETE_SUNSET,
+    )
+    return await _canonical(current_user=current_user)
 
 
 # /users/bootstrap — iOS app init call. Response shape MUST match

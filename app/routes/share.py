@@ -315,6 +315,19 @@ def _resolve_session_local(session_id: str):
     return doc_ref, snapshot # snapshot.exists will be False
 
 
+def _share_link_response_with_aliases(url: str) -> ShareLinkResponse:
+    """Build a ShareLinkResponse that emits the canonical ``url`` plus
+    every URL-equivalent alias key (P0 #3). iOS picks whichever it
+    decodes first; the server pre-fills them all so the client never
+    has to fall through the 12-候補 list."""
+    return ShareLinkResponse(
+        url=url,
+        shareUrl=url, share_url=url,
+        shareLink=url, share_link=url,
+        link=url, publicUrl=url,
+    )
+
+
 @router.api_route("/sessions/{session_id}/share_link", methods=["GET", "POST"], response_model=ShareLinkResponse)
 async def create_share_link(
     session_id: str,
@@ -343,21 +356,21 @@ async def create_share_link(
             # Found valid token! Use it.
             token = d.id
             url = f"{FRONTEND_BASE_URL}/s/{token}"
-            return ShareLinkResponse(url=url)
-    
+            return _share_link_response_with_aliases(url)
+
     # Generate New Token if no valid one found
     token = secrets.token_urlsafe(16)
     expires_at = now + timedelta(days=7)
-    
+
     db.collection("shareLinks").document(token).set({
         "sessionId": real_session_id,
         "ownerId": current_user.uid,
         "expiresAt": expires_at,
         "createdAt": firestore.SERVER_TIMESTAMP
     })
-    
+
     url = f"{FRONTEND_BASE_URL}/s/{token}"
-    return ShareLinkResponse(url=url)
+    return _share_link_response_with_aliases(url)
 
 @router.get("/share/{token}")
 async def resolve_share_link(token: str):
