@@ -30,10 +30,11 @@ Anything more complex falls through unchanged on the next tick.
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from google.cloud import firestore  # type: ignore
 
 from app.firebase import db
 
@@ -118,14 +119,28 @@ def _coll(account_id: str):
     return db.collection("accounts").document(account_id).collection("scheduled_tasks")
 
 
+class InvalidRRuleError(ValueError):
+    """Raised when an RRULE string is missing, syntactically invalid, or
+    cannot produce a future ``nextRunAt``. Routes translate this into
+    HTTP 400 with ``code=invalid_rrule``."""
+
+
 def create(account_id: str, *, body: Dict[str, Any]) -> Dict[str, Any]:
     if not account_id:
         raise ValueError("account_id required")
     rrule = body.get("rrule") or ""
     if not rrule:
-        raise ValueError("rrule required")
+        raise InvalidRRuleError("rrule required")
     tzname = body.get("timezone") or "Asia/Tokyo"
     next_run = compute_next_run(rrule, tzname=tzname)
+    if next_run is None:
+        # Strict validation (2026-05-08): we used to silently store the
+        # task with ``nextRunAt=None`` for unknown FREQ values; that
+        # turned every typo into a permanently-stuck task. Reject at
+        # create time instead so the client sees the failure.
+        raise InvalidRRuleError(
+            f"rrule could not be parsed into a next run time: {rrule!r}"
+        )
     task_id = body.get("taskId") or f"st_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc)
     doc = {
@@ -171,7 +186,14 @@ def update(account_id: str, task_id: str, patch: Dict[str, Any]) -> Optional[Dic
         cur = snap.to_dict() or {}
         rrule = upd.get("rrule") or cur.get("rrule") or ""
         tzname = upd.get("timezone") or cur.get("timezone") or "Asia/Tokyo"
-        upd["nextRunAt"] = compute_next_run(rrule, tzname=tzname)
+        if not rrule:
+            raise InvalidRRuleError("rrule required")
+        next_run = compute_next_run(rrule, tzname=tzname)
+        if next_run is None:
+            raise InvalidRRuleError(
+                f"rrule could not be parsed into a next run time: {rrule!r}"
+            )
+        upd["nextRunAt"] = next_run
     upd["updatedAt"] = datetime.now(timezone.utc)
     ref.update(upd)
     snap2 = ref.get()
@@ -190,10 +212,23 @@ def delete(account_id: str, task_id: str) -> bool:
 # Scheduler tick
 # ──────────────────────────────────────────────────────────────────────
 
+class SchedulerDueQueryError(RuntimeError):
+    """Raised when find_due cannot complete (typically a missing
+    Firestore composite index). Propagated to scheduler_tick which
+    surfaces it to the caller as ``errorCode=scheduler_due_query_failed``
+    so silent failure is impossible."""
+
+
 def find_due(now: Optional[datetime] = None, limit: int = 200) -> List[Tuple[str, Dict[str, Any]]]:
     """Return [(account_id, task_doc), ...] for every enabled task whose
     nextRunAt is <= now. Cross-account collection_group query keeps the
     tick endpoint a single read regardless of how many accounts exist.
+
+    Behaviour change (2026-05-08): exceptions are propagated as
+    :class:`SchedulerDueQueryError` instead of being swallowed and
+    returning ``[]``. The previous silent-fail mode let composite index
+    errors masquerade as ``due=0`` for days. The caller is responsible
+    for translating the exception into a structured response.
     """
     now = now or datetime.now(timezone.utc)
     out: List[Tuple[str, Dict[str, Any]]] = []
@@ -220,10 +255,18 @@ def find_due(now: Optional[datetime] = None, limit: int = 200) -> List[Tuple[str
                 out.append((account_id, d))
     except Exception as e:
         logger.warning("[scheduled_tasks.find_due] failed: %s", e)
+        raise SchedulerDueQueryError(str(e)) from e
     return out
 
 
-def mark_run(account_id: str, task_id: str, *, success: bool, message: str = "") -> None:
+def mark_run(account_id: str, task_id: str, *, success: bool, message: str = "",
+             run_slot: Optional[datetime] = None) -> None:
+    """Advance ``nextRunAt`` and record outcome of the run.
+
+    ``run_slot`` is the original due ``nextRunAt`` of this fire — stored
+    in ``lastRunSlot`` so a second tick with the same slot can detect
+    duplicate dispatch via ``notification_events.idempotencyKey``.
+    """
     ref = _coll(account_id).document(task_id)
     snap = ref.get()
     if not snap.exists:
@@ -237,10 +280,90 @@ def mark_run(account_id: str, task_id: str, *, success: bool, message: str = "")
         "lastRunAt": now,
         "nextRunAt": next_run,
         "updatedAt": now,
+        # Lease release: tick implementations always pair acquire/release.
+        "leaseUntil": None,
+        "runningJobId": None,
     }
+    if run_slot is not None:
+        upd["lastRunSlot"] = run_slot
     if success:
         upd["lastRunOutcome"] = "ok"
+        upd["lastError"] = None
     else:
         upd["lastRunOutcome"] = "failed"
-        upd["lastRunError"] = message[:500]
+        upd["lastError"] = {"message": message[:500], "at": now}
     ref.update(upd)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Lease acquisition (multi-tick idempotency)
+# ──────────────────────────────────────────────────────────────────────
+
+LEASE_TTL_SECONDS = 300  # 5 minutes — long enough to outlast a slow dispatch,
+                         # short enough that a crashed tick releases its tasks.
+
+
+def try_acquire_lease(account_id: str, task_id: str, *,
+                      run_slot: datetime, lease_holder_id: str) -> bool:
+    """Atomically claim the right to dispatch this task for ``run_slot``.
+
+    Returns True if the caller acquired the lease and should dispatch.
+    Returns False if another tick already claimed it (their lease is
+    still valid OR they already advanced ``lastRunSlot`` past this slot).
+
+    Implementation: a Firestore transactional read-then-write that
+    writes ``leaseUntil = now + LEASE_TTL_SECONDS`` and
+    ``runningJobId = lease_holder_id`` only if the prior lease has
+    expired AND ``lastRunSlot != run_slot``.
+    """
+    ref = _coll(account_id).document(task_id)
+    now = datetime.now(timezone.utc)
+    lease_until = now + timedelta(seconds=LEASE_TTL_SECONDS)
+
+    transaction = db.transaction()
+
+    @firestore.transactional  # type: ignore[attr-defined]
+    def _txn(tx) -> bool:
+        snap = ref.get(transaction=tx)
+        if not snap.exists:
+            return False
+        d = snap.to_dict() or {}
+        last_slot = d.get("lastRunSlot")
+        if last_slot is not None and last_slot == run_slot:
+            return False  # already dispatched this slot
+        existing_lease = d.get("leaseUntil")
+        if existing_lease is not None and existing_lease > now:
+            return False  # someone else holds the lease
+        tx.update(ref, {
+            "leaseUntil": lease_until,
+            "runningJobId": lease_holder_id,
+            "updatedAt": now,
+        })
+        return True
+
+    try:
+        return bool(_txn(transaction))
+    except Exception as e:
+        logger.warning("[scheduled_tasks.lease] tx failed task=%s: %s", task_id, e)
+        return False
+
+
+def release_lease(account_id: str, task_id: str) -> None:
+    """Clear lease fields (idempotent). Called on dispatch failure when
+    we don't want to advance ``lastRunSlot`` either."""
+    ref = _coll(account_id).document(task_id)
+    try:
+        ref.update({
+            "leaseUntil": None,
+            "runningJobId": None,
+            "updatedAt": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning("[scheduled_tasks.lease] release failed task=%s: %s", task_id, e)
+
+
+def build_run_slot_key(task_id: str, run_slot: datetime) -> str:
+    """Idempotency key shared between scheduled_tasks and notification_events.
+    Format ``scheduled_task:{taskId}:{run_slot ISO 8601 UTC}``."""
+    iso = run_slot.replace(microsecond=(run_slot.microsecond // 1000) * 1000).isoformat()
+    return f"scheduled_task:{task_id}:{iso}"
