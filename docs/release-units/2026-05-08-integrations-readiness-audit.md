@@ -3,8 +3,57 @@
 - **Date**: 2026-05-08
 - **Production revision**: `deepnote-api-00416-loc` (V-038 + V-037 + V-040)
 - **Scope**: Google Calendar / Gmail / Microsoft Calendar / Outlook Mail
-- **Verdict**: **NOT READY** — OAuth secrets unconfigured + 5 endpoints missing vs spec
+- **Verdict**: **PARTIAL READY** — OAuth infra **already configured**, master token absent, 5 endpoints missing vs spec
 - **Goal**: turn this audit into 3 sequential release units that get DeepNote Clow's pre/post-meeting capabilities live
+
+---
+
+## ⚠ CORRIGENDUM (2026-05-08, 後刻訂正)
+
+§2.1 で「OAuth secrets が空」「TOKEN_ENCRYPTION_KEY が空」と書いていましたが **これは誤りでした**。
+私の `gcloud run services describe ... --format='json(spec.template.spec.containers[0].env)'`
+プローブが **Secret Manager 由来 (`valueFrom.secretKeyRef`) の env を inline value としてしか
+読まなかった** のが原因で、実際は以下が **すべて Secret Manager 経由で投入済**:
+
+```
+GOOGLE_OAUTH_CLIENT_ID         ← google-oauth-client-id:latest
+GOOGLE_OAUTH_CLIENT_SECRET     ← google-oauth-client-secret:latest
+GOOGLE_OAUTH_STATE_SECRET      ← google-oauth-state-secret:latest
+MICROSOFT_OAUTH_CLIENT_ID      ← microsoft-oauth-client-id:latest
+MICROSOFT_OAUTH_CLIENT_SECRET  ← microsoft-oauth-client-secret:latest
+MICROSOFT_OAUTH_STATE_SECRET   ← microsoft-oauth-state-secret:latest
+TOKEN_ENCRYPTION_KEY           ← token-encryption-key:latest
+```
+
+**実機検証(2026-05-08 後刻)**:
+
+```
+GET /integrations/google/oauth/start    (auth 付き) → 307 redirect to accounts.google.com
+  scope = openid email profile calendar.events.readonly + Gmail scope
+  client_id, state, redirect_uri all present
+GET /integrations/microsoft/oauth/start (auth 付き) → 307 redirect to login.microsoftonline.com
+  scope = openid profile email offline_access User.Read Calendars.Read Mail.Read
+```
+
+つまり **V-041-A は既に完了済**。下記 §2.1 / §4 の "V-041-A pending" 表記はすべて **完了扱い** に
+読み替えてください(履歴保存のため本文は残し、セクション冒頭に CORRIGENDUM を追記)。
+
+ただし master アカウントの token doc は現時点で **未取得**:
+
+```
+users/cfdXMsjPXfea8OsidGQtXrSZOfP2/integrations/google     → 不在
+users/cfdXMsjPXfea8OsidGQtXrSZOfP2/integrations/microsoft  → 不在
+```
+
+過去にセットアップしたトークンは **Firestore から消えている / 失効** している状態。次の手順:
+
+1. iOS / Desktop の Settings > Integrations 画面から「Google Calendar 接続」「Microsoft 接続」を再実行
+2. consent 後、`users/{master_uid}/integrations/{google,microsoft}` に encrypted refresh token が格納される
+3. その後 V-041-B 以降の implementation 実装中に live readiness probe が回せる(events.list / drafts.create 等)
+
+つまり次にやるべきは **operator の OAuth flow walkthrough**(V-041-A 完了済の確認も兼ねる) → 次セッションで V-041-B 実装、の順。
+
+---
 
 ---
 
