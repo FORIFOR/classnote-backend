@@ -1,8 +1,24 @@
 # Phase 2-A 着手用 wake-up 指示書
 
 **生成**: 2026-05-07 21:00 JST
-**fire 予定**: 2026-05-08 21:07 JST (Phase 1.5 deploy から ~24h)
-**cron job id (session-only)**: `cc24fbf3`
+**用途**: 開発作業を翌日再開するための **一時的な wake-up メモ**
+**cron job id**: `cc24fbf3` (2026-05-07 中に削除済 — in-memory のため信用不可)
+
+## Important
+
+This wake-up prompt is for development workflow only.
+Do not use Claude Code in-memory cron as a DeepNote product feature.
+DeepNote scheduled execution must be implemented via:
+- backend scheduled_tasks
+- internal scheduler tick
+- Cloud Tasks
+- Desktop automation UI
+- notification_events polling
+
+開発再開用にこのファイルを残しているだけで、DeepNote 本体の cron / 常駐通知の
+土台ではありません。製品としての定期実行は Phase 2-B (DM scheduled_tasks UX)
+および Phase 2-B-Desktop (Desktop Automation UX) として、上記のバックエンド
+基盤に正式実装する。Claude Code の in-memory cron は本番運用に使わない。
 
 > このファイルは「24h 後に Phase 2-A に進める」自動 wake-up の保険です。
 > CronCreate の durable persistence が利かず session-only 登録になったため、
