@@ -35,6 +35,10 @@ ALLOWED_ORIGINS = [
     "https://deepnote-billing-ui.vercel.app",
     "http://localhost:3000",
     "http://localhost:3001",
+    # Bot connect login fallback (DeepNote Clow LINE/Slack linking)
+    "https://deepnote-api-900324644592.asia-northeast1.run.app",
+    "https://deepnote-api-mur5rvqgga-an.a.run.app",
+    "https://dev---deepnote-api-mur5rvqgga-an.a.run.app",
 ]
 
 

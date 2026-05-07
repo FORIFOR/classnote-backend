@@ -950,6 +950,69 @@ def _classify_stt_type(data: dict) -> str:
 
 
 @st.cache_data(ttl=60)  # 1 minute cache
+def fetch_sessions_for_owner(project_id, account_id: str = "", user_id: str = "", limit: int = 5000):
+    """Fetch ALL sessions for a specific account_id and/or user_id, ignoring
+    the dashboard's global limit. Used by the per-user history viewer.
+
+    We query three legacy shapes (ownerAccountId / ownerUid / ownerUserId)
+    and dedupe by session id so we don't miss legacy sessions written
+    before the account refactor.
+    """
+    try:
+        db = _init_firebase(project_id)
+        all_docs = []
+        if account_id:
+            try:
+                q = db.collection("sessions").where("ownerAccountId", "==", account_id).limit(limit)
+                all_docs.extend(list(q.stream()))
+            except Exception as e:
+                st.warning(f"ownerAccountId query failed: {e}")
+        if user_id:
+            for field in ("ownerUid", "ownerUserId", "userId"):
+                try:
+                    q = db.collection("sessions").where(field, "==", user_id).limit(limit)
+                    all_docs.extend(list(q.stream()))
+                except Exception:
+                    pass
+
+        seen = set()
+        sessions = []
+        for doc in all_docs:
+            if doc.id in seen:
+                continue
+            seen.add(doc.id)
+            data = doc.to_dict() or {}
+            sessions.append({
+                "id": doc.id,
+                "title": data.get("title") or "-",
+                "userId": data.get("userId") or data.get("ownerUserId") or data.get("ownerUid") or "-",
+                "owner_account_id": data.get("ownerAccountId") or "-",
+                "status": data.get("status") or "unknown",
+                "mode": data.get("mode") or "-",
+                "transcriptionMode": data.get("transcriptionMode") or "-",
+                "sttType": _classify_stt_type(data),
+                "source": data.get("source") or "-",
+                "createdAt": data.get("createdAt"),
+                "durationSec": data.get("durationSec") or 0,
+                "audioStatus": data.get("audioStatus") or "-",
+                "summaryStatus": data.get("summaryStatus") or "-",
+                "quizStatus": data.get("quizStatus") or "-",
+                "hasTranscript": bool(data.get("transcriptText")),
+                "transcriptLen": len(data.get("transcriptText") or ""),
+                "deletedAt": data.get("deletedAt"),
+            })
+        # Sort newest-first
+        from datetime import datetime as _dt
+        sessions.sort(
+            key=lambda s: s.get("createdAt") or _dt.min,
+            reverse=True,
+        )
+        return sessions
+    except Exception as e:
+        st.error(f"Per-user sessions fetch error: {e}")
+        return []
+
+
 def fetch_sessions_data(project_id, limit=200):
     """Fetch sessions with detailed info."""
     try:
@@ -2420,20 +2483,214 @@ with tab_sessions:
         st.caption(f"Showing {len(display_df)} sessions")
         st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
 
-        # Session detail expander
-        with st.expander("🔍 View Session Details"):
-            selected_sid = st.selectbox("Select Session", df["id"].tolist())
-            if selected_sid:
-                session_doc = fetch_document(selected_project, "sessions", selected_sid)
-                if session_doc:
-                    st.json(session_doc)
+        # Session detail expander — supports per-user full history
+        with st.expander("🔍 View Session Details", expanded=False):
+            st.markdown("##### 👤 ユーザを選択して全セッション履歴を見る")
+            st.caption(
+                "ユーザ名 / 表示名 / メール / uid のいずれかで検索して選択できます。"
+                "選択するとそのユーザの全セッションを画面上部の Limit に縛られず取得します。"
+            )
 
-                # Show jobs for this session
-                st.markdown("#### Jobs")
-                jobs = fetch_jobs_data(selected_project, session_id=selected_sid)
-                if jobs:
-                    jobs_df = pd.DataFrame(jobs)
-                    st.dataframe(jobs_df, use_container_width=True, hide_index=True)
+            # Build searchable user options from users_data (fetched above).
+            # st.selectbox has built-in incremental search over the option labels,
+            # so we pack username / displayName / email / uid / accountId into the
+            # label — typing any of them filters the list.
+            user_options: list[str] = [""]
+            user_meta: dict[str, dict] = {}
+            if users_data:
+                _epoch_min = datetime.min.replace(tzinfo=timezone.utc)
+                sorted_users = sorted(
+                    users_data,
+                    key=lambda u: u.get("lastSeenAt") or _epoch_min,
+                    reverse=True,
+                )
+                for u in sorted_users:
+                    uid = (u.get("uid") or "").strip()
+                    if not uid:
+                        continue
+                    username = (u.get("username") or "").strip()
+                    display_name = (u.get("displayName") or "").strip()
+                    email = (u.get("email") or "").strip()
+                    account_id = (u.get("accountId") or "").strip()
+                    parts = []
+                    if username and username != "-":
+                        parts.append(f"@{username}")
+                    if display_name and display_name not in ("-", username):
+                        parts.append(display_name)
+                    if email and email != "-":
+                        parts.append(email)
+                    parts.append(f"uid:{uid[:8]}…")
+                    if account_id and account_id != "-":
+                        parts.append(f"acc:{account_id[:8]}…")
+                    label = "  ·  ".join(parts) or uid
+                    # Disambiguate duplicates by appending uid suffix
+                    if label in user_meta:
+                        label = f"{label}  ·  {uid[-4:]}"
+                    user_options.append(label)
+                    user_meta[label] = {
+                        "uid": uid,
+                        "accountId": account_id if account_id and account_id != "-" else "",
+                    }
+
+            selected_label = st.selectbox(
+                f"ユーザを選択（{max(len(user_options) - 1, 0)} 件 / 名前・メール・uid で検索可）",
+                user_options,
+                format_func=lambda x: "（ユーザを選択…）" if x == "" else x,
+                key="detail_user_selectbox",
+            )
+
+            picked_account_id = ""
+            picked_user_id = ""
+            if selected_label and selected_label in user_meta:
+                picked_account_id = user_meta[selected_label]["accountId"]
+                picked_user_id = user_meta[selected_label]["uid"]
+
+            # Manual fallback: 500件の上限を超えたユーザや、生 ID から直接辿りたい時用。
+            # Streamlit forbids nested ``st.expander`` and we are already
+            # inside the outer "🔍 View Session Details" expander, so this
+            # fallback uses a divider + container instead.
+            st.markdown("---")
+            st.caption("🛠 ID を直接指定する（一覧に居ない場合）")
+            with st.container():
+                colA, colB = st.columns([1, 1])
+                with colA:
+                    manual_account_id = st.text_input(
+                        "Account ID",
+                        placeholder="例: Jwb9VwA4kkfOLQh7PVZ9",
+                        key="detail_account_id",
+                    ).strip()
+                with colB:
+                    manual_user_id = st.text_input(
+                        "User ID (uid)",
+                        placeholder="例: cfdXMsjPXfea8OsidGQtXrSZOfP2",
+                        key="detail_user_id",
+                    ).strip()
+
+            # Manual input wins if entered; otherwise use the dropdown selection
+            detail_account_id = manual_account_id or picked_account_id
+            detail_user_id = manual_user_id or picked_user_id
+
+            include_deleted = st.checkbox(
+                "deletedAt 付きセッションも含める", value=False, key="detail_include_deleted"
+            )
+
+            # Choose data source: user-scoped (full history) vs current page df
+            using_user_scope = bool(detail_account_id or detail_user_id)
+
+            if using_user_scope:
+                with st.spinner("そのユーザの全セッションを取得中…"):
+                    user_sessions = fetch_sessions_for_owner(
+                        selected_project,
+                        account_id=detail_account_id,
+                        user_id=detail_user_id,
+                        limit=5000,
+                    )
+                if not include_deleted:
+                    user_sessions = [s for s in user_sessions if not s.get("deletedAt")]
+                if not user_sessions:
+                    st.warning("該当ユーザのセッションは見つかりませんでした。")
+                else:
+                    detail_df = pd.DataFrame(user_sessions)
+                    detail_df["Time"] = detail_df["createdAt"].apply(
+                        lambda x: _format_timestamp_short(x) if pd.notna(x) else "-"
+                    )
+                    detail_df["Duration"] = (detail_df["durationSec"] / 60).round(1).astype(str) + " min"
+                    detail_df["Title"] = detail_df["title"].apply(lambda x: str(x)[:40] if x else "-")
+                    detail_df["Transcript"] = detail_df.apply(
+                        lambda row: f"✅ ({row['transcriptLen']:,})" if row['hasTranscript'] else "❌",
+                        axis=1,
+                    )
+                    detail_df["Summary"] = detail_df["summaryStatus"].apply(
+                        lambda x: "✅" if x == "completed" else "⏳" if x in ["running", "queued"] else "❌" if x == "failed" else "-"
+                    )
+                    detail_df["Quiz"] = detail_df["quizStatus"].apply(
+                        lambda x: "✅" if x == "completed" else "⏳" if x in ["running", "queued"] else "❌" if x == "failed" else "-"
+                    )
+                    detail_df["Deleted"] = detail_df["deletedAt"].apply(lambda x: "🗑" if x else "")
+
+                    show_cols = [
+                        "Time", "sttType", "Title", "status", "Duration",
+                        "Transcript", "Summary", "Quiz", "Deleted",
+                        "id", "owner_account_id", "userId",
+                    ]
+                    rename = {
+                        "id": "Session ID",
+                        "owner_account_id": "Account ID",
+                        "userId": "User ID",
+                        "sttType": "STT",
+                    }
+                    st.caption(
+                        f"📊 該当ユーザのセッション総数: **{len(detail_df)}** 件 "
+                        f"(account={detail_account_id or '-'}, user={detail_user_id or '-'})"
+                    )
+                    st.dataframe(
+                        detail_df[show_cols].rename(columns=rename),
+                        use_container_width=True, hide_index=True, height=420,
+                    )
+                    options = detail_df["id"].tolist()
+                    title_map = dict(zip(detail_df["id"], detail_df["title"].fillna("(無題)")))
+                    time_map = dict(zip(detail_df["id"], detail_df["Time"]))
+
+                    def _fmt_user(sid: str) -> str:
+                        return f"{time_map.get(sid, '?'):<14} {sid[:8]}…  {title_map.get(sid, '')[:40]}"
+
+                    selected_sid = st.selectbox(
+                        "Select Session",
+                        options,
+                        format_func=_fmt_user,
+                        key="user_scope_session_select",
+                    )
+                    if selected_sid:
+                        session_doc = fetch_document(selected_project, "sessions", selected_sid)
+                        if session_doc:
+                            st.markdown(
+                                f"**Session ID**: `{selected_sid}`  \n"
+                                f"**Account ID**: `{session_doc.get('ownerAccountId') or '-'}`  \n"
+                                f"**User ID**: `{session_doc.get('ownerUid') or session_doc.get('ownerUserId') or '-'}`  \n"
+                                f"**Title**: {session_doc.get('title') or '(無題)'}"
+                            )
+                            st.json(session_doc)
+
+                        st.markdown("#### Jobs")
+                        jobs = fetch_jobs_data(selected_project, session_id=selected_sid)
+                        if jobs:
+                            jobs_df = pd.DataFrame(jobs)
+                            st.dataframe(jobs_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("(jobs なし)")
+            else:
+                # Fallback: list-scoped (current page df)
+                st.caption("（指定なしの場合は、画面上部のリストから選択した範囲だけ表示します）")
+                options = df["id"].tolist()
+                if not options:
+                    st.info("該当するセッションがありません。")
+                else:
+                    title_map = dict(zip(df["id"], df["title"].fillna("(無題)")))
+                    acc_map = dict(zip(df["id"], df.get("owner_account_id", pd.Series(dtype=str)).fillna("-"))) if "owner_account_id" in df else {}
+                    def _fmt_global(sid: str) -> str:
+                        t = title_map.get(sid, "")
+                        a = acc_map.get(sid, "-")
+                        return f"{sid[:8]}…  {t[:30]}  [account={a[:12]}…]"
+                    selected_sid = st.selectbox(
+                        "Select Session",
+                        options,
+                        format_func=_fmt_global,
+                        key="global_session_select",
+                    )
+                    if selected_sid:
+                        session_doc = fetch_document(selected_project, "sessions", selected_sid)
+                        if session_doc:
+                            st.markdown(
+                                f"**Session ID**: `{selected_sid}`  \n"
+                                f"**Account ID**: `{session_doc.get('ownerAccountId') or '-'}`  \n"
+                                f"**User ID**: `{session_doc.get('ownerUid') or session_doc.get('ownerUserId') or '-'}`"
+                            )
+                            st.json(session_doc)
+                        st.markdown("#### Jobs")
+                        jobs = fetch_jobs_data(selected_project, session_id=selected_sid)
+                        if jobs:
+                            jobs_df = pd.DataFrame(jobs)
+                            st.dataframe(jobs_df, use_container_width=True, hide_index=True)
     else:
         st.warning("No session data available.")
 

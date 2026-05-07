@@ -2212,9 +2212,51 @@ async def update_transcript(session_id: str, body: TranscriptUpdateRequest, curr
     Note: For incremental/streaming uploads, use transcript_chunks:append instead.
     """
     # [FIX] Support clientSessionId fallback for offline-first clients
-    doc_ref, snap, session_id = _resolve_session(session_id, current_user.uid)
-    session_data = snap.to_dict()
-    ensure_is_owner(session_data, current_user, session_id)
+    # [HOTFIX 2026-05-05] iOS app records offline and POSTs /transcript without
+    # first calling POST /sessions, causing 404 → no transcript saved → no
+    # summary generated. We auto-create the session here when the path id
+    # looks like a UUID and current_user is verified, mirroring the contract
+    # of POST /sessions (account_id / clientSessionId / mode defaults).
+    try:
+        doc_ref, snap, session_id = _resolve_session(
+            session_id, current_user.uid, current_user.account_id,
+        )
+        session_data = snap.to_dict()
+        ensure_is_owner(session_data, current_user, session_id)
+    except HTTPException as _e:
+        if _e.status_code != 404:
+            raise
+        import re as _re
+        if not _re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", session_id):
+            raise
+        if not getattr(current_user, "account_id", None):
+            raise
+        now = _now_timestamp()
+        title_default = "会議 " + (now.strftime("%-m/%-d %H:%M") if hasattr(now, "strftime") else "")
+        auto_data = {
+            "title": title_default,
+            "clientSessionId": session_id,
+            "ownerUid": current_user.uid,
+            "ownerUserId": current_user.uid,
+            "ownerAccountId": current_user.account_id,
+            "createdAt": now,
+            "startedAt": now,
+            "endedAt": now,
+            "mode": "meeting",
+            "transcriptionMode": "device_sherpa",
+            "status": "録音済み",
+            "source": (body.source or "device"),
+            "autoCreatedFromTranscript": True,
+            "autoCreatedAt": now,
+        }
+        doc_ref = _session_doc_ref(session_id)
+        doc_ref.set(auto_data, merge=True)
+        snap = doc_ref.get()
+        session_data = snap.to_dict() or auto_data
+        logger.warning(
+            "[transcript] auto-created session %s for uid=%s account=%s (iOS offline flow)",
+            session_id, current_user.uid, current_user.account_id,
+        )
         
     # [FIX] Server-side Guard: Prevent Device STT from overwriting Cloud STT
     # If session is configured for Cloud STT, allow device transcript only as fallback.
@@ -2285,11 +2327,47 @@ async def update_transcript(session_id: str, body: TranscriptUpdateRequest, curr
     
     doc_ref.update(update_data)
     await publish_session_event(session_id, "assets.updated", {"fields": ["transcript"]})
-    
-    # [FIX] Auto-trigger summary/quiz if this is a FINAL transcript upload
-    # This prevents the "pending forever" state when uploading from Device STT
-    # We allow 'device' source to trigger even without isFinal because iOS client might use this endpoint for the final save.
-    # [DISABLED] Summary/Quiz auto-trigger removed — user triggers manually via generate button
+
+    # [HOTFIX 2026-05-05] Auto-trigger summary when iOS finished recording
+    # but never explicitly POSTs /jobs or `isFinal=true`. The previous
+    # version disabled this entirely, leaving sessions stuck at
+    # status=処理中 / summaryStatus=null / transcriptState=partial.
+    # We re-enable it under tight conditions:
+    #   - audioStatus == "uploaded"  (recording really did end)
+    #   - transcript long enough to be meaningful (>= 30 chars)
+    #   - no summary already running / completed
+    #   - device-source (don't intervene with the cloud-STT pipeline)
+    try:
+        merged = {**(session_data or {}), **update_data}
+        if (
+            merged.get("audioStatus") == "uploaded"
+            and len(transcript_text) >= 30
+            and not merged.get("summaryStatus")
+            and (incoming_source or "").startswith("device")
+        ):
+            from app.task_queue import enqueue_summarize_task
+            auto_idem = f"auto-final:{session_id}:{body.transcriptSha256 or len(transcript_text)}"
+            doc_ref.update({
+                "transcriptState": "final",
+                "summaryStatus": "queued",
+                "summaryError": None,
+                "summaryQueuedAt": _now_timestamp(),
+                "autoSummaryTriggered": True,
+            })
+            enqueue_summarize_task(
+                session_id,
+                user_id=current_user.uid,
+                idempotency_key=auto_idem,
+            )
+            logger.info(
+                "[transcript] auto-enqueued summary for %s (uid=%s, txn_len=%d, source=%s)",
+                session_id, current_user.uid, len(transcript_text), incoming_source,
+            )
+    except Exception as _auto_err:
+        logger.warning(
+            "[transcript] auto-summary enqueue skipped for %s: %s",
+            session_id, _auto_err,
+        )
 
     return {"sessionId": session_id, "status": "transcribed", "source": incoming_source}
 
@@ -3527,9 +3605,25 @@ async def get_artifact_summary(
     - Fast path: If derived doc exists with completed/running status, return immediately
     - Lazy trigger: Only enqueue if truly needed (missing or stale)
     - ETag support: Return 304 Not Modified if status unchanged
+
+    [HOTFIX 2026-05-05] When the session itself doesn't exist server-side
+    (iOS local-DB ghost — e.g. after a wipe / mid-deploy crash), return
+    200 with `status="not_found"` + `tombstone=True` instead of 404.
+    iOS used to spin on the 404 response, marking the app as "syncing"
+    forever. Returning 200 with a graceful tombstone lets the client
+    advance state and (when the iOS code is updated) drop the stale id.
     """
     # [FIX] Support clientSessionId fallback for offline-first clients
-    doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    try:
+        doc_ref, snapshot, session_id = _resolve_session(session_id, current_user.uid)
+    except HTTPException as _e:
+        if _e.status_code == 404:
+            return DerivedStatusResponse(
+                status="not_found",
+                result=None,
+                meta={"tombstone": True, "sessionExists": False, "sessionId": session_id},
+            )
+        raise
 
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
@@ -6034,6 +6128,30 @@ async def get_summary_v2(
     derived_snap = derived_ref.get()
 
     if not derived_snap.exists:
+        # Phase B fallback: when summary_v2 was never explicitly
+        # generated (it requires an explicit ``:generate`` call) but
+        # the regular summary pipeline already finished, synthesise
+        # a SummaryV2-shaped response from the session doc so clients
+        # don't poll forever waiting for a job that will never run.
+        if (data or {}).get("summaryStatus") == "completed":
+            md = (data or {}).get("summaryMarkdown") or (data or {}).get("topicSummary") or ""
+            if md:
+                try:
+                    synth = SummaryV2(
+                        version=1,
+                        generatedAt=(data or {}).get("summaryUpdatedAt"),
+                        renderedMarkdown=md,
+                        items=[],
+                    )
+                except Exception:
+                    synth = None
+                if synth is not None:
+                    return SummaryV2Response(
+                        status="ready",
+                        summary=synth,
+                        jobId=None,
+                        updatedAt=(data or {}).get("summaryUpdatedAt"),
+                    )
         return SummaryV2Response(
             status="pending",
             summary=None,

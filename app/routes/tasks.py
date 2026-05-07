@@ -31,6 +31,31 @@ from datetime import datetime, timezone
 router = APIRouter()
 logger = logging.getLogger("app.tasks")
 
+# Cloud Tasks `summarize-queue` / `quiz-queue` are configured with maxAttempts=3.
+# When this is the final attempt, transient errors must be persisted as a
+# terminal "failed" state instead of bouncing a 503 back to Cloud Tasks —
+# otherwise the session is left stranded at summaryStatus="running" and
+# never recovers in the UI.
+CLOUD_TASKS_MAX_ATTEMPTS = 3
+
+
+def _is_final_cloud_task_attempt(request: Request) -> bool:
+    """Return True iff the incoming request is the last permitted retry.
+
+    Cloud Tasks sends ``X-CloudTasks-TaskRetryCount`` (0-indexed retries
+    *after* the initial dispatch). On the final allowed attempt that
+    counter equals ``maxAttempts - 1``. Header is absent for direct curl /
+    local invocations — treat that as "not final" so we keep the same
+    retry-friendly behaviour outside of Cloud Tasks.
+    """
+    raw = request.headers.get("X-CloudTasks-TaskRetryCount")
+    if raw is None:
+        return False
+    try:
+        return int(raw) >= CLOUD_TASKS_MAX_ATTEMPTS - 1
+    except (TypeError, ValueError):
+        return False
+
 @router.get("/internal/tasks/ping")
 async def ping_task():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc)}
@@ -66,11 +91,21 @@ async def handle_summarize_quick_task(request: Request):
         data = doc.to_dict()
         derived_ref = doc_ref.collection("derived").document("summary_quick")
 
+        # [HOTFIX 2026-05-06] Same fix as the full summarize handler — only
+        # short-circuit if the derived doc shows the previous run actually
+        # SUCCEEDED. /jobs writes the idempotency key with status="running"
+        # before the worker fires, so the old check skipped every retry.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     return {"status": "skipped", "reason": "idempotent_hit"}
 
         transcript = await resolve_transcript_text_async(session_id, data) or ""
@@ -111,19 +146,24 @@ async def handle_summarize_quick_task(request: Request):
 
     except Exception as e:
         logger.exception(f"[QuickSummary] Failed for {session_id}")
+        error_str = str(e)
+        is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str
+        final_attempt = _is_final_cloud_task_attempt(request)
+        if is_transient and not final_attempt:
+            # Don't persist "failed" yet — let Cloud Tasks retry with a fresh
+            # quota window. The session keeps its current pending state.
+            raise HTTPException(status_code=503, detail="Transient error, retrying...")
         if derived_ref is not None:
             try:
                 derived_ref.set({
                     "status": "failed",
-                    "errorReason": str(e),
+                    "errorReason": error_str,
                     "updatedAt": datetime.now(timezone.utc),
                     "idempotencyKey": idempotency_key,
+                    "finalAttempt": final_attempt and is_transient,
                 }, merge=True)
             except Exception:
                 pass
-        error_str = str(e)
-        if "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str:
-            raise HTTPException(status_code=503, detail="Transient error, retrying...")
         return {"status": "failed", "error": error_str}
 
 
@@ -214,11 +254,24 @@ async def _handle_summarize_task_core(request: Request):
         mode = data.get("mode", "lecture")
         derived_ref = doc_ref.collection("derived").document("summary")
 
+        # [HOTFIX 2026-05-06] Only short-circuit if a PRIOR attempt with the
+        # same idempotency key actually completed. Previously this branch
+        # returned "idempotent_hit" whenever the key matched, but
+        # ``POST /sessions/{id}/jobs`` writes derived/summary with the
+        # idempotency key BEFORE the worker runs (so iOS can poll). That
+        # caused every Cloud Tasks invocation to skip itself in ~250ms,
+        # leaving sessions stuck at summaryStatus="running" forever.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     if job_id:
                          db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
@@ -302,6 +355,84 @@ async def _handle_summarize_task_core(request: Request):
             "autoTags": tags,
             "status": "要約済み",
         }
+        # [HOTFIX 2026-05-05 / 2026-05-06] Promote topicSummary to session.title
+        # when the current title is still the auto-generated placeholder
+        # (e.g. iOS default "会議 5/4 16:08", auto-create fallback, "(無題)") and
+        # the user has not edited it. Final shape: ``YYYYMMDD HH:MM_<topic>``
+        # using the session's startedAt (fallback createdAt) so the list
+        # view stays sortable by visible name and the user can spot the
+        # session by date at a glance.
+        try:
+            import re as _re
+            current_title = (data.get("title") or "").strip()
+            user_edited = bool(data.get("titleUserEdited"))
+            placeholder_re = _re.compile(
+                r"^(?:会議|講義|ミーティング|レコーディング|録音|Meeting|Lecture|Untitled|\(無題\))?\s*"
+                r"(?:\d{1,2}[/\-月]\d{1,2}日?\s*\d{1,2}[:時]\d{1,2}分?\s*)?$"
+            )
+            # Import-flow defaults that should always be replaced once the
+            # summary names a real topic. ``YouTube取り込み`` is the title
+            # backend assigns when /imports/youtube creates a session
+            # before the transcript / summary pipeline runs; without this
+            # entry the placeholder regex above didn't match and the
+            # auto-promote step was silently skipped.
+            import_defaults = {
+                "YouTube取り込み", "YouTube import",
+                "Audio import", "音声取り込み",
+                "Transcript import", "字幕取り込み",
+            }
+            # Treat any prior auto-set title (incl. older "M/D HH:MM_..." or
+            # plain topic) as still placeholder-replaceable, so we can upgrade
+            # them to the new "YYYYMMDD HH:MM_..." format.
+            already_auto = bool(data.get("titleAutoSet"))
+            is_placeholder = (
+                not current_title
+                or current_title == "(無題)"
+                or bool(placeholder_re.match(current_title))
+                or current_title in import_defaults
+                or already_auto
+            )
+
+            def _clean_title_candidate(s: str) -> str:
+                if not s:
+                    return ""
+                t = s.strip()
+                t = _re.sub(r"^[\-\*・●◆▶︎]+\s*", "", t)
+                t = _re.sub(r"^\d+[\.\)]\s*", "", t)
+                t = _re.sub(r"^(?:\[[^\]]+\]\s*)+", "", t)
+                t = t.strip(" 　:：.。、,")
+                return t[:80]
+
+            def _format_title_prefix(d: dict) -> str:
+                """Return ``YYYYMMDD HH:MM`` from the session's startedAt /
+                createdAt. Falls back to "now" if both are missing so the
+                title still gets a stable prefix.
+                """
+                ts = d.get("startedAt") or d.get("createdAt")
+                if ts is None:
+                    ts = datetime.now(timezone.utc)
+                if hasattr(ts, "to_datetime"):
+                    try:
+                        ts = ts.to_datetime()
+                    except Exception:
+                        ts = datetime.now(timezone.utc)
+                if not isinstance(ts, datetime):
+                    ts = datetime.now(timezone.utc)
+                # JST display per existing iOS UX convention (record times
+                # are presented in user-local; backend stores UTC). +9h.
+                from datetime import timedelta as _td
+                jst = ts + _td(hours=9)
+                return jst.strftime("%Y%m%d %H:%M")
+
+            candidate = _clean_title_candidate(topic_summary or "")
+            if candidate and is_placeholder and not user_edited:
+                prefix = _format_title_prefix(data)
+                final_title = f"{prefix}_{candidate}"
+                update_payload["title"] = final_title[:120]
+                update_payload["titleAutoSet"] = True
+                update_payload["titleAutoSetAt"] = datetime.now(timezone.utc)
+        except Exception as _title_err:
+            logger.warning(f"[Summary] title auto-promote skipped for {session_id}: {_title_err}")
         doc_ref.update(update_payload)
         derived_ref.set({
             "status": "succeeded",
@@ -349,6 +480,42 @@ async def _handle_summarize_task_core(request: Request):
         if job_id:
             db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed"}, merge=True)
 
+        # [Smart Share — DeepNote] Send a *DM-only* notification to every
+        # bot link of the owner account that has opted in to Lv1/Lv2.
+        try:
+            if owner_account_id:
+                from app.services import bot_smart_share as _smart
+                _sent = _smart.notify_after_summary(session_id, owner_account_id, session_data=data)
+                if _sent:
+                    logger.info("[smart_share] DM notifications sent: session=%s sent=%d", session_id, _sent)
+        except Exception as _smart_err:
+            logger.warning("[smart_share] notify skipped for %s: %s", session_id, _smart_err)
+
+        # [Phase D — post-meeting follow-up] Schedule a one-shot reminder
+        # 24 hours from now. The scheduled_task is itself the source of
+        # truth, so a Cloud Run cold start or rolling deploy can't lose
+        # it. ``deliver_session_followup`` is DM-only and surfaces ONLY
+        # still-open TODOs; if everything was checked off, no DM fires.
+        try:
+            if owner_account_id:
+                from app.services import scheduled_tasks as _st
+                from datetime import timedelta as _td
+                fire_at = datetime.now(timezone.utc) + _td(hours=24)
+                rrule = (
+                    f"FREQ=DAILY;COUNT=1;BYHOUR={fire_at.hour};BYMINUTE={fire_at.minute}"
+                )
+                _st.create(owner_account_id, body={
+                    "type": "session_followup",
+                    "channel": "any",
+                    "destination": {},
+                    "rrule": rrule,
+                    "timezone": "UTC",
+                    "filters": {"sessionId": session_id},
+                    "output": {"reminder": True},
+                })
+        except Exception as _f_err:
+            logger.warning("[followup.schedule] skipped for %s: %s", session_id, _f_err)
+
         # ops_logger: job completed
         log_job_transition(session_id, "summarize", "completed", uid=final_user_id, job_id=job_id)
         # Log usage success
@@ -372,37 +539,43 @@ async def _handle_summarize_task_core(request: Request):
             await usage_logger.log(user_id=final_user_id, feature="summary", event_type="error", session_id=session_id)
         error_str = str(e)
         is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
-        
-        if is_transient:
-             logger.warning(f"Transient error detected for session {session_id}, raising 503 for retry.")
+        final_attempt = _is_final_cloud_task_attempt(request)
+
+        if is_transient and not final_attempt:
+             logger.warning(f"Transient error for session {session_id} (retry available), raising 503 for retry.")
              raise HTTPException(status_code=503, detail="Transient error, retrying...")
 
-        # Update DB on failure
-        # We need to be careful if DB init failed, db might be undefined? 
-        # But we are inside try where db init happened or returned.
+        # Persist terminal failure: either non-transient OR Cloud Tasks final
+        # attempt. Without this, sessions hit by sustained 429 stay stuck at
+        # summaryStatus="running" forever once Cloud Tasks gives up.
+        terminal_reason = (
+            f"Vertex AI transient error after {CLOUD_TASKS_MAX_ATTEMPTS} attempts: {error_str}"
+            if is_transient and final_attempt
+            else error_str
+        )
         try:
              doc_ref.update({
                  "summaryStatus": "failed",
-                 "summaryError": str(e),
+                 "summaryError": terminal_reason,
                  "summaryUpdatedAt": datetime.now(timezone.utc),
                  "status": "録音済み",
              })
              if job_id:
-                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
+                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": terminal_reason}, merge=True)
              derived_ref.set({
                  "status": "failed",
-                 "errorReason": str(e),
+                 "errorReason": terminal_reason,
                  "updatedAt": datetime.now(timezone.utc),
                  "idempotencyKey": idempotency_key,
+                 "finalAttempt": is_transient and final_attempt,
              }, merge=True)
              await publish_session_event(session_id, "assets.updated", {"fields": ["summary"]})
         except Exception as db_err:
             logger.warning(f"[summarize] Failed to update error status in DB: {db_err}")
 
-        # ops_logger: job failed
-        log_job_transition(session_id, "summarize", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
+        log_job_transition(session_id, "summarize", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=terminal_reason)
 
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": terminal_reason}
 
     # finally: removed
 
@@ -579,15 +752,23 @@ async def _handle_quiz_task_core(request: Request):
         mode = data.get("mode", "lecture")
         derived_ref = doc_ref.collection("derived").document("quiz")
 
+        # [HOTFIX 2026-05-06] Same fix as the summary handlers — only
+        # short-circuit when the previous run actually succeeded.
         if idempotency_key:
             derived_snap = derived_ref.get()
             if derived_snap.exists:
-                current_key = (derived_snap.to_dict() or {}).get("idempotencyKey")
-                if current_key and current_key == idempotency_key:
+                derived_data = derived_snap.to_dict() or {}
+                current_key = derived_data.get("idempotencyKey")
+                current_status = derived_data.get("status")
+                if (
+                    current_key
+                    and current_key == idempotency_key
+                    and current_status in ("succeeded", "completed")
+                ):
                     if job_id:
                          db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "completed", "result": "cached"}, merge=True)
                     return {"status": "skipped", "reason": "idempotent_hit"}
-        
+
         if not transcript:
             doc_ref.update({"quizStatus": "failed", "quizError": "Transcript empty", "status": "録音済み"})
             if job_id:
@@ -673,30 +854,35 @@ async def _handle_quiz_task_core(request: Request):
             await usage_logger.log(user_id=final_user_id, feature="quiz", event_type="error", session_id=session_id)
         error_str = str(e)
         is_transient = "429" in error_str or "503" in error_str or "ResourceExhausted" in error_str or "ServiceUnavailable" in error_str
+        final_attempt = _is_final_cloud_task_attempt(request)
 
-        if is_transient:
-             logger.warning(f"Transient error detected for quiz {session_id}, raising 503 for retry.")
+        if is_transient and not final_attempt:
+             logger.warning(f"Transient error for quiz {session_id} (retry available), raising 503 for retry.")
              raise HTTPException(status_code=503, detail="Transient error, retrying...")
 
-        # Safe DB update
+        terminal_reason = (
+            f"Vertex AI transient error after {CLOUD_TASKS_MAX_ATTEMPTS} attempts: {error_str}"
+            if is_transient and final_attempt
+            else error_str
+        )
         try:
-            doc_ref.update({"quizStatus": "failed", "quizError": str(e), "status": "録音済み"})
+            doc_ref.update({"quizStatus": "failed", "quizError": terminal_reason, "status": "録音済み"})
             if job_id:
-                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": str(e)}, merge=True)
+                 db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": terminal_reason}, merge=True)
             derived_ref.set({
                 "status": "failed",
-                "errorReason": str(e),
+                "errorReason": terminal_reason,
                 "updatedAt": datetime.now(timezone.utc),
                 "idempotencyKey": idempotency_key,
+                "finalAttempt": is_transient and final_attempt,
             }, merge=True)
             await publish_session_event(session_id, "assets.updated", {"fields": ["quiz"]})
         except Exception as db_err:
             logger.warning(f"[quiz] Failed to update error status in DB: {db_err}")
 
-        # ops_logger: job failed
-        log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=str(e))
+        log_job_transition(session_id, "quiz", "failed", uid=final_user_id, job_id=job_id, error_code=ErrorCode.JOB_WORKER_500, error_message=terminal_reason)
 
-        return {"status": "failed", "error": str(e)}
+        return {"status": "failed", "error": terminal_reason}
 
     # finally: removed
 

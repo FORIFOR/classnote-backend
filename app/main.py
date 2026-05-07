@@ -241,6 +241,11 @@ app.include_router(account.router, tags=["Account"])
 app.include_router(account_merge.router, tags=["Account Merge"])
 app.include_router(phone.router, tags=["Phone Verification"])
 app.include_router(assets_router, tags=["Assets"])
+# compat_aliases must be included BEFORE sessions so iOS-only paths like
+# ``GET /sessions/search`` are matched before the ``/sessions/{session_id}``
+# catch-all in sessions.py. All other compat aliases are sub-paths of
+# ``/sessions/{id}/...`` so they don't shadow the sessions canonical routes.
+app.include_router(compat_aliases.router)  # MUST be before sessions
 app.include_router(sessions.router, tags=["Sessions"])
 # Folders / Library organisation — canonical /v1/folders + legacy /folders + /sessions/{id}:move
 # See: deepnote-contracts/api/endpoints-map.md (V-017/V-018)
@@ -267,7 +272,7 @@ from app.routes import assist
 app.include_router(assist.router, tags=["Assist"])
 app.include_router(billing.router, tags=["Billing"])
 app.include_router(share.router, tags=["Share"])
-app.include_router(compat_aliases.router)  # iOS hyphen aliases + transcript_segments artifacts alias + playlist:generate
+# (compat_aliases.router was moved up above sessions.router for /sessions/search precedence)
 app.include_router(entity_review.router, tags=["Entity Review"])  # /v1/sessions/{id}/entity-review[/run|/apply|/skip] + /term-hints
 # [DEPRECATED 2026-05-01] Legacy Google OAuth routes (replaced by integrations_google).
 # Kept import to avoid breaking any latent reference, but not registered:
@@ -281,6 +286,30 @@ app.include_router(integrations_microsoft.router)
 app.include_router(integrations_microsoft.oauth_router)
 # integrations_slack: module file missing from working tree.
 # Restore app/routes/integrations_slack.py + slack_client.py before re-enabling.
+# DeepNote Clow LINE bot (Phase 1: 1:1 only — webhook + connect HTML + link-token API)
+from app.routes import integrations_line
+app.include_router(integrations_line.router)
+# v1-prefixed alias so LINE Developer Console webhook URLs configured as
+# ``/v1/integrations/line/webhook`` also reach the same handlers. Without
+# this, deepnote-contracts canonical paths return 404 and the bot stops
+# replying entirely.
+app.include_router(integrations_line.router, prefix="/v1", include_in_schema=False)
+# DeepNote Clow Slack bot (Phase 1: 1:1 DM only — events + OAuth install + link-token API)
+from app.routes import integrations_slack
+app.include_router(integrations_slack.router)
+app.include_router(integrations_slack.router, prefix="/v1", include_in_schema=False)
+# DeepNote Clow scheduled digests (Phase 3 — Cloud Scheduler hits this internal route)
+from app.routes import digests as _digests
+app.include_router(_digests.router, include_in_schema=False)
+# DeepNote Clow Phase 5 — backend-hosted Firebase login fallback for bot connect
+from app.routes import bot_login as _bot_login
+app.include_router(_bot_login.router)
+# DeepNote Clow Phase 6 — backend-hosted GET bridge for /sessions/{id}/export
+from app.routes import bot_export_bridge as _bot_export_bridge
+app.include_router(_bot_export_bridge.router)
+# DeepNote Clow Phase 8 — self-service settings + audit + opt-out for bot users
+from app.routes import bot_settings as _bot_settings
+app.include_router(_bot_settings.router)
 # Startup soft-check: warn if token_crypto / OAuth not configured
 try:
     from app.services import token_crypto as _token_crypto
@@ -294,6 +323,13 @@ app.include_router(admin.router, tags=["Admin"])
 from app.routes import dashboard_public
 app.include_router(dashboard_public.router, tags=["Dashboard Public"])
 app.include_router(ops.router, tags=["Ops"])  # Deployment safety & presence
+# DeepNote Assistant Hub (Phase A): POST /v1/assistant/messages
+from app.routes import assistant as _assistant
+app.include_router(_assistant.router)
+# Scheduled Tasks (Phase B): user-defined cron-style automations
+from app.routes import scheduled_tasks_routes as _st_routes
+app.include_router(_st_routes.router)
+app.include_router(_st_routes.internal_router, include_in_schema=False)
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)
