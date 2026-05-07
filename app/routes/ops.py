@@ -193,15 +193,29 @@ async def presence_heartbeat(
 
 @router.delete("/presence/heartbeat")
 async def clear_presence(
-    deviceId: str,
+    deviceId: Optional[str] = None,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Clear presence when app goes to background or operation completes.
+    """Clear presence when app goes to background or operation completes.
+
+    [HOTFIX 2026-05-08 V-040 part 2] ``deviceId`` made Optional. The
+    POST handler hotfix landed earlier in this file but the DELETE
+    handler still required ``deviceId`` as a query string, so iOS
+    builds that omit it produced HTTP 422 — keeping the iOS sync loop
+    stuck on the same path the POST handler was just freed from.
+    Falls back to the same per-account device id used by the POST
+    handler so the delete targets the same Firestore document.
     """
     account_id = current_user.account_id or current_user.uid
-    doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{deviceId}")
-    doc_ref.delete()
+    effective_device_id = (deviceId or "").strip() or f"ios-{current_user.uid[:12]}"
+    try:
+        doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{effective_device_id}")
+        doc_ref.delete()
+    except Exception as e:
+        # Best-effort: never 5xx out of clear_presence. iOS retries on failure
+        # and the worst case is a stale document expiring via the TTL.
+        logger.warning("[Presence] clear_presence firestore delete failed: %s", e)
+    return {"ok": True}
 
     logger.debug(f"[Presence] Cleared presence for {account_id}/{deviceId}")
 
