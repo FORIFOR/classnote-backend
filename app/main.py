@@ -330,6 +330,12 @@ app.include_router(_assistant.router)
 from app.routes import scheduled_tasks_routes as _st_routes
 app.include_router(_st_routes.router)
 app.include_router(_st_routes.internal_router, include_in_schema=False)
+
+# Notifications inbox (Phase 2-B Desktop Automation): polling target for
+# Desktop / mobile clients. Writes happen from scheduled_tasks_routes
+# desktop dispatcher; this surface is read-only-per-user.
+from app.routes import notifications_routes as _notif_routes
+app.include_router(_notif_routes.router)
 app.include_router(imports.router, tags=["Imports"])
 app.include_router(universal_links.router) # Root level (/.well-known)
 app.include_router(debug_appstore.router)
