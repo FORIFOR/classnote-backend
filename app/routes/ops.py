@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from google.cloud import firestore
 
@@ -95,7 +95,7 @@ PRESENCE_COLLECTION = "presence"
 
 @router.post("/presence/heartbeat", response_model=HeartbeatResponse)
 async def presence_heartbeat(
-    req: HeartbeatRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -107,7 +107,49 @@ async def presence_heartbeat(
     - When the operation completes (with empty states to clear)
 
     The presence automatically expires after 90 seconds if no heartbeat is received.
+
+    [HOTFIX 2026-05-08 V-040] Body parsing is fail-soft. The previous
+    handler used ``req: HeartbeatRequest`` as a typed dependency, which
+    let FastAPI/Pydantic raise 422 when iOS sent a body that could not be
+    coerced (empty body, non-JSON, ``states`` not a list of str, …).
+    The 422 in turn caused the iOS bootstrap loop to be stuck on
+    "同期中 / キャッシュで起動しました" and to fail folder fetch / YouTube
+    import / record-to-folder save.
+
+    We now read the body manually and tolerate any malformed payload —
+    presence tracking is best-effort, never load-bearing for data
+    integrity, so returning 200 with a logged warning is strictly safer
+    than 422 retry storms. The original Pydantic ``HeartbeatRequest`` is
+    still applied opportunistically when the body parses, so usable
+    fields (deviceId / states / appVersion / rev / platform) still flow
+    through to Firestore.
     """
+    # ---- fail-soft body parse (V-040) ----
+    raw: Any = {}
+    try:
+        if request.headers.get("content-length", "0") not in ("", "0"):
+            raw = await request.json()
+    except Exception as e:
+        logger.warning("[Presence] heartbeat body not JSON, treating as empty: %s", e)
+        raw = {}
+    if not isinstance(raw, dict):
+        logger.warning("[Presence] heartbeat body was %s, not dict, treating as empty",
+                       type(raw).__name__)
+        raw = {}
+    try:
+        req = HeartbeatRequest(**raw)
+    except Exception as e:
+        logger.warning("[Presence] heartbeat Pydantic validation failed, falling back: %s", e)
+        # Best-effort coercion of the raw fields one by one. Never raise.
+        req = HeartbeatRequest()
+        for k in ("deviceId", "sessionId", "appVersion", "rev", "platform"):
+            v = raw.get(k)
+            if isinstance(v, str):
+                setattr(req, k, v)
+        v_states = raw.get("states")
+        if isinstance(v_states, list):
+            req.states = [s for s in v_states if isinstance(s, str)]
+
     account_id = current_user.account_id or current_user.uid
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=PRESENCE_TTL_SECONDS)
@@ -132,9 +174,13 @@ async def presence_heartbeat(
     }
 
     # Store in presence collection with deviceId as key
-    # This allows multiple devices per user
-    doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{effective_device_id}")
-    doc_ref.set(presence_data)
+    # This allows multiple devices per user. Wrap in try/except so that
+    # any Firestore hiccup also returns 200 — heartbeat is non-load-bearing.
+    try:
+        doc_ref = db.collection(PRESENCE_COLLECTION).document(f"{account_id}_{effective_device_id}")
+        doc_ref.set(presence_data)
+    except Exception as e:
+        logger.warning("[Presence] heartbeat firestore write failed (returning 200 anyway): %s", e)
 
     logger.debug(f"[Presence] Heartbeat from {account_id}/{effective_device_id}: {req.states}")
 
