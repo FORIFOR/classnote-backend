@@ -6111,6 +6111,42 @@ async def finalize_session(
 
 # ---------- SummaryV2: Evidence-based Structured Summary ---------- #
 
+
+def _ensure_summary_v2_ios_required_fields(data: dict) -> dict:
+    """Sanitize a SummaryV2 dict so the iOS Codable decoder never throws.
+
+    iOS ``SummaryV2.init(from decoder:)`` in
+    ``ClassnoteX/SessionModels.swift:2484-2502`` calls
+    ``c.decode(Date.self, forKey: .generatedAt)`` and
+    ``c.decode(SummaryV2Quality.self, forKey: .quality)`` — both raise
+    ``valueNotFound`` if the key is null or missing. The backend Pydantic
+    ``SummaryV2`` model declares both as ``Optional[None]`` for historical
+    reasons, so ``200 OK + 3151 bytes`` responses can still fail to decode
+    on iOS (observed 2026-05-08 in production logs, V-038).
+
+    Until the iOS decode path is upgraded to ``decodeIfPresent`` and a
+    new client release is rolled out, the server must guarantee that
+    ``generatedAt`` and ``quality`` are non-null on the wire.
+
+    Spec: deepnote-contracts/api/openapi.yaml#/components/schemas/SummaryV2
+          (added 2026-05-08 — version/generatedAt/items/quality required)
+    """
+    if not data.get("generatedAt"):
+        data["generatedAt"] = datetime.now(timezone.utc)
+    if not data.get("quality"):
+        data["quality"] = {
+            "unsupportedCount": 0,
+            "partialCount": 0,
+            "fullCount": 0,
+            "avgConfidence": 0.0,
+        }
+    if data.get("version") is None:
+        data["version"] = 1
+    if data.get("items") is None:
+        data["items"] = []
+    return data
+
+
 @router.get("/sessions/{session_id}/artifacts/summary_v2", response_model=SummaryV2Response)
 async def get_summary_v2(
     session_id: str,
@@ -6137,12 +6173,15 @@ async def get_summary_v2(
             md = (data or {}).get("summaryMarkdown") or (data or {}).get("topicSummary") or ""
             if md:
                 try:
-                    synth = SummaryV2(
-                        version=1,
-                        generatedAt=(data or {}).get("summaryUpdatedAt"),
-                        renderedMarkdown=md,
-                        items=[],
-                    )
+                    # V-038: ensure iOS-required fields (generatedAt / quality)
+                    # are non-null even on the synthesised fallback path.
+                    synth_data = _ensure_summary_v2_ios_required_fields({
+                        "version": 1,
+                        "generatedAt": (data or {}).get("summaryUpdatedAt"),
+                        "renderedMarkdown": md,
+                        "items": [],
+                    })
+                    synth = SummaryV2(**synth_data)
                 except Exception:
                     synth = None
                 if synth is not None:
@@ -6162,7 +6201,11 @@ async def get_summary_v2(
     status = derived_data.get("status", "pending")
 
     if status == "succeeded" or status == "completed":
-        summary_data = derived_data.get("result", {})
+        summary_data = derived_data.get("result", {}) or {}
+        # V-038: backend Pydantic SummaryV2 has generatedAt/quality as
+        # Optional[None], but iOS requires them at decode time. Sanitize
+        # before constructing the model to guarantee non-null wire output.
+        summary_data = _ensure_summary_v2_ios_required_fields(summary_data)
         try:
             summary = SummaryV2(**summary_data)
         except Exception as e:
