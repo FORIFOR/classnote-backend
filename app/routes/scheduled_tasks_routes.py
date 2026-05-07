@@ -277,6 +277,8 @@ def _build_desktop_notification(task: Dict[str, Any]) -> Dict[str, str]:
     """
     t = (task.get("type") or "").lower()
     label = (task.get("label") or "").strip()
+    plan = task.get("automationPlan") or {}
+    plan_title = (plan.get("title") or "").strip()
     if t == "daily_todo_digest" or t == "daily_open_todos":
         return {"title": "今日のTODO",
                 "body": label or "未完了TODOがあります。Desktop で確認してください。"}
@@ -292,6 +294,19 @@ def _build_desktop_notification(task: Dict[str, Any]) -> Dict[str, str]:
     if t == "smart_share_prompt":
         return {"title": "共有候補の会議があります",
                 "body": label or "Desktop で内容を確認して共有してください。"}
+    # ── V-042 AutomationPlan-derived task types (PR3 minimum) ──
+    if t == "create_mail_draft":
+        return {"title": plan_title or "メール下書きの作成確認",
+                "body": "会議内容からメール下書きを作成しますか? Desktop で確認してください。"}
+    if t == "create_share_draft":
+        return {"title": plan_title or "共有下書きの作成確認",
+                "body": "Slack / LINE 用の共有下書きを作成しますか?"}
+    if t == "create_todo_review":
+        return {"title": plan_title or "TODO 候補のレビュー",
+                "body": "新しい TODO 候補があります。Desktop で承認/却下してください。"}
+    if t == "automation":
+        return {"title": plan_title or "自動化通知",
+                "body": (plan.get("summary") or "DeepNote の自動化が実行されました。")[:200]}
     return {"title": label or "DeepNote 通知",
             "body": "DeepNote から自動通知が届きました。"}
 
