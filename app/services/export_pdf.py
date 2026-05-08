@@ -61,20 +61,44 @@ def _register_jp_fonts() -> tuple[str, str]:
     ):
         extra_globs_serif.extend(_glob.glob(pat, recursive=True))
 
+    # Reportlab TTFont supports TrueType (glyf table) only — NOT OpenType
+    # CFF (postscript outlines). fonts-noto-cjk ships .ttc with CFF
+    # glyphs, so we use IPAex / IPA Gothic + Mincho (TTF, glyf) instead.
+    extra_ipa: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/ipaexg.ttf",
+        "/usr/share/fonts/**/ipag.ttf",
+        "/usr/share/fonts/**/ipagp.ttf",
+    ):
+        extra_ipa.extend(_glob.glob(pat, recursive=True))
+    extra_ipa_serif: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/ipaexm.ttf",
+        "/usr/share/fonts/**/ipam.ttf",
+        "/usr/share/fonts/**/ipamp.ttf",
+    ):
+        extra_ipa_serif.extend(_glob.glob(pat, recursive=True))
+
     candidates_sans = [
-        # Hard-coded Bookworm path first (fast path)
-        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
-        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 0),
-    ] + [(p, 0) for p in extra_globs] + [
-        # macOS Hiragino
+        # IPAex Gothic (TTF, well-supported by reportlab)
+        ("/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf", 0),
+        ("/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf", 0),
+    ] + [(p, 0) for p in extra_ipa] + [
+        # macOS Hiragino — only useful for local dev
         ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
     ]
     candidates_serif = [
-        ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 0),
-    ] + [(p, 0) for p in extra_globs_serif] + [
+        ("/usr/share/fonts/opentype/ipaexfont-mincho/ipaexm.ttf", 0),
+        ("/usr/share/fonts/opentype/ipafont-mincho/ipam.ttf", 0),
+    ] + [(p, 0) for p in extra_ipa_serif] + [
         ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc", 0),
     ]
+    # Remove the now-unused glob lists from earlier (we kept the Noto
+    # globs but they're guaranteed to fail TTFont registration). Strip
+    # them to avoid noisy fallback warnings.
+    extra_globs = []
+    extra_globs_serif = []
 
     import logging as _logging
     _diag_logger = _logging.getLogger("app.services.export_pdf")
