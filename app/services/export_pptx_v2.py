@@ -80,7 +80,16 @@ PRIORITY_COLORS = {
 # ---------------------------------------------------------------------------
 
 def render_pptx_from_ir(ir: Dict[str, Any]) -> bytes:
-    """Render a Presentation IR into PPTX bytes (executive-dark theme)."""
+    """Render a Presentation IR into PPTX bytes (executive-dark theme).
+
+    2026-05-08 design refresh: the deck is capped at **1–2 slides**
+    (cover + a single ``hero_summary``). PPTX is now treated as a
+    summary attachment; per-section content (decisions / todos /
+    risks / keyword cloud / transcript appendix) lives in the PDF /
+    DOCX exports. The per-kind handlers are kept in this module so a
+    future PR can re-enable richer decks via a feature flag without
+    re-writing the renderers.
+    """
     prs = Presentation()
     prs.slide_width = Inches(SLIDE_W_IN)
     prs.slide_height = Inches(SLIDE_H_IN)
@@ -92,26 +101,31 @@ def render_pptx_from_ir(ir: Dict[str, Any]) -> bytes:
     # Cover slide always present
     _render_cover(prs, deck=deck, meta=meta)
 
-    for slide_ir in slides:
-        kind = slide_ir.get("kind")
+    # Pick at most one ``hero_summary`` slide. Falls back to the first
+    # slide of any recognised kind so we always have *something* on
+    # slide 2 — but only ever one.
+    hero = next((s for s in slides if s.get("kind") == "hero_summary"), None)
+    if hero is None and slides:
+        hero = slides[0]
+    if hero is not None:
         try:
+            kind = hero.get("kind")
             if kind == "hero_summary":
-                _render_hero_summary(prs, slide_ir)
+                _render_hero_summary(prs, hero)
             elif kind == "decision_board":
-                _render_decision_board(prs, slide_ir)
+                _render_decision_board(prs, hero)
             elif kind == "todo_board":
-                _render_todo_board(prs, slide_ir)
+                _render_todo_board(prs, hero)
             elif kind == "risk_alert":
-                _render_risk_alert(prs, slide_ir)
+                _render_risk_alert(prs, hero)
             elif kind == "keyword_cloud":
-                _render_keyword_cloud(prs, slide_ir)
+                _render_keyword_cloud(prs, hero)
             elif kind == "appendix_transcript":
-                _render_appendix_transcript(prs, slide_ir)
+                _render_appendix_transcript(prs, hero)
             else:
-                logger.warning(f"[pptx_v2] unknown slide kind: {kind}")
+                _render_hero_summary(prs, hero)  # best-effort fallback
         except Exception as exc:
-            # Never let one broken slide fail the whole deck.
-            logger.exception(f"[pptx_v2] failed to render slide {slide_ir.get('id')}: {exc}")
+            logger.exception(f"[pptx_v2] failed to render summary slide: {exc}")
 
     buf = io.BytesIO()
     prs.save(buf)

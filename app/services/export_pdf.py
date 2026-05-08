@@ -18,14 +18,145 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     HRFlowable, KeepTogether, PageBreak,
 )
+import os
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
 
-FONT = 'HeiseiKakuGo-W5'
-FONT_SERIF = 'HeiseiMin-W3'
+def _register_jp_fonts() -> tuple[str, str]:
+    """Register Japanese fonts and return ``(sans_name, serif_name)``.
+
+    Prefers TrueType fonts that get **embedded** into the PDF so the
+    output renders identically on macOS Preview / Adobe / iOS / Windows.
+    Previously we relied on UnicodeCIDFont (HeiseiKakuGo-W5), which
+    only embeds the CID descriptor and lets the reader substitute its
+    own font — that caused glyph fallback / kerning regressions on
+    desktop PC PDF readers (especially Chromium / Edge built-in).
+
+    Search order:
+      1. fonts-noto-cjk on Linux (Cloud Run base image), with both the
+         Debian Bookworm path and several alternate paths to be robust
+         to different package layouts
+      2. macOS bundled Hiragino (local dev)
+      3. Fall back to UnicodeCIDFont
+    """
+    import glob as _glob
+    # Debian fonts-noto-cjk lays files under several possible directories;
+    # also support fonts-noto-cjk-vf (variable font) and any noto cjk file
+    # the operator drops into the image manually.
+    extra_globs: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/NotoSansCJK*.ttc",
+        "/usr/share/fonts/**/NotoSansCJK*.otf",
+        "/usr/share/fonts/**/NotoSans*JP*.otf",
+        "/usr/share/fonts/**/NotoSans*JP*.ttf",
+    ):
+        extra_globs.extend(_glob.glob(pat, recursive=True))
+    extra_globs_serif: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/NotoSerifCJK*.ttc",
+        "/usr/share/fonts/**/NotoSerif*JP*.otf",
+        "/usr/share/fonts/**/NotoSerif*JP*.ttf",
+    ):
+        extra_globs_serif.extend(_glob.glob(pat, recursive=True))
+
+    # Reportlab TTFont supports TrueType (glyf table) only — NOT OpenType
+    # CFF (postscript outlines). fonts-noto-cjk ships .ttc with CFF
+    # glyphs, so we use IPAex / IPA Gothic + Mincho (TTF, glyf) instead.
+    extra_ipa: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/ipaexg.ttf",
+        "/usr/share/fonts/**/ipag.ttf",
+        "/usr/share/fonts/**/ipagp.ttf",
+    ):
+        extra_ipa.extend(_glob.glob(pat, recursive=True))
+    extra_ipa_serif: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/ipaexm.ttf",
+        "/usr/share/fonts/**/ipam.ttf",
+        "/usr/share/fonts/**/ipamp.ttf",
+    ):
+        extra_ipa_serif.extend(_glob.glob(pat, recursive=True))
+
+    candidates_sans = [
+        # IPAex Gothic (TTF, well-supported by reportlab)
+        ("/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf", 0),
+        ("/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf", 0),
+    ] + [(p, 0) for p in extra_ipa] + [
+        # macOS Hiragino — only useful for local dev
+        ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
+        ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+    ]
+    candidates_serif = [
+        ("/usr/share/fonts/opentype/ipaexfont-mincho/ipaexm.ttf", 0),
+        ("/usr/share/fonts/opentype/ipafont-mincho/ipam.ttf", 0),
+    ] + [(p, 0) for p in extra_ipa_serif] + [
+        ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc", 0),
+    ]
+    # Remove the now-unused glob lists from earlier (we kept the Noto
+    # globs but they're guaranteed to fail TTFont registration). Strip
+    # them to avoid noisy fallback warnings.
+    extra_globs = []
+    extra_globs_serif = []
+
+    import logging as _logging
+    _diag_logger = _logging.getLogger("app.services.export_pdf")
+
+    def _try_register(name: str, path: str, idx: int) -> bool:
+        try:
+            pdfmetrics.registerFont(TTFont(name, path, subfontIndex=idx))
+            return True
+        except Exception as e:
+            _diag_logger.warning(
+                "[export_pdf] TTFont(%r, %r, subfontIndex=%d) failed: %s",
+                name, path, idx, e
+            )
+            return False
+
+    sans_name = None
+    for path, idx in candidates_sans:
+        if os.path.exists(path) and _try_register('DeepNoteSansJP', path, idx):
+            sans_name = 'DeepNoteSansJP'
+            break
+    serif_name = None
+    for path, idx in candidates_serif:
+        if os.path.exists(path) and _try_register('DeepNoteSerifJP', path, idx):
+            serif_name = 'DeepNoteSerifJP'
+            break
+
+    if sans_name is None:
+        pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+        sans_name = 'HeiseiKakuGo-W5'
+    if serif_name is None:
+        pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
+        serif_name = 'HeiseiMin-W3'
+    # Log what we ended up with so the operator can confirm Noto is
+    # actually being embedded (vs. CID fallback). Visible on Cloud Run
+    # cold start logs.
+    import logging as _logging
+    _logger = _logging.getLogger("app.services.export_pdf")
+    if sans_name.startswith("DeepNote"):
+        _logger.info("[export_pdf] embedded Noto sans font: %s", sans_name)
+    else:
+        # Log what fonts ARE on disk so the operator can spot the
+        # actual filename without shelling into the container.
+        import glob as __g
+        present: List[str] = []
+        for pat in ("/usr/share/fonts/**/*.ttc",
+                    "/usr/share/fonts/**/*.otf",
+                    "/usr/share/fonts/**/*.ttf"):
+            present.extend(__g.glob(pat, recursive=True))
+        _logger.warning(
+            "[export_pdf] FALLING BACK to CID font: %s (expected Noto). "
+            "Tried: %s. Fonts on disk: %s",
+            sans_name,
+            ", ".join(p for p, _ in candidates_sans),
+            ", ".join(present[:30]) or "(none)")
+    return sans_name, serif_name
+
+
+FONT, FONT_SERIF = _register_jp_fonts()
 PAGE_W, PAGE_H = A4
 MARGIN = 18 * mm
 CONTENT_W = PAGE_W - 2 * MARGIN
