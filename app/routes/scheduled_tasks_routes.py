@@ -268,23 +268,68 @@ async def scheduler_tick(
     }
 
 
+def _count_open_todos(account_id: str) -> Optional[int]:
+    """Cheap count of open TODOs for the digest body. Returns None on
+    Firestore failure so the dispatcher can fall back to a generic body
+    text without breaking the tick."""
+    try:
+        from app.services.assistant_briefing import _open_todos as _ot
+        rows = _ot(account_id, limit=20)
+        return len(rows)
+    except Exception as e:
+        logger.warning("[dispatcher] open todo count failed: %s", e)
+        return None
+
+
+def _count_recent_sessions(account_id: str, *, days: int = 7) -> Optional[int]:
+    """Count of sessions in the last ``days`` for the meeting digest."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        from app.firebase import db as _db
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        n = 0
+        for _ in (_db.collection("sessions")
+                  .where("ownerAccountId", "==", account_id)
+                  .where("createdAt", ">=", cutoff)
+                  .limit(50)
+                  .stream()):
+            n += 1
+        return n
+    except Exception as e:
+        logger.warning("[dispatcher] recent sessions count failed: %s", e)
+        return None
+
+
 def _build_desktop_notification(task: Dict[str, Any]) -> Dict[str, str]:
     """Render title/body for a desktop-channel notification based on
     task type. AI is intentionally NOT used here — this path runs
     every minute and must stay free of LLM latency/cost. Dynamic
-    content (TODO counts, meeting counts) can be folded in by future
-    PRs reading from existing summary/todo collections.
+    counts come from cheap Firestore reads; on failure we fall back
+    to a generic body text.
     """
     t = (task.get("type") or "").lower()
     label = (task.get("label") or "").strip()
     plan = task.get("automationPlan") or {}
     plan_title = (plan.get("title") or "").strip()
+    account_id = task.get("accountId") or ""
     if t == "daily_todo_digest" or t == "daily_open_todos":
-        return {"title": "今日のTODO",
-                "body": label or "未完了TODOがあります。Desktop で確認してください。"}
+        n = _count_open_todos(account_id) if account_id else None
+        if n is None:
+            body = label or "未完了TODOがあります。Desktop で確認してください。"
+        elif n == 0:
+            body = "未完了TODOはありません。"
+        else:
+            body = f"未完了TODOが{n}件あります。Desktop で確認してください。"
+        return {"title": "今日のTODO", "body": body}
     if t == "weekly_meeting_digest":
-        return {"title": "先週の会議まとめ",
-                "body": label or "先週の会議まとめが届きました。Desktop で確認してください。"}
+        n = _count_recent_sessions(account_id, days=7) if account_id else None
+        if n is None:
+            body = label or "先週の会議まとめが届きました。Desktop で確認してください。"
+        elif n == 0:
+            body = "先週の会議はありません。"
+        else:
+            body = f"先週の会議は{n}件です。Desktop で確認してください。"
+        return {"title": "先週の会議まとめ", "body": body}
     if t == "session_followup":
         return {"title": "会議の要約が完了しました",
                 "body": label or "要約・決定事項・TODOを確認できます。"}
@@ -329,7 +374,11 @@ def _dispatch(account_id: str, task: Dict[str, Any]) -> None:
     # ── Desktop: write to notification_events. Idempotent on
     # (accountId, idempotencyKey).
     if channel == "desktop":
-        rendered = _build_desktop_notification(task)
+        # Carry accountId so _build_desktop_notification can do
+        # cheap Firestore counts (TODOs, sessions) for richer body text.
+        rendered_task = dict(task)
+        rendered_task["accountId"] = account_id
+        rendered = _build_desktop_notification(rendered_task)
         ev = _notif.create(
             account_id=account_id,
             notification_type=task_type or "system",
