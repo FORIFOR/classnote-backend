@@ -35,20 +35,44 @@ def _register_jp_fonts() -> tuple[str, str]:
     desktop PC PDF readers (especially Chromium / Edge built-in).
 
     Search order:
-      1. fonts-noto-cjk on Linux (Cloud Run base image)
+      1. fonts-noto-cjk on Linux (Cloud Run base image), with both the
+         Debian Bookworm path and several alternate paths to be robust
+         to different package layouts
       2. macOS bundled Hiragino (local dev)
       3. Fall back to UnicodeCIDFont
     """
+    import glob as _glob
+    # Debian fonts-noto-cjk lays files under several possible directories;
+    # also support fonts-noto-cjk-vf (variable font) and any noto cjk file
+    # the operator drops into the image manually.
+    extra_globs: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/NotoSansCJK*.ttc",
+        "/usr/share/fonts/**/NotoSansCJK*.otf",
+        "/usr/share/fonts/**/NotoSans*JP*.otf",
+        "/usr/share/fonts/**/NotoSans*JP*.ttf",
+    ):
+        extra_globs.extend(_glob.glob(pat, recursive=True))
+    extra_globs_serif: List[str] = []
+    for pat in (
+        "/usr/share/fonts/**/NotoSerifCJK*.ttc",
+        "/usr/share/fonts/**/NotoSerif*JP*.otf",
+        "/usr/share/fonts/**/NotoSerif*JP*.ttf",
+    ):
+        extra_globs_serif.extend(_glob.glob(pat, recursive=True))
+
     candidates_sans = [
-        # fonts-noto-cjk apt package (Cloud Run / dev container)
+        # Hard-coded Bookworm path first (fast path)
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 0),
+    ] + [(p, 0) for p in extra_globs] + [
         # macOS Hiragino
         ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
     ]
     candidates_serif = [
         ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 0),
+    ] + [(p, 0) for p in extra_globs_serif] + [
         ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc", 0),
     ]
 
@@ -85,11 +109,20 @@ def _register_jp_fonts() -> tuple[str, str]:
     if sans_name.startswith("DeepNote"):
         _logger.info("[export_pdf] embedded Noto sans font: %s", sans_name)
     else:
+        # Log what fonts ARE on disk so the operator can spot the
+        # actual filename without shelling into the container.
+        import glob as __g
+        present: List[str] = []
+        for pat in ("/usr/share/fonts/**/*.ttc",
+                    "/usr/share/fonts/**/*.otf",
+                    "/usr/share/fonts/**/*.ttf"):
+            present.extend(__g.glob(pat, recursive=True))
         _logger.warning(
             "[export_pdf] FALLING BACK to CID font: %s (expected Noto). "
-            "Check fonts-noto-cjk installed in the container image. "
-            "Tried: %s", sans_name,
-            ", ".join(p for p, _ in candidates_sans))
+            "Tried: %s. Fonts on disk: %s",
+            sans_name,
+            ", ".join(p for p, _ in candidates_sans),
+            ", ".join(present[:30]) or "(none)")
     return sans_name, serif_name
 
 
