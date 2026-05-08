@@ -92,6 +92,30 @@
         { "fieldPath": "accountId", "order": "ASCENDING" },
         { "fieldPath": "idempotencyKey", "order": "ASCENDING" }
       ]
+    },
+
+    {
+      "collectionGroup": "scheduled_task_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "idempotencyKey", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "scheduled_task_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "taskId", "order": "ASCENDING" },
+        { "fieldPath": "startedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "scheduled_task_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "accountId", "order": "ASCENDING" },
+        { "fieldPath": "startedAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
