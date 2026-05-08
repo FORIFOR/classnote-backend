@@ -77,6 +77,19 @@ def _register_jp_fonts() -> tuple[str, str]:
     if serif_name is None:
         pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
         serif_name = 'HeiseiMin-W3'
+    # Log what we ended up with so the operator can confirm Noto is
+    # actually being embedded (vs. CID fallback). Visible on Cloud Run
+    # cold start logs.
+    import logging as _logging
+    _logger = _logging.getLogger("app.services.export_pdf")
+    if sans_name.startswith("DeepNote"):
+        _logger.info("[export_pdf] embedded Noto sans font: %s", sans_name)
+    else:
+        _logger.warning(
+            "[export_pdf] FALLING BACK to CID font: %s (expected Noto). "
+            "Check fonts-noto-cjk installed in the container image. "
+            "Tried: %s", sans_name,
+            ", ".join(p for p, _ in candidates_sans))
     return sans_name, serif_name
 
 
