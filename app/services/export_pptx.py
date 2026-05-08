@@ -198,16 +198,25 @@ def _slide_compact_summary(
     cur_y = Inches(0.85)
     inner_w = CONTENT_W
 
-    # Overview (first paragraph only)
+    # Overview — multi-line, soft-truncated (preserve paragraphs / wrap long lines)
     if overview:
-        first = (overview or "").strip().splitlines()[0][:200]
-        if first:
-            ov = slide.shapes.add_textbox(MARGIN_X, cur_y, inner_w, Inches(0.65))
-            ovp = ov.text_frame.paragraphs[0]
-            ovp.text = first
-            ovp.font.size = Pt(12)
-            ovp.font.color.rgb = C_TEXT
-            cur_y += Inches(0.7)
+        cleaned = (overview or "").strip()
+        if cleaned:
+            OV_MAX = 600
+            if len(cleaned) > OV_MAX:
+                tail = cleaned[:OV_MAX]
+                cut = max(tail.rfind("。"), tail.rfind("\n"), tail.rfind(". "))
+                cleaned = (tail[: cut + 1] if cut > 200 else tail) + "…"
+            ov_h = Inches(1.4)
+            ov = slide.shapes.add_textbox(MARGIN_X, cur_y, inner_w, ov_h)
+            tf = ov.text_frame
+            tf.word_wrap = True
+            for i, line in enumerate(cleaned.splitlines() or [cleaned]):
+                para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                para.text = line
+                para.font.size = Pt(12)
+                para.font.color.rgb = C_TEXT
+            cur_y += ov_h + Inches(0.15)
 
     # Two columns: highlights (left) + digest bullets (right)
     col_w = (CONTENT_W - Inches(0.3)) / 2
