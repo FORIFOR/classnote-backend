@@ -293,6 +293,82 @@ def mark_run(account_id: str, task_id: str, *, success: bool, message: str = "",
         upd["lastRunOutcome"] = "failed"
         upd["lastError"] = {"message": message[:500], "at": now}
     ref.update(upd)
+    # Append a row to scheduled_task_runs for audit-grade history.
+    # Failure to write the run doc must not block lease release; tick
+    # cannot retry mark_run safely once nextRunAt has advanced.
+    try:
+        record_run(
+            account_id=account_id,
+            task_id=task_id,
+            run_slot=run_slot,
+            status="succeeded" if success else "failed",
+            finished_at=now,
+            error=None if success else (message or None),
+        )
+    except Exception as e:
+        logger.warning("[scheduled_tasks.mark_run] record_run failed task=%s err=%s",
+                       task_id, e)
+
+
+def record_run(
+    *,
+    account_id: str,
+    task_id: str,
+    run_slot: Optional[datetime],
+    status: str,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+    error: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Append a single run-history row to ``scheduled_task_runs/{runId}``.
+
+    Idempotent: a second call with the same (taskId, runSlot) returns the
+    existing run id without writing a duplicate. ``run_slot`` may be None
+    for runs that don't correspond to a scheduler-issued slot (e.g. a
+    manual ``:run`` admin call) — those rows skip the idempotency check.
+    """
+    if status not in ("succeeded", "failed"):
+        raise ValueError(f"record_run: invalid status {status!r}")
+    finished_at = finished_at or datetime.now(timezone.utc)
+    started_at = started_at or finished_at
+    coll = db.collection("scheduled_task_runs")
+    idem_key: Optional[str] = None
+    if run_slot is not None:
+        slot_iso = run_slot.isoformat() if hasattr(run_slot, "isoformat") else str(run_slot)
+        idem_key = f"scheduled_task:{task_id}:{slot_iso}"
+        try:
+            existing = list(
+                coll.where(filter=firestore.FieldFilter("idempotencyKey", "==", idem_key))
+                .limit(1)
+                .stream()
+            )
+            if existing:
+                return existing[0].id
+        except Exception as e:
+            # Index-missing or transient: do not block — fall through to
+            # write. A duplicate doc is preferable to a missing audit row.
+            logger.warning("[scheduled_tasks.record_run] idem lookup failed: %s", e)
+
+    run_id = f"run_{uuid.uuid4().hex[:16]}"
+    doc: Dict[str, Any] = {
+        "id": run_id,
+        "taskId": task_id,
+        "accountId": account_id,
+        "status": status,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+    }
+    if run_slot is not None:
+        doc["runSlot"] = run_slot
+    if idem_key:
+        doc["idempotencyKey"] = idem_key
+    if error:
+        doc["error"] = {"message": str(error)[:500]}
+    if result:
+        doc["result"] = result
+    coll.document(run_id).set(doc)
+    return run_id
 
 
 # ──────────────────────────────────────────────────────────────────────

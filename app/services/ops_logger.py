@@ -214,6 +214,62 @@ class OpsLogger:
 ops_logger = OpsLogger()
 
 
+def log_ops_event(
+    event: str,
+    *,
+    severity: str = "INFO",
+    account_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+) -> Optional[str]:
+    """Generic free-form ops event for the Core System (automation /
+    scheduler / integration / todo-candidate). Writes to the same
+    ``ops_events`` Firestore collection as the typed events so the
+    existing operator dashboard surfaces it.
+
+    Differs from ``OpsLogger.log()`` in that ``event`` is a plain
+    string — the legacy ``EventType`` enum is closed and adding new
+    domains there forces a schema bump. New domains use this helper
+    instead and store the discriminator under ``event`` (free-form)
+    while keeping ``type`` empty so legacy queries are unaffected.
+
+    Failures are swallowed to stdlib logger so a Firestore outage
+    cannot break the primary code path (same policy as ``OpsLogger.log``).
+    """
+    sev_norm = (severity or "INFO").upper()
+    if sev_norm not in ("INFO", "WARN", "ERROR"):
+        sev_norm = "INFO"
+    event_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    doc: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc),
+        "severity": sev_norm,
+        "event": event,
+    }
+    if account_id:
+        doc["accountId"] = account_id
+    if user_id:
+        doc["userId"] = user_id
+        doc["uid"] = user_id  # back-compat with legacy uid index
+    if resource_type:
+        doc["resourceType"] = resource_type
+    if resource_id:
+        doc["resourceId"] = resource_id
+    if request_id:
+        doc["requestId"] = request_id
+    if metadata:
+        doc["metadata"] = metadata
+    try:
+        db = ops_logger._get_db()
+        db.collection("ops_events").document(event_id).set(doc)
+    except Exception as e:
+        logger.error(f"log_ops_event Firestore write failed event={event} err={e}")
+        return None
+    return event_id
+
+
 # 便利関数
 def log_session_create(
     uid: str,
