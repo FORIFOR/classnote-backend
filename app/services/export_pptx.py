@@ -79,22 +79,202 @@ def render_pptx(
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
 
+    # 2026-05-08 design refresh: PPTX is now a 1–2 slide compact deck
+    # so it stays readable as a "summary attachment" rather than a
+    # 10-slide per-section deck. Slide 1 is the title hero; slide 2
+    # consolidates the highlights + key decisions/TODOs/overview
+    # extracted from sections. The detailed per-section content stays
+    # in the PDF / DOCX export.
+
     # Slide 1: Title + bottom line
     _slide_title(prs, title, date_text, duration_text, mode,
                  bottom_line, why_it_matters, outcome_status)
 
-    # Slide 2: Highlights + participants + overview
+    # Slide 2: Compact "everything else" — only emit when we have
+    # something to show.
     rich_hls = _normalize_highlights(highlights)
-    if rich_hls or participants or overview:
-        _slide_highlights(prs, rich_hls, participants, overview, keywords)
-
-    # Slide 3+: Section content, one or more slides as needed
-    for sec in (sections or []):
-        _render_section_slide(prs, sec)
+    digest_bullets = _condense_sections_to_bullets(sections or [], limit=8)
+    if rich_hls or participants or overview or digest_bullets or keywords:
+        _slide_compact_summary(
+            prs,
+            highlights=rich_hls,
+            participants=participants,
+            overview=overview,
+            keywords=keywords,
+            digest_bullets=digest_bullets,
+        )
 
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────
+# Compact summary helpers (2026-05-08 design refresh)
+# ─────────────────────────────────────────────────────
+
+def _condense_sections_to_bullets(
+    sections: List[Dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> List[Tuple[str, str]]:
+    """Flatten arbitrarily many sections into ``(label, text)`` pairs
+    so the 2-slide deck can show a small snapshot. Stops at ``limit``
+    bullets — anything past that lives in the PDF / DOCX exports.
+
+    Recognised section variants (best-effort, robust to missing keys):
+      - ``type: "bullets"`` → up to 3 from ``items``
+      - ``type: "grouped_bullets"`` → flatten 1 group, up to 3 items
+      - ``type: "table"`` → first column of up to 2 rows
+      - ``type: "cards"`` → first ``title`` of up to 2 cards
+      - ``type: "text"`` → first sentence
+    """
+    out: List[Tuple[str, str]] = []
+    for sec in sections:
+        label = (sec.get("title") or "").strip() or "—"
+        st = (sec.get("type") or "").lower()
+        items_added = 0
+        if st in ("bullets", ""):
+            for it in (sec.get("items") or [])[:3]:
+                txt = it if isinstance(it, str) else (it.get("text") or "")
+                if txt:
+                    out.append((label, txt))
+                    items_added += 1
+        elif st == "grouped_bullets":
+            groups = sec.get("groups") or []
+            for g in groups[:1]:
+                for it in (g.get("items") or [])[:3]:
+                    txt = it if isinstance(it, str) else (it.get("text") or "")
+                    if txt:
+                        out.append((label, txt))
+                        items_added += 1
+        elif st == "table":
+            for row in (sec.get("rows") or [])[:2]:
+                if row:
+                    out.append((label, str(row[0])))
+                    items_added += 1
+        elif st == "cards":
+            for card in (sec.get("cards") or [])[:2]:
+                t = (card.get("title") or "").strip()
+                if t:
+                    out.append((label, t))
+                    items_added += 1
+        elif st == "text":
+            body = (sec.get("body") or "").strip()
+            if body:
+                first_line = body.splitlines()[0][:120]
+                out.append((label, first_line))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _slide_compact_summary(
+    prs,
+    *,
+    highlights: List[Dict[str, Any]],
+    participants: Optional[List[Dict[str, str]]],
+    overview: Optional[str],
+    keywords: Optional[List[str]],
+    digest_bullets: List[Tuple[str, str]],
+) -> None:
+    """Single slide combining highlights + overview + digest bullets +
+    participants + keywords. Items are deliberately compressed so a
+    busy session still fits."""
+    slide = _blank_slide(prs)
+
+    # Header band
+    band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SLIDE_W, Inches(0.55))
+    band.fill.solid()
+    band.fill.fore_color.rgb = C_PRIMARY
+    band.line.fill.background()
+    head = slide.shapes.add_textbox(MARGIN_X, Inches(0.10), CONTENT_W, Inches(0.4))
+    hp = head.text_frame.paragraphs[0]
+    hp.text = "ハイライト & まとめ"
+    hp.font.size = Pt(16)
+    hp.font.bold = True
+    hp.font.color.rgb = C_WHITE
+
+    cur_y = Inches(0.85)
+    inner_w = CONTENT_W
+
+    # Overview (first paragraph only)
+    if overview:
+        first = (overview or "").strip().splitlines()[0][:200]
+        if first:
+            ov = slide.shapes.add_textbox(MARGIN_X, cur_y, inner_w, Inches(0.65))
+            ovp = ov.text_frame.paragraphs[0]
+            ovp.text = first
+            ovp.font.size = Pt(12)
+            ovp.font.color.rgb = C_TEXT
+            cur_y += Inches(0.7)
+
+    # Two columns: highlights (left) + digest bullets (right)
+    col_w = (CONTENT_W - Inches(0.3)) / 2
+    left_x = MARGIN_X
+    right_x = MARGIN_X + col_w + Inches(0.3)
+    list_h = Inches(3.4)
+
+    # Left column: highlights
+    if highlights:
+        lt = slide.shapes.add_textbox(left_x, cur_y, col_w, Inches(0.32))
+        ltp = lt.text_frame.paragraphs[0]
+        ltp.text = "Highlights"
+        ltp.font.size = Pt(11)
+        ltp.font.bold = True
+        ltp.font.color.rgb = C_PRIMARY
+        body = slide.shapes.add_textbox(left_x, cur_y + Inches(0.35), col_w, list_h)
+        bf = body.text_frame
+        bf.word_wrap = True
+        for i, h in enumerate(highlights[:5]):
+            txt = h.get("text") if isinstance(h, dict) else str(h)
+            if not txt: continue
+            para = bf.paragraphs[0] if i == 0 else bf.add_paragraph()
+            para.text = f"• {txt[:80]}"
+            para.font.size = Pt(11)
+            para.font.color.rgb = C_TEXT
+
+    # Right column: digest bullets (decisions / todos / etc.)
+    if digest_bullets:
+        rt = slide.shapes.add_textbox(right_x, cur_y, col_w, Inches(0.32))
+        rtp = rt.text_frame.paragraphs[0]
+        rtp.text = "決定事項・TODO・メモ"
+        rtp.font.size = Pt(11)
+        rtp.font.bold = True
+        rtp.font.color.rgb = C_PRIMARY
+        body = slide.shapes.add_textbox(right_x, cur_y + Inches(0.35), col_w, list_h)
+        bf = body.text_frame
+        bf.word_wrap = True
+        seen_label = ""
+        idx = 0
+        for label, txt in digest_bullets[:6]:
+            para = bf.paragraphs[0] if idx == 0 else bf.add_paragraph()
+            prefix = f"[{label[:8]}] " if label and label != seen_label else "• "
+            seen_label = label
+            para.text = f"{prefix}{txt[:80]}"
+            para.font.size = Pt(11)
+            para.font.color.rgb = C_TEXT
+            idx += 1
+
+    # Footer: participants + keywords on the same row
+    foot_y = SLIDE_H - Inches(0.85)
+    if participants:
+        names = [p.get("name") or "(不明)" for p in participants[:6]]
+        ptxt = "参加者: " + " / ".join(names)
+        if len(participants) > 6:
+            ptxt += f" 他 {len(participants)-6} 名"
+        pbox = slide.shapes.add_textbox(MARGIN_X, foot_y, CONTENT_W, Inches(0.3))
+        pp = pbox.text_frame.paragraphs[0]
+        pp.text = ptxt
+        pp.font.size = Pt(9)
+        pp.font.color.rgb = C_MUTED
+        foot_y += Inches(0.25)
+    if keywords:
+        kbox = slide.shapes.add_textbox(MARGIN_X, foot_y, CONTENT_W, Inches(0.3))
+        kp = kbox.text_frame.paragraphs[0]
+        kp.text = "Keywords: " + " · ".join(keywords[:8])
+        kp.font.size = Pt(9)
+        kp.font.color.rgb = C_PRIMARY
 
 
 # ─────────────────────────────────────────────────────

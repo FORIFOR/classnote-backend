@@ -195,26 +195,34 @@ def _render_section(doc: Document, sec: Dict[str, Any]) -> None:
 # Components
 # ─────────────────────────────────────────────────────
 def _section_header(doc: Document, label: str, accent_hex: str) -> None:
-    """Colored bar + heading using a 1x1 table for the accent stripe."""
-    tbl = doc.add_table(rows=1, cols=2)
-    tbl.autofit = False
-    tbl.columns[0].width = Cm(0.15)
-    tbl.columns[1].width = Cm(16.5)
-    tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
-    _shade_cell(tbl.rows[0].cells[0], accent_hex)
-    tbl.rows[0].cells[0].text = ""
-    cell = tbl.rows[0].cells[1]
-    cell.text = ""
-    p = cell.paragraphs[0]
+    """Plain bold mid-section heading with a thin hairline underline.
+
+    2026-05-08 design refresh: previously this rendered a 1x1 colored
+    bar + heading combo via a table. The colored stripe felt visually
+    heavy ("中項目の青いところがいらない"); the new layout is just a
+    bold paragraph with a 0.5pt grey bottom border so sections still
+    have a clear separator without competing with the body text.
+
+    ``accent_hex`` is intentionally ignored to keep the visual language
+    consistent (only the hero callout retains the brand accent).
+    """
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(8)
+    p.paragraph_format.space_after = Pt(2)
     run = p.add_run(label)
     run.bold = True
     run.font.size = Pt(12)
     run.font.color.rgb = C_HEAD
-    p.paragraph_format.space_before = Pt(2)
-    p.paragraph_format.space_after = Pt(2)
-    _set_cell_margins(cell, top=40, left=120, bottom=40, right=40)
-    _remove_table_borders(tbl)
-    doc.add_paragraph().paragraph_format.space_after = Pt(2)
+    # Hairline grey underline at the paragraph level
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "4")          # 0.5pt
+    bottom.set(qn("w:space"), "2")
+    bottom.set(qn("w:color"), "D6D6DC")  # very light grey
+    pBdr.append(bottom)
+    pPr.append(pBdr)
 
 
 def _hero_callout(

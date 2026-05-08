@@ -11,11 +11,12 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir app-store-server-library
-# Install ffmpeg and nodejs (for yt-dlp JS engine)
+# Install ffmpeg, nodejs, and Noto CJK fonts (for cross-platform PDF rendering)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
     ca-certificates \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp (System wide)

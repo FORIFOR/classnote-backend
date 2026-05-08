@@ -18,14 +18,69 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     HRFlowable, KeepTogether, PageBreak,
 )
+import os
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
 
-FONT = 'HeiseiKakuGo-W5'
-FONT_SERIF = 'HeiseiMin-W3'
+def _register_jp_fonts() -> tuple[str, str]:
+    """Register Japanese fonts and return ``(sans_name, serif_name)``.
+
+    Prefers TrueType fonts that get **embedded** into the PDF so the
+    output renders identically on macOS Preview / Adobe / iOS / Windows.
+    Previously we relied on UnicodeCIDFont (HeiseiKakuGo-W5), which
+    only embeds the CID descriptor and lets the reader substitute its
+    own font — that caused glyph fallback / kerning regressions on
+    desktop PC PDF readers (especially Chromium / Edge built-in).
+
+    Search order:
+      1. fonts-noto-cjk on Linux (Cloud Run base image)
+      2. macOS bundled Hiragino (local dev)
+      3. Fall back to UnicodeCIDFont
+    """
+    candidates_sans = [
+        # fonts-noto-cjk apt package (Cloud Run / dev container)
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc", 0),
+        # macOS Hiragino
+        ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0),
+        ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+    ]
+    candidates_serif = [
+        ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 0),
+        ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc", 0),
+    ]
+
+    sans_name = None
+    for path, idx in candidates_sans:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont('DeepNoteSansJP', path, subfontIndex=idx))
+                sans_name = 'DeepNoteSansJP'
+                break
+            except Exception:
+                continue
+    serif_name = None
+    for path, idx in candidates_serif:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont('DeepNoteSerifJP', path, subfontIndex=idx))
+                serif_name = 'DeepNoteSerifJP'
+                break
+            except Exception:
+                continue
+
+    if sans_name is None:
+        pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+        sans_name = 'HeiseiKakuGo-W5'
+    if serif_name is None:
+        pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
+        serif_name = 'HeiseiMin-W3'
+    return sans_name, serif_name
+
+
+FONT, FONT_SERIF = _register_jp_fonts()
 PAGE_W, PAGE_H = A4
 MARGIN = 18 * mm
 CONTENT_W = PAGE_W - 2 * MARGIN
