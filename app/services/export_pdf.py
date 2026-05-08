@@ -76,24 +76,30 @@ def _register_jp_fonts() -> tuple[str, str]:
         ("/System/Library/Fonts/ヒラギノ明朝 ProN.ttc", 0),
     ]
 
+    import logging as _logging
+    _diag_logger = _logging.getLogger("app.services.export_pdf")
+
+    def _try_register(name: str, path: str, idx: int) -> bool:
+        try:
+            pdfmetrics.registerFont(TTFont(name, path, subfontIndex=idx))
+            return True
+        except Exception as e:
+            _diag_logger.warning(
+                "[export_pdf] TTFont(%r, %r, subfontIndex=%d) failed: %s",
+                name, path, idx, e
+            )
+            return False
+
     sans_name = None
     for path, idx in candidates_sans:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont('DeepNoteSansJP', path, subfontIndex=idx))
-                sans_name = 'DeepNoteSansJP'
-                break
-            except Exception:
-                continue
+        if os.path.exists(path) and _try_register('DeepNoteSansJP', path, idx):
+            sans_name = 'DeepNoteSansJP'
+            break
     serif_name = None
     for path, idx in candidates_serif:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont('DeepNoteSerifJP', path, subfontIndex=idx))
-                serif_name = 'DeepNoteSerifJP'
-                break
-            except Exception:
-                continue
+        if os.path.exists(path) and _try_register('DeepNoteSerifJP', path, idx):
+            serif_name = 'DeepNoteSerifJP'
+            break
 
     if sans_name is None:
         pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
