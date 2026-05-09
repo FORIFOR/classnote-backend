@@ -145,13 +145,33 @@ async def google_oauth_callback(code: str, state: str, error: Optional[str] = No
 @router.get("/status")
 async def google_status(current_user: CurrentUser = Depends(get_current_user)):
     data = integ_store.load(current_user.uid, "google") or {}
+    is_connected = data.get("status") == "connected"
+    last_error = data.get("lastError")
+    # Desktop legacy `IntegrationsSection` (Settings page) reads
+    # ``status === 'active'`` and ``email`` from this endpoint. Surface
+    # those alongside the legacy ``connected`` / ``accountEmail`` fields
+    # so both shapes render correctly.
+    desktop_status = "active" if is_connected else ("error" if last_error else "disconnected")
+    scope_str = data.get("scope") or ""
+    scopes_list = scope_str.split() if isinstance(scope_str, str) and scope_str else []
+    err_msg = (last_error.get("message") if isinstance(last_error, dict)
+               else last_error if isinstance(last_error, str) else None)
     return {
-        "connected": data.get("status") == "connected",
+        # ── shape Desktop legacy IntegrationsSection expects ──
+        "status": desktop_status,                  # 'active' | 'disconnected' | 'error'
+        "email": data.get("accountEmail"),
+        "googleUserId": data.get("accountId"),
+        "scopes": scopes_list,
+        "connectedAt": data.get("connectedAt"),
+        "updatedAt": data.get("updatedAt"),
+        "errorMessage": err_msg,
+        # ── legacy/back-compat fields (kept) ──
+        "connected": is_connected,
         "accountEmail": data.get("accountEmail"),
         "accountId": data.get("accountId"),
         "scope": data.get("scope"),
         "expiresAt": data.get("expiresAt"),
-        "lastError": data.get("lastError"),
+        "lastError": last_error,
         "lastErrorAt": data.get("lastErrorAt"),
     }
 
