@@ -322,7 +322,7 @@ def _classify_command(text: str) -> str:
     return "unknown"
 
 
-def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str = "", raw_text: str = "") -> str:
+def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str = "", deepnote_uid: str = "", raw_text: str = "") -> str:
     if command == "greeting":
         return (
             "こんにちは。DeepNote Clow です。\n"
@@ -342,8 +342,14 @@ def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str
             return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
         try:
             from app.services import assistant_hub
+            # owner_uid must be the DeepNote Firebase uid (matches the
+            # ``ownerUserId`` field on session docs). Slack user IDs
+            # never appear on a session — passing one here would make
+            # resolve_session_id return None.
             result = _run_coroutine(assistant_hub.handle_message(
-                account_id=account_id, owner_uid=slack_user_id, question=q,
+                account_id=account_id,
+                owner_uid=deepnote_uid or slack_user_id,
+                question=q,
                 session_id=None, mode="session", channel="slack",
                 idempotency_key=None,
             ))
@@ -891,7 +897,12 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
                 logger.warning("[slack.pdf] direct attach failed, falling back to URL: %s", _e)
         # fall-through → URL reply
 
-    reply = _build_reply_for_linked(link["accountId"], command, slack_user_id=user, raw_text=text or "")
+    reply = _build_reply_for_linked(
+        link["accountId"], command,
+        slack_user_id=user,
+        deepnote_uid=link.get("deepnoteUid", ""),
+        raw_text=text or "",
+    )
     slack_client.post_message(team_id=team_id, channel=channel, text=reply)
     bot_audit.record(
         provider="slack", source_type="im",
