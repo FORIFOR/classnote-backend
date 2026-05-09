@@ -43,6 +43,15 @@ PROVIDERS = ("google", "microsoft")
 # ──────────────────────────────────────────────────────────────────────
 
 class IntegrationStatus(BaseModel):
+    # Per-capability fields (Desktop spec §3.4 — one row per capability,
+    # not per provider). ``id`` and ``capability`` are the canonical
+    # discriminator; ``status`` is the string form Desktop UI checks
+    # via ``status === 'connected'``.
+    id: Optional[str] = None
+    capability: Optional[str] = None
+    status: Optional[Literal["connected", "disconnected", "needs_reconnect"]] = None
+    # Provider-level fields (kept for back-compat with any consumer that
+    # still reads the per-provider shape).
     provider: Literal["google", "microsoft"]
     connected: bool
     email: Optional[str] = None
@@ -108,14 +117,16 @@ class CalendarEventsResponse(BaseModel):
 
 def _capabilities_from_scopes(provider: str, scopes: List[str]) -> Dict[str, bool]:
     """Translate raw OAuth scopes into the user-facing capability flags
-    the spec calls out (calendarRead / calendarWrite / mailDraft /
-    mailSend)."""
+    the spec calls out (calendarRead / calendarWrite / mailRead /
+    mailDraft / mailSend)."""
     s = set(scopes or [])
     if provider == "google":
         return {
             "calendarRead":  any("calendar" in x for x in s),
             "calendarWrite": "https://www.googleapis.com/auth/calendar.events" in s
                               or "https://www.googleapis.com/auth/calendar" in s,
+            "mailRead":      "https://www.googleapis.com/auth/gmail.readonly" in s
+                              or "https://www.googleapis.com/auth/gmail.modify" in s,
             "mailDraft":     "https://www.googleapis.com/auth/gmail.compose" in s
                               or "https://www.googleapis.com/auth/gmail.modify" in s,
             "mailSend":      "https://www.googleapis.com/auth/gmail.send" in s,
@@ -125,50 +136,90 @@ def _capabilities_from_scopes(provider: str, scopes: List[str]) -> Dict[str, boo
         return {
             "calendarRead":  any("calendars.read" in x for x in ls),
             "calendarWrite": "calendars.readwrite" in ls,
+            "mailRead":      "mail.read" in ls or "mail.readwrite" in ls,
             "mailDraft":     "mail.readwrite" in ls,
             "mailSend":      "mail.send" in ls,
         }
     return {}
 
 
-def _status_for(uid: str, provider: str) -> IntegrationStatus:
+# Per-capability rows the Desktop UI renders as one card each.
+# (capability_id, [capability flag keys it cares about])
+_CAPABILITY_MAP: Dict[str, List[tuple]] = {
+    "google": [
+        ("google_calendar", ["calendarRead", "calendarWrite"]),
+        ("gmail",           ["mailRead", "mailDraft", "mailSend"]),
+    ],
+    "microsoft": [
+        ("microsoft_calendar", ["calendarRead", "calendarWrite"]),
+        ("outlook_mail",       ["mailRead", "mailDraft", "mailSend"]),
+    ],
+}
+
+
+def _capability_rows_for(uid: str, provider: str) -> List[IntegrationStatus]:
+    """Build one ``IntegrationStatus`` per capability for a provider.
+
+    Desktop spec §3.4 expects 4 cards total:
+      - google → google_calendar, gmail
+      - microsoft → microsoft_calendar, outlook_mail
+    """
     rec = _store.load(uid, provider)
     if not rec:
-        return IntegrationStatus(
-            provider=provider,  # type: ignore[arg-type]
-            connected=False,
-            scopes=[],
-            capabilities={"calendarRead": False, "calendarWrite": False,
-                          "mailDraft": False, "mailSend": False},
-        )
+        return [
+            IntegrationStatus(
+                id=cap_id,
+                capability=cap_id,
+                status="disconnected",
+                provider=provider,  # type: ignore[arg-type]
+                connected=False,
+                scopes=[],
+                capabilities={k: False for k in keys},
+            )
+            for cap_id, keys in _CAPABILITY_MAP.get(provider, [])
+        ]
+
     # Storage key compatibility: integ_store.save_tokens persists ``scope``
     # as a space-separated string and ``accountEmail`` as the user's email.
-    # The canonical V1 contract surfaces ``scopes`` (list) and ``email``.
-    # Accept both shapes so the desktop client sees populated values
-    # whether the row came from save_tokens (legacy) or a writer that
-    # uses canonical keys directly.
     scopes_raw = rec.get("scopes") or rec.get("scope") or []
     if isinstance(scopes_raw, str):
         scopes = scopes_raw.split()
     else:
         scopes = list(scopes_raw)
-    return IntegrationStatus(
-        provider=provider,  # type: ignore[arg-type]
-        connected=bool(rec.get("status") == "connected"
-                       or rec.get("encryptedRefreshToken")),
-        email=rec.get("email") or rec.get("accountEmail"),
-        scopes=scopes,
-        capabilities=_capabilities_from_scopes(provider, scopes),
-        lastHealthCheckAt=rec.get("lastHealthCheckAt") and rec["lastHealthCheckAt"].isoformat()
-                          if hasattr(rec.get("lastHealthCheckAt"), "isoformat")
-                          else rec.get("lastHealthCheckAt"),
-        lastError=rec.get("lastError"),
-    )
+    email = rec.get("email") or rec.get("accountEmail")
+    full_caps = _capabilities_from_scopes(provider, scopes)
+    health = rec.get("lastHealthCheckAt")
+    if hasattr(health, "isoformat"):
+        health = health.isoformat()
+    last_error = rec.get("lastError")
+    rows: List[IntegrationStatus] = []
+    for cap_id, keys in _CAPABILITY_MAP.get(provider, []):
+        cap_subset = {k: bool(full_caps.get(k, False)) for k in keys}
+        # A capability is "connected" if the underlying provider has a
+        # token AND at least one of this capability's flags is True.
+        token_present = bool(rec.get("status") == "connected"
+                             or rec.get("encryptedRefreshToken"))
+        connected = token_present and any(cap_subset.values())
+        rows.append(IntegrationStatus(
+            id=cap_id,
+            capability=cap_id,
+            status="connected" if connected else "disconnected",
+            provider=provider,  # type: ignore[arg-type]
+            connected=connected,
+            email=email,
+            scopes=scopes,
+            capabilities=cap_subset,
+            lastHealthCheckAt=health,
+            lastError=last_error,
+        ))
+    return rows
 
 
 @router.get("", response_model=IntegrationsResponse)
 def list_integrations(current_user: CurrentUser = Depends(get_current_user)):
-    items = [_status_for(current_user.uid, p) for p in PROVIDERS]
+    items: List[IntegrationStatus] = []
+    for p in PROVIDERS:
+        items.extend(_capability_rows_for(current_user.uid, p))
     return IntegrationsResponse(items=items)
 
 
