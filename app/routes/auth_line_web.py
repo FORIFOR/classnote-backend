@@ -46,6 +46,20 @@ def _is_allowed_redirect(url: str) -> bool:
     return any(url.startswith(origin) for origin in ALLOWED_ORIGINS)
 
 
+def _append_query(url: str, param_name: str, param_value: str) -> str:
+    """Append ``param=value`` to ``url`` using the correct separator.
+
+    The bot connect login fallback passes a redirect URL that already
+    has its own query string (``?token=X&from=line``). Naively appending
+    ``?lineToken=...`` produced a malformed URL with two ``?`` so the
+    browser folded the new key into the previous param's value and
+    ``URLSearchParams.get('lineToken')`` returned null — breaking the
+    LINE Bot connect flow.
+    """
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{param_name}={quote(param_value)}"
+
+
 @router.get("/auth/line/web")
 async def line_web_start(
     redirect: str = Query(..., description="URL to redirect after login"),
@@ -87,15 +101,15 @@ async def line_web_callback(
     # Handle errors
     if error:
         logger.warning("[LINE Web] LINE returned error: %s (%s)", error, error_description)
-        return RedirectResponse(f"{redirect_url}?lineError={quote(error_description or error)}")
+        return RedirectResponse(_append_query(redirect_url, "lineError", error_description or error))
 
     if not code:
-        return RedirectResponse(f"{redirect_url}?lineError=no_code")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "no_code"))
 
     LINE_CLIENT_ID = os.environ.get("LINE_CHANNEL_ID")
     LINE_CLIENT_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
     if not LINE_CLIENT_ID or not LINE_CLIENT_SECRET:
-        return RedirectResponse(f"{redirect_url}?lineError=server_config")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "server_config"))
 
     # 1. Exchange code for tokens
     try:
@@ -111,16 +125,16 @@ async def line_web_callback(
                 },
             )
     except httpx.TimeoutException:
-        return RedirectResponse(f"{redirect_url}?lineError=timeout")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "timeout"))
 
     if token_resp.status_code != 200:
         logger.error("[LINE Web] Token exchange failed: %s", token_resp.text)
-        return RedirectResponse(f"{redirect_url}?lineError=token_failed")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "token_failed"))
 
     token_data = token_resp.json()
     id_token = token_data.get("id_token")
     if not id_token:
-        return RedirectResponse(f"{redirect_url}?lineError=no_id_token")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "no_id_token"))
 
     # 2. Verify ID token
     try:
@@ -130,11 +144,11 @@ async def line_web_callback(
                 data={"id_token": id_token, "client_id": LINE_CLIENT_ID},
             )
     except httpx.TimeoutException:
-        return RedirectResponse(f"{redirect_url}?lineError=verify_timeout")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "verify_timeout"))
 
     if verify_resp.status_code != 200:
         logger.error("[LINE Web] Verify failed: %s", verify_resp.text)
-        return RedirectResponse(f"{redirect_url}?lineError=verify_failed")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "verify_failed"))
 
     payload = verify_resp.json()
     line_user_id = payload.get("sub")
@@ -142,7 +156,7 @@ async def line_web_callback(
     picture = payload.get("picture")
 
     if not line_user_id:
-        return RedirectResponse(f"{redirect_url}?lineError=no_user")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "no_user"))
 
     logger.info("[LINE Web] Verified: sub=%s, name=%s", line_user_id, name)
 
@@ -156,8 +170,8 @@ async def line_web_callback(
         custom_token = custom_token_bytes.decode("utf-8")
     except Exception:
         logger.exception("Failed to create custom token for uid=%s", firebase_uid)
-        return RedirectResponse(f"{redirect_url}?lineError=firebase_error")
+        return RedirectResponse(_append_query(redirect_url, "lineError", "firebase_error"))
 
     # 4. Redirect to web app with token
     logger.info("[LINE Web] Success, redirecting to web app")
-    return RedirectResponse(f"{redirect_url}?lineToken={quote(custom_token)}")
+    return RedirectResponse(_append_query(redirect_url, "lineToken", custom_token))
