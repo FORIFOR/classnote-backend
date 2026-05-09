@@ -111,6 +111,35 @@ _PAGE_TEMPLATE = """<!doctype html>
     allBtns.forEach((b) => {{ b.disabled = busy; }});
   }}
 
+  function escapeHtml(s) {{
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {{
+      return ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}})[c];
+    }});
+  }}
+
+  async function deriveAccountSummary() {{
+    const u = auth.currentUser;
+    if (!u) return {{ identity: "(取得失敗)", source: "" }};
+    let source = "";
+    if (u.providerData && u.providerData.length > 0) {{
+      const pid = u.providerData[0].providerId || "";
+      if (pid === "google.com") source = "Google";
+      else if (pid === "apple.com") source = "Apple";
+      else source = pid;
+    }}
+    let identity = u.email || u.displayName || "";
+    // Custom-token sign-in (LINE) — providerData is empty; pull from claims.
+    if (!source || !identity) {{
+      try {{
+        const tokRes = await u.getIdTokenResult();
+        if (!source && tokRes.claims && tokRes.claims.provider === "line") source = "LINE";
+        if (!identity && tokRes.claims && tokRes.claims.name) identity = tokRes.claims.name;
+      }} catch (e) {{ /* ignore */ }}
+    }}
+    if (!identity) identity = u.uid ? ("uid:" + u.uid.substring(0, 12) + "…") : "(不明)";
+    return {{ identity: identity, source: source || "(不明)" }};
+  }}
+
   async function consume(idToken) {{
     status.textContent = "連携を確定しています…";
     const r = await fetch(consume_url, {{
@@ -118,9 +147,26 @@ _PAGE_TEMPLATE = """<!doctype html>
       headers: {{ "Authorization": "Bearer " + idToken }},
     }});
     if (r.ok) {{
+      let linkData = {{}};
+      try {{ linkData = await r.json(); }} catch (e) {{ /* ignore */ }}
+      const acct = await deriveAccountSummary();
       status.className = "ok";
-      status.textContent = provider_label + " と DeepNote の連携が完了しました。" +
-        provider_label + " のチャットに戻ってご利用ください。";
+      const idHtml = escapeHtml(acct.identity);
+      const srcHtml = escapeHtml(acct.source);
+      const lineId = linkData && linkData.lineUserId ? String(linkData.lineUserId) : "";
+      const lineFrag = lineId
+        ? "<div style='margin-top:6px'>" + provider_label + " ユーザー ID: <code>"
+          + escapeHtml(lineId.substring(0, 16)) + "…</code></div>"
+        : "";
+      status.innerHTML = ""
+        + "<div><strong>✓ " + provider_label + " と DeepNote の連携が完了しました</strong></div>"
+        + "<div style='margin-top:10px'>DeepNote アカウント: <strong>" + idHtml + "</strong>"
+        + " <span style='color:#666;font-size:12px'>(" + srcHtml + " ログイン)</span></div>"
+        + lineFrag
+        + "<div style='margin-top:10px;color:#555'>" + provider_label
+        + " のチャットに戻ってご利用ください。別のアカウントに切り替えるには "
+        + "<code>ログアウト</code> と " + provider_label
+        + " に送ってから連携し直してください。</div>";
       setBusy(true);
     }} else {{
       const body = await r.text();

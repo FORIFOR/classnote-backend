@@ -183,6 +183,23 @@ def get_link(line_user_id: str) -> Optional[Dict[str, Any]]:
     return snap.to_dict() or None
 
 
+def delete_link(line_user_id: str) -> bool:
+    """Remove the LINE userId ↔ DeepNote account link.
+
+    Returns True if a link existed and was deleted, False if no link
+    was present. Used by the LINE bot 1:1 ``ログアウト`` command and
+    by ``DELETE /integrations/me/links/line``.
+    """
+    if not line_user_id:
+        return False
+    ref = db.collection(USER_LINKS_COLLECTION).document(line_user_id)
+    snap = ref.get()
+    if not snap.exists:
+        return False
+    ref.delete()
+    return True
+
+
 def cleanup_expired(limit: int = 200) -> int:
     """Best-effort sweeper for expired token records (call from a cron)."""
     now = _now()

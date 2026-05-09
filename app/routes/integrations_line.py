@@ -76,7 +76,18 @@ class M:
         "・「決定事項」: 最新会議の決定事項\n"
         "・「資料」: 最新会議の PDF / DOCX / PPTX リンク\n"
         "・「PDF」「DOCX」「PPTX」: 個別フォーマット\n"
+        "・「ログアウト」: DeepNote 連携を解除（別アカウントで再連携する前に）\n"
         "・「ヘルプ」: この案内"
+    )
+
+    USER_UNLINKED_OK = (
+        "✅ DeepNote の連携を解除しました。\n"
+        "別のアカウントで連携し直すには、もう一度何かメッセージを送ってください。"
+    )
+
+    USER_UNLINK_NOT_LINKED = (
+        "現在 DeepNote と連携していません。\n"
+        "連携するには何かメッセージを送ってください。"
     )
 
     NOT_LINKED_INTRO = (
@@ -281,6 +292,12 @@ def _classify_command(text: str) -> str:
         return "assistant_qna"
     if any(k in t for k in ("ヘルプ", "help", "使い方", "?", "？")):
         return "help"
+    # 1:1 unlink (logout) — exact-match keywords so casual mentions in
+    # group chatter don't accidentally remove links. has_bot is not
+    # required here because the handler is gated to source_type=="user"
+    # in _handle_message_event.
+    if t in {"ログアウト", "logout", "サインアウト", "signout", "sign out"}:
+        return "user_unlink"
     # Phase 1 group ACL commands. Require an explicit DeepNote/Clow
     # mention so that bare 「接続」「切断」 in group chatter doesn't
     # accidentally trigger admin operations.
@@ -1059,6 +1076,24 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         return
 
     command = _classify_command(user_text)
+    # 1:1 unlink: ログアウト / logout — delete the LINE userId ↔ account
+    # link so the user can connect a different account next time. Only
+    # reachable in 1:1 source_type=="user" path; group context never
+    # gets here.
+    if command == "user_unlink":
+        deleted = line_link_tokens.delete_link(line_user_id)
+        msg = M.USER_UNLINKED_OK if deleted else M.USER_UNLINK_NOT_LINKED
+        line_messaging.reply(reply_token, [line_messaging.text_message(msg)])
+        bot_audit.record(
+            provider="line", source_type="user",
+            source_user_id=line_user_id,
+            account_id=link.get("accountId"),
+            deepnote_uid=link.get("deepnoteUid"),
+            command="user_unlink",
+            outcome="ok" if deleted else "not_linked",
+        )
+        return
+
     text = _build_reply_for_linked(link["accountId"], command, line_user_id=line_user_id, raw_text=user_text or "")
     line_messaging.reply(reply_token, [line_messaging.text_message(text)])
     bot_audit.record(
