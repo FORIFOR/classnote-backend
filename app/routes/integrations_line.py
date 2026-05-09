@@ -373,6 +373,26 @@ def _classify_command(text: str) -> str:
     for _cmd, _words in _EXACT_QUICK.items():
         if t in _words:
             return _cmd
+    # Natural-language artefact requests — the LLM can't generate signed
+    # asset URLs, so detect "give me the asset" patterns and route to
+    # the deterministic asset / format handler instead. Examples that
+    # should fire here (and not go to assistant_qna):
+    #   ・「最新の会議の資料を送って」
+    #   ・「PDF をください」
+    #   ・「ファイルが欲しい」
+    #   ・「パワポお願い」
+    _ACTION_WORDS = ("送って", "ほしい", "欲しい", "ください", "下さい",
+                     "お願い", "おねがい", "頂戴", "ちょうだい", "発行",
+                     "send", "want", "please", "give")
+    if any(a in t for a in _ACTION_WORDS):
+        if any(k in t for k in ("資料", "ファイル", "ドキュメント")):
+            return "assets"
+        if "pdf" in t or "ピーディーエフ" in t:
+            return "pdf"
+        if "docx" in t or "ワード" in t or "word" in t:
+            return "docx"
+        if "pptx" in t or "パワポ" in t or "powerpoint" in t:
+            return "pptx"
     # Anything else — natural-language request → forward to AI Assist
     # so the LLM can interpret intent. This is the same engine that
     # powers iOS / Desktop AI Assist; it has access to recent meetings,
