@@ -371,13 +371,27 @@ async def generate_playlist_timeline(
         prompt,
         GenerationConfig(
             temperature=0.5,
-            max_output_tokens=1024,
+            # 1024 tokens fit roughly 12-15 chapter objects. Long
+            # meetings (~45min) produced 0 items because the JSON array
+            # was truncated mid-row, json.loads failed, and the catch-
+            # all swallowed it as []. Give the model room for 30+
+            # chapters.
+            max_output_tokens=4096,
             response_mime_type="application/json",
         ),
         label="playlist",
     )
     # Gemini json mode returns text as JSON string
-    return (resp.text or "").strip()
+    raw = (resp.text or "").strip()
+    # Diagnostic: surface size + leading bytes so operators can tell at
+    # a glance whether the LLM emitted "[]", a truncated array, or full
+    # JSON. Capped at 200 chars to avoid log inflation / PII spillage.
+    preview = raw[:200].replace("\n", " ")
+    logger.info(
+        "[playlist.llm] transcript_chars=%d duration_sec=%s out_chars=%d preview=%s",
+        len(text), duration_sec, len(raw), preview,
+    )
+    return raw
 
 async def answer_question(text: str, question: str, mode: str = "lecture") -> dict:
     """

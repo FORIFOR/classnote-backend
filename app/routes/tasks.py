@@ -951,11 +951,30 @@ async def _handle_playlist_task_core(request: Request):
 
         try:
             raw_items = json.loads(playlist_json_str)
-        except:
+            parse_ok = True
+        except Exception as parse_err:
+            # Was previously a bare ``except:`` so a truncated /
+            # malformed JSON response from the LLM looked identical to a
+            # literal "[]" — operators couldn't tell which one happened.
+            logger.warning(
+                "[playlist.task] JSON parse failed for %s: %s | head=%s",
+                session_id, parse_err,
+                (playlist_json_str or "")[:200].replace("\n", " "),
+            )
             raw_items = []
+            parse_ok = False
 
         # [NEW] Normalize: ms/sec detection, duration clamp, validation
         items = normalize_playlist_items(raw_items, segments=segments, duration_sec=duration)
+        # Diagnostic so we can spot 0-item completions in logs without
+        # dumping the full LLM response.
+        logger.info(
+            "[playlist.task] %s parse_ok=%s raw=%d items=%d transcript=%d",
+            session_id, parse_ok,
+            len(raw_items) if isinstance(raw_items, list) else -1,
+            len(items),
+            len(transcript or ""),
+        )
 
         # Success
         ts = datetime.now(timezone.utc)
