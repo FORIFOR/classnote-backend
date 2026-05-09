@@ -443,9 +443,13 @@ def _hero_callout(
         inner.append(Paragraph(_escape(why_it_matters), STYLE_WHY))
 
     t = Table([[inner]], colWidths=[CONTENT_W])
+    # Background tint alone is enough accent for the hero callout. The
+    # 3pt LINEBEFORE that used to be here doubled visually with the
+    # ``_section_header`` LINEBEFORE 3pt immediately below
+    # ("参加者" / "要点" / "概要"), producing the "blue stripe twice"
+    # the user reported on PC PDF readers.
     t.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), C_PRIMARY_BG),
-        ('LINEBEFORE', (0, 0), (0, 0), 3, C_PRIMARY),
         ('LEFTPADDING', (0, 0), (-1, -1), 5*mm),
         ('RIGHTPADDING', (0, 0), (-1, -1), 5*mm),
         ('TOPPADDING', (0, 0), (-1, -1), 4*mm),

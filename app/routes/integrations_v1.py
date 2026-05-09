@@ -396,30 +396,64 @@ def calendar_events(
 
     items: List[CalendarEventDTO] = []
 
-    # Google
+    # ── Google ────────────────────────────────────────────────────────
+    # Fan out across the user's owned / writer calendars, not just
+    # ``primary``. Many people put work meetings on a secondary calendar
+    # (e.g. company.com) so a primary-only fetch returns 0 events even
+    # though the user has plenty of upcoming meetings.
     if (_store.load(current_user.uid, "google") or {}).get("encryptedRefreshToken"):
+        google_calendars: List[str] = ["primary"]
         try:
-            res = _g.list_calendar_events(
-                current_user.uid, time_min=f, time_max=t, max_results=50,
-            )
-            for ev in (res.get("items") or []):
-                start = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date")
-                end = (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date")
-                items.append(CalendarEventDTO(
-                    provider="google",
-                    externalEventId=ev.get("id") or "",
-                    title=ev.get("summary") or "(no title)",
-                    startAt=start, endAt=end,
-                    attendees=[{"email": a.get("email"), "displayName": a.get("displayName")}
-                               for a in (ev.get("attendees") or [])],
-                    meetingUrl=ev.get("hangoutLink"),
-                    location=ev.get("location"),
-                ))
+            cal_list = _g.list_calendar_list(current_user.uid)
+            for c in (cal_list.get("items") or []):
+                cid = c.get("id")
+                role = c.get("accessRole") or ""
+                if not cid:
+                    continue
+                # Skip the primary alias dup, holidays, birthdays, group
+                # subscribed read-only calendars. Keep only calendars the
+                # user actually owns or can write to.
+                if c.get("primary"):
+                    continue
+                if role not in ("owner", "writer"):
+                    continue
+                google_calendars.append(cid)
         except Exception as e:
-            logger.warning("[integrations.calendar.google] fan-out failed: %s", e)
+            logger.warning("[integrations.calendar.google] calendar_list failed: %s", e)
 
-    # Microsoft
+        google_count = 0
+        for cid in google_calendars:
+            try:
+                res = _g.list_calendar_events(
+                    current_user.uid, calendar_id=cid,
+                    time_min=f, time_max=t, max_results=50,
+                )
+                for ev in (res.get("items") or []):
+                    start = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date")
+                    end = (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date")
+                    items.append(CalendarEventDTO(
+                        provider="google",
+                        externalEventId=ev.get("id") or "",
+                        title=ev.get("summary") or "(no title)",
+                        startAt=start, endAt=end,
+                        attendees=[{"email": a.get("email"), "displayName": a.get("displayName")}
+                                   for a in (ev.get("attendees") or [])],
+                        meetingUrl=ev.get("hangoutLink"),
+                        location=ev.get("location"),
+                    ))
+                    google_count += 1
+            except Exception as e:
+                logger.warning("[integrations.calendar.google] fan-out failed for %s: %s", cid, e)
+        logger.info(
+            "[integrations.calendar.google] uid=%s fetched=%d calendars=%d range=%s..%s",
+            current_user.uid, google_count, len(google_calendars), f, t,
+        )
+
+    # ── Microsoft ─────────────────────────────────────────────────────
+    # ``/me/calendarView`` already aggregates across all calendars the
+    # user has access to in Microsoft Graph, so single fetch is enough.
     if (_store.load(current_user.uid, "microsoft") or {}).get("encryptedRefreshToken"):
+        ms_count = 0
         try:
             res = _ms.list_calendar_events(
                 current_user.uid,
@@ -438,8 +472,16 @@ def calendar_events(
                     meetingUrl=(ev.get("onlineMeeting") or {}).get("joinUrl"),
                     location=(ev.get("location") or {}).get("displayName"),
                 ))
+                ms_count += 1
         except Exception as e:
             logger.warning("[integrations.calendar.microsoft] fan-out failed: %s", e)
+        logger.info(
+            "[integrations.calendar.microsoft] uid=%s fetched=%d range=%s..%s",
+            current_user.uid, ms_count, f, t,
+        )
 
     items.sort(key=lambda e: e.startAt or "")
+    # Cap total to keep response payloads bounded (50 google + 50 ms
+    # was the implicit prior limit; keep the same effective ceiling).
+    items = items[:100]
     return CalendarEventsResponse(items=items)
