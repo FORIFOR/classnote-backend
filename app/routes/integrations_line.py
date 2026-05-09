@@ -37,6 +37,26 @@ logger = logging.getLogger("app.routes.integrations.line")
 router = APIRouter(prefix="/integrations/line", tags=["Integrations:LINE"])
 
 
+def _run_coroutine(coro):
+    """Run an async coroutine from inside this module's sync handlers.
+
+    The LINE webhook handler is ``async def`` (FastAPI async path), but
+    delegates to the sync ``_handle_message_event`` for per-event work.
+    Calling ``asyncio.run(coro)`` directly from there raises
+    ``RuntimeError: asyncio.run() cannot be called from a running event
+    loop`` because the FastAPI loop is already active in this thread.
+
+    Workaround: spin up a one-shot worker thread and execute
+    ``asyncio.run`` there — the new thread has no running loop, so
+    ``asyncio.run`` works as designed. Cost is one thread per call,
+    acceptable for chat-bot QPS.
+    """
+    import asyncio
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────
@@ -380,9 +400,8 @@ def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str 
         if not q:
             return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
         try:
-            import asyncio
             from app.services import assistant_hub
-            result = asyncio.run(assistant_hub.handle_message(
+            result = _run_coroutine(assistant_hub.handle_message(
                 account_id=account_id, owner_uid=line_user_id, question=q,
                 session_id=None, mode="session", channel="line",
                 idempotency_key=None,
@@ -967,9 +986,8 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
                     "質問を入力してください。例: 「決定事項は？」「TODO は？」")])
                 return
             try:
-                import asyncio
                 from app.services import assistant_hub
-                result = asyncio.run(assistant_hub.handle_message(
+                result = _run_coroutine(assistant_hub.handle_message(
                     account_id=ctx.billing_owner_account_id,
                     owner_uid=ctx.billing_owner_deepnote_uid,
                     question=q, session_id=None, mode="session",

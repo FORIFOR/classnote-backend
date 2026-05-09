@@ -36,6 +36,21 @@ logger = logging.getLogger("app.routes.integrations.slack")
 router = APIRouter(prefix="/integrations/slack", tags=["Integrations:Slack"])
 
 
+def _run_coroutine(coro):
+    """Run an async coroutine from inside this module's sync handlers.
+
+    The Slack events handler is ``async def`` (FastAPI async path) but
+    delegates per-event work to sync helpers. ``asyncio.run(coro)``
+    raises ``RuntimeError: cannot be called from a running event loop``
+    when called from those helpers because the FastAPI loop is already
+    active in this thread. Run on a fresh thread instead.
+    """
+    import asyncio
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Configuration helpers
 # ──────────────────────────────────────────────────────────────────────
@@ -326,9 +341,8 @@ def _build_reply_for_linked(account_id: str, command: str, *, slack_user_id: str
         if not q:
             return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
         try:
-            import asyncio
             from app.services import assistant_hub
-            result = asyncio.run(assistant_hub.handle_message(
+            result = _run_coroutine(assistant_hub.handle_message(
                 account_id=account_id, owner_uid=slack_user_id, question=q,
                 session_id=None, mode="session", channel="slack",
                 idempotency_key=None,
@@ -730,9 +744,8 @@ def _handle_message_event(team_id: str, event: Dict[str, Any]) -> None:
                     thread_ts=thread_ts)
                 return
             try:
-                import asyncio
                 from app.services import assistant_hub
-                result = asyncio.run(assistant_hub.handle_message(
+                result = _run_coroutine(assistant_hub.handle_message(
                     account_id=ctx.billing_owner_account_id,
                     owner_uid=ctx.billing_owner_deepnote_uid,
                     question=q, session_id=None, mode="session",
