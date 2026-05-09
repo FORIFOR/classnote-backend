@@ -1473,7 +1473,10 @@ async def consume_link_token(
     """Consume the token and persist line_user_id ↔ deepnote uid link.
 
     Caller must present a valid Firebase ID token (Authorization: Bearer …)
-    just like the rest of the API."""
+    just like the rest of the API. After a successful link the bot pushes
+    a confirmation message to the LINE chat so the user sees they are
+    signed in even if the deeplink-back-to-app step is silently lost.
+    """
     try:
         data = line_link_tokens.consume(
             token,
@@ -1482,9 +1485,31 @@ async def consume_link_token(
         )
     except line_link_tokens.TokenError as e:
         raise HTTPException(status_code=e.status, detail=e.code)
+
+    line_user_id = data.get("lineUserId")
+    if line_user_id and line_messaging.is_configured():
+        identity = (
+            current_user.email
+            or current_user.display_name
+            or f"uid:{current_user.uid[:12]}…"
+        )
+        msg = (
+            "✅ DeepNote にログインできました。\n"
+            f"アカウント: {identity}\n\n"
+            "「ヘルプ」と送ると使えるコマンド一覧が出ます。\n"
+            "別のアカウントに切り替えるには「ログアウト」と送ってください。"
+        )
+        try:
+            line_messaging.push(line_user_id, [line_messaging.text_message(msg)])
+        except Exception as e:
+            # Push failure must not fail the link confirmation; the
+            # browser success page already shows the same info.
+            logger.warning("[line.consume] post-link push failed lineUserId=%s err=%s",
+                           line_user_id, e)
+
     return {
         "linked": True,
-        "lineUserId": data["lineUserId"],
+        "lineUserId": line_user_id,
         "lineSourceType": data.get("lineSourceType"),
     }
 
