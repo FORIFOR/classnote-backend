@@ -69,15 +69,20 @@ def _is_line_inapp(user_agent: Optional[str]) -> bool:
 class M:
     HELP = (
         "DeepNote と LINE の連携BOTです。\n"
-        "次のメッセージで応答します:\n"
-        "・「クレジット」: あなたのDeepNoteアカウントのクレジット残量\n"
+        "クイックコマンド:\n"
         "・「最新」: 最新の会議の要約\n"
         "・「TODO」: 直近のTODO（最大3件）\n"
         "・「決定事項」: 最新会議の決定事項\n"
         "・「資料」: 最新会議の PDF / DOCX / PPTX リンク\n"
         "・「PDF」「DOCX」「PPTX」: 個別フォーマット\n"
+        "・「クレジット」: あなたのDeepNoteアカウントのクレジット残量\n"
         "・「ログアウト」: DeepNote 連携を解除（別アカウントで再連携する前に）\n"
-        "・「ヘルプ」: この案内"
+        "・「ヘルプ」: この案内\n\n"
+        "自然な質問・依頼にも答えます（DeepNote / iOS / Desktop と同じ AI Assist が応答）:\n"
+        "・「先週のA社の決定事項は?」\n"
+        "・「最新の会議の資料を送って」\n"
+        "・「今週の TODO のうち期限が近いものは?」\n"
+        "・「営業会議の参加者を教えて」"
     )
 
     USER_UNLINKED_OK = (
@@ -329,23 +334,30 @@ def _classify_command(text: str) -> str:
         if any(off in t for off in ("off", "オフ", "無効", "停止", "disable")):
             return "digest_off"
         return "digest_status"
-    if any(k in t for k in ("クレジット", "残量", "credit")):
-        return "credit"
-    if any(k in t for k in ("最新", "会議", "summary", "要約")):
-        return "latest"
-    if any(k in t for k in ("todo", "タスク", "やること")):
-        return "todos"
-    if any(k in t for k in ("決定", "decision")):
-        return "decisions"
-    if any(k in t for k in ("pdf", "ピーディーエフ")):
-        return "pdf"
-    if "docx" in t or "ワード" in t or "word" in t:
-        return "docx"
-    if "pptx" in t or "パワポ" in t or "ppt" in t or "powerpoint" in t:
-        return "pptx"
-    if any(k in t for k in ("資料", "asset", "asset")):
-        return "assets"
-    return "unknown"
+    # Quick-info commands — exact match only. A bare "最新" is a quick-
+    # reply command, but "最新の会議の資料を送って" is a natural-language
+    # request that must fall through to assistant_qna so the LLM can
+    # interpret intent (e.g., decide to surface asset links). Substring
+    # match was previously hijacking every sentence containing 最新 /
+    # 要約 etc., short-circuiting the AI Assist path.
+    _EXACT_QUICK = {
+        "credit":    {"クレジット", "残量", "credit", "credits"},
+        "latest":    {"最新", "最新会議", "summary", "要約", "サマリ", "サマリー"},
+        "todos":     {"todo", "todos", "タスク", "やること", "タスク一覧"},
+        "decisions": {"決定", "決定事項", "decision", "decisions"},
+        "pdf":       {"pdf", "ピーディーエフ"},
+        "docx":      {"docx", "ワード", "word"},
+        "pptx":      {"pptx", "パワポ", "ppt", "powerpoint"},
+        "assets":    {"資料", "asset", "assets", "資料一覧", "ファイル"},
+    }
+    for _cmd, _words in _EXACT_QUICK.items():
+        if t in _words:
+            return _cmd
+    # Anything else — natural-language request → forward to AI Assist
+    # so the LLM can interpret intent. This is the same engine that
+    # powers iOS / Desktop AI Assist; it has access to recent meetings,
+    # decisions and TODOs and can pick the right artefact to surface.
+    return "assistant_qna"
 
 
 def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "", raw_text: str = "") -> str:
