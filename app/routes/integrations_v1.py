@@ -141,12 +141,22 @@ def _status_for(uid: str, provider: str) -> IntegrationStatus:
             capabilities={"calendarRead": False, "calendarWrite": False,
                           "mailDraft": False, "mailSend": False},
         )
-    scopes = rec.get("scopes") or []
+    # Storage key compatibility: integ_store.save_tokens persists ``scope``
+    # as a space-separated string and ``accountEmail`` as the user's email.
+    # The canonical V1 contract surfaces ``scopes`` (list) and ``email``.
+    # Accept both shapes so the desktop client sees populated values
+    # whether the row came from save_tokens (legacy) or a writer that
+    # uses canonical keys directly.
+    scopes_raw = rec.get("scopes") or rec.get("scope") or []
+    if isinstance(scopes_raw, str):
+        scopes = scopes_raw.split()
+    else:
+        scopes = list(scopes_raw)
     return IntegrationStatus(
         provider=provider,  # type: ignore[arg-type]
         connected=bool(rec.get("status") == "connected"
                        or rec.get("encryptedRefreshToken")),
-        email=rec.get("email"),
+        email=rec.get("email") or rec.get("accountEmail"),
         scopes=scopes,
         capabilities=_capabilities_from_scopes(provider, scopes),
         lastHealthCheckAt=rec.get("lastHealthCheckAt") and rec["lastHealthCheckAt"].isoformat()
