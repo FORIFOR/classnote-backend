@@ -3785,6 +3785,27 @@ async def get_artifact_playlist(
     data = snapshot.to_dict()
     ensure_can_view(data, current_user, session_id)
 
+    # [FIX 2026-05-09] Recovery / lazy-trigger gates previously checked
+    # ``data.get("transcriptText")`` only. Cloud STT writes the transcript
+    # to the ``transcript_chunks`` subcollection without populating that
+    # field, so a session that completed playlist generation with empty
+    # items could never auto-recover (the iOS app would loop forever on
+    # GET, seeing status=completed + items=null and not knowing to
+    # trigger a regenerate). Cover all three storage paths:
+    #   1. legacy ``transcriptText`` field on the session doc
+    #   2. ``hasTranscript`` flag (set by GET /sessions/{id} for any
+    #      session that has transcript content available)
+    #   3. ``transcript_chunks`` subcollection count (cloud STT path)
+    def _transcript_available() -> bool:
+        if data.get("transcriptText"):
+            return True
+        if data.get("hasTranscript"):
+            return True
+        try:
+            return count_transcript_chunks(session_id) > 0
+        except Exception:
+            return False
+
     # [NEW] Extract audio duration for client-side verification
     # Priority: direct durationSec > audioMeta.durationSec
     audio_duration_sec = data.get("durationSec")
@@ -3875,7 +3896,7 @@ async def get_artifact_playlist(
         items = _sanitize_playlist_items(items)
 
         # [FIX] If succeeded/completed but items are empty, retry generation
-        if derived_status == "completed" and not items and data.get("transcriptText"):
+        if derived_status == "completed" and not items and _transcript_available():
             retry_count = derived_data.get("retryCount") or 0
             if retry_count < 3:
                 logger.warning(f"[RETRY] Playlist succeeded but empty for {session_id}, retrying (attempt {retry_count + 1})")
@@ -3913,7 +3934,7 @@ async def get_artifact_playlist(
     result_items = _sanitize_playlist_items(data.get("playlist"))
 
     # [LAZY TRIGGER] If pending (missing items) and not already running, enqueue now.
-    if not result_items and status != "running" and data.get("transcriptText"):
+    if not result_items and status != "running" and _transcript_available():
          job_id = f"playlist_{uuid.uuid4().hex[:8]}"
          enqueue_playlist_task(session_id, job_id=job_id, user_id=current_user.uid)
 
