@@ -380,7 +380,7 @@ def _classify_command(text: str) -> str:
     return "assistant_qna"
 
 
-def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "", raw_text: str = "") -> str:
+def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str = "", deepnote_uid: str = "", raw_text: str = "") -> str:
     if command == "greeting":
         return (
             "こんにちは。DeepNote Clow です。\n"
@@ -401,8 +401,15 @@ def _build_reply_for_linked(account_id: str, command: str, *, line_user_id: str 
             return "質問を入力してください。例: 「決定事項は？」「TODO は？」"
         try:
             from app.services import assistant_hub
+            # owner_uid must be the DeepNote Firebase uid (matches the
+            # ``ownerUserId`` field on session docs). The LINE userId
+            # never appears on a session, so passing it here would make
+            # ``resolve_session_id`` return None — the user's previous
+            # "対象の会議が見つかりません" was caused by exactly that.
             result = _run_coroutine(assistant_hub.handle_message(
-                account_id=account_id, owner_uid=line_user_id, question=q,
+                account_id=account_id,
+                owner_uid=deepnote_uid or line_user_id,
+                question=q,
                 session_id=None, mode="session", channel="line",
                 idempotency_key=None,
             ))
@@ -1124,7 +1131,12 @@ def _handle_message_event(event: Dict[str, Any]) -> None:
         )
         return
 
-    text = _build_reply_for_linked(link["accountId"], command, line_user_id=line_user_id, raw_text=user_text or "")
+    text = _build_reply_for_linked(
+        link["accountId"], command,
+        line_user_id=line_user_id,
+        deepnote_uid=link.get("deepnoteUid", ""),
+        raw_text=user_text or "",
+    )
     line_messaging.reply(reply_token, [line_messaging.text_message(text)])
     bot_audit.record(
         provider="line", source_type="user",
