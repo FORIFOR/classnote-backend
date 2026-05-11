@@ -401,7 +401,17 @@ def calendar_events(
     # ``primary``. Many people put work meetings on a secondary calendar
     # (e.g. company.com) so a primary-only fetch returns 0 events even
     # though the user has plenty of upcoming meetings.
-    if (_store.load(current_user.uid, "google") or {}).get("encryptedRefreshToken"):
+    #
+    # [FIX 2026-05-12] Connection check uses the canonical token cipher
+    # field names from store._migrate_legacy_google (accessTokenCipher /
+    # refreshTokenCipher). The previous ``encryptedRefreshToken`` check
+    # never matched any user's integration doc, so this entire branch
+    # was a silent no-op — /v1/integrations/calendar/events always
+    # returned an empty array, while the legacy
+    # /integrations/google/calendar/events kept working because it
+    # bypassed this gate and called google_client directly.
+    google_creds = _store.load(current_user.uid, "google") or {}
+    if google_creds.get("accessTokenCipher") or google_creds.get("refreshTokenCipher"):
         google_calendars: List[str] = ["primary"]
         try:
             cal_list = _g.list_calendar_list(current_user.uid)
@@ -452,7 +462,10 @@ def calendar_events(
     # ── Microsoft ─────────────────────────────────────────────────────
     # ``/me/calendarView`` already aggregates across all calendars the
     # user has access to in Microsoft Graph, so single fetch is enough.
-    if (_store.load(current_user.uid, "microsoft") or {}).get("encryptedRefreshToken"):
+    # [FIX 2026-05-12] See Google branch comment — same token cipher
+    # field name bug applied here too.
+    ms_creds = _store.load(current_user.uid, "microsoft") or {}
+    if ms_creds.get("accessTokenCipher") or ms_creds.get("refreshTokenCipher"):
         ms_count = 0
         try:
             res = _ms.list_calendar_events(
