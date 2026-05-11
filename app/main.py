@@ -247,6 +247,10 @@ app.include_router(assets_router, tags=["Assets"])
 # ``/sessions/{id}/...`` so they don't shadow the sessions canonical routes.
 app.include_router(compat_aliases.router)  # MUST be before sessions
 app.include_router(sessions.router, tags=["Sessions"])
+# /v1/sessions/{id}/jobs canonical alias — desktop QuizTab + future clients
+# call the /v1 path directly. iOS legacy callers continue hitting the
+# bare /sessions/{id}/jobs route registered on sessions.router above.
+app.include_router(sessions.v1_jobs_alias_router)
 # Folders / Library organisation — canonical /v1/folders + legacy /folders + /sessions/{id}:move
 # See: deepnote-contracts/api/endpoints-map.md (V-017/V-018)
 from app.routes import folders as _folders_module
