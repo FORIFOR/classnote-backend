@@ -6699,3 +6699,43 @@ async def get_todo_extraction_status(
         "errorReason": extract_data.get("errorReason"),
         "updatedAt": extract_data.get("updatedAt"),
     }
+
+
+# =============================================================================
+# /v1/sessions/{id}/jobs canonical alias router
+# =============================================================================
+# The handlers above register the **legacy** path ``/sessions/{id}/jobs[…]``
+# that iOS clients have always used (and continue to use through a
+# canonical→legacy fallback wrapper). The desktop client calls the
+# canonical ``/v1/sessions/{id}/jobs`` shape directly and was getting 404
+# because no /v1 alias existed.
+#
+# Same pattern as ``folders.move_router`` and the
+# ``integrations_line.router`` /v1 dual-mount: rather than adding a /v1
+# prefix to the entire ``sessions.router`` (which would silently /v1-alias
+# every session endpoint — a much larger contract surface), we register a
+# narrow alias router that re-exports just the three jobs handlers under
+# /v1. iOS legacy callers are unaffected.
+#
+# Route order mirrors the legacy registrations so behaviour is identical:
+# ``get_job_by_id`` is registered before ``get_job_status`` so the path
+# segment is resolved against the ``{job_id}`` doc lookup first.
+v1_jobs_alias_router = APIRouter(tags=["Sessions"])
+v1_jobs_alias_router.add_api_route(
+    "/v1/sessions/{session_id}/jobs",
+    create_job,
+    methods=["POST"],
+    response_model=JobResponse,
+)
+v1_jobs_alias_router.add_api_route(
+    "/v1/sessions/{session_id}/jobs/{job_id}",
+    get_job_by_id,
+    methods=["GET"],
+    response_model=JobResponse,
+)
+v1_jobs_alias_router.add_api_route(
+    "/v1/sessions/{session_id}/jobs/{job_type}",
+    get_job_status,
+    methods=["GET"],
+    response_model=JobResponse,
+)
