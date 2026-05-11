@@ -116,6 +116,38 @@ def delete_task(task_id: str, current_user: CurrentUser = Depends(get_current_us
     return None
 
 
+@router.post("/{task_id}:run", status_code=202)
+def run_task_now(task_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Manually fire a scheduled task immediately (Desktop "テスト実行" button).
+
+    Uses the same `_dispatch` path as the cron tick so all channel
+    routing / payload rendering / idempotency rules apply. The manual
+    fire overrides the run-slot key so it isn't deduped against the
+    next scheduled fire — re-pressing the button always produces a
+    fresh notification / push.
+    """
+    account_id = getattr(current_user, "account_id", None) or current_user.uid
+    task = None
+    for t in _st.list_for(account_id):
+        if t.get("taskId") == task_id:
+            task = t
+            break
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    # Override `nextRunAt` (which `_dispatch` reads as `run_slot` for the
+    # idempotency_key) so this manual fire never collides with a
+    # cron-scheduled run. Uses a `manual-` prefix so it's easy to grep
+    # in notification_events when debugging.
+    manual_task = dict(task)
+    manual_task["nextRunAt"] = f"manual-{uuid.uuid4().hex[:12]}"
+    try:
+        _dispatch(account_id, manual_task)
+    except Exception as e:
+        logger.warning("[run_task_now] dispatch failed for %s: %s", task_id, e)
+        raise HTTPException(status_code=500, detail=f"dispatch failed: {e}")
+    return {"taskId": task_id, "status": "dispatched"}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # /internal/scheduler/tick — Cloud Scheduler entry point
 # ──────────────────────────────────────────────────────────────────────
