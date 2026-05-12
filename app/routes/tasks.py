@@ -1717,8 +1717,24 @@ async def _handle_transcribe_task_core(request: Request):
         # ops_logger: job started
         log_job_transition(session_id, "transcribe", "started", uid=final_user_id, job_id=job_id)
 
-        # Execute Transcription
-        from app.services.google_speech import transcribe_audio_google_with_segments
+        # [EMERGENCY DISABLE 2026-05-12] Google Cloud Speech V2 batch STT
+        # is fully disabled. Frontend never consumes server-side STT
+        # results; all transcription is performed on-device. Mark the
+        # job as skipped without invoking transcribe_audio_google_with_segments
+        # (which would otherwise bill Google Cloud Speech per audio second).
+        err_msg = "cloud_speech_disabled"
+        doc_ref.update({
+            "transcriptionStatus": "skipped",
+            "transcriptionError": err_msg,
+            "transcriptionUpdatedAt": datetime.now(timezone.utc),
+        })
+        if job_ref:
+            job_ref.set({"status": "skipped", "errorReason": err_msg}, merge=True)
+        log_job_transition(session_id, "transcribe", "completed", uid=final_user_id, job_id=job_id)
+        return
+
+        # Execute Transcription  -- unreachable, kept for reference until removed
+        from app.services.google_speech import transcribe_audio_google_with_segments  # noqa: E402
 
         # ops_logger: STT started
         log_stt_event(session_id, "started", uid=final_user_id)
@@ -1918,23 +1934,41 @@ async def handle_transcribe_task_deprecated(request: Request):
     # If engine='google', we just run it.
     
     if engine == "google":
-        try:
-            from app.services.google_speech import transcribe_audio_google_with_segments
-            
+        # [EMERGENCY DISABLE 2026-05-12] Google Cloud Speech V2 batch STT
+        # is fully disabled. Frontend never consumes server-side STT
+        # results; all transcription is performed on-device. Skip the
+        # entire engine="google" branch instead of calling
+        # transcribe_audio_google_with_segments.
+        err_msg = "cloud_speech_disabled"
+        doc_ref.update({
+            "transcriptionStatus": "skipped",
+            "transcriptionError": err_msg,
+            "transcriptionUpdatedAt": datetime.now(timezone.utc),
+        })
+        if job_id:
+            db.collection("sessions").document(session_id).collection("jobs").document(job_id).set(
+                {"status": "skipped", "errorReason": err_msg}, merge=True,
+            )
+        return {"status": "skipped", "reason": err_msg}
+
+        # Unreachable legacy path kept for reference until removed:
+        try:  # noqa: E722
+            from app.services.google_speech import transcribe_audio_google_with_segments  # noqa: E402
+
             audio_info = data.get("audio") or {}
             gcs_path = audio_info.get("gcsPath") or data.get("audioPath")
-            
+
             if not gcs_path:
                  if job_id:
                       db.collection("sessions").document(session_id).collection("jobs").document(job_id).set({"status": "failed", "errorReason": "No audio path found"}, merge=True)
                  return {"status": "failed", "error": "No audio path found"}
-            
+
             # Update status
             doc_ref.update({
-                "transcriptionStatus": "running", 
+                "transcriptionStatus": "running",
                 "transcriptionEngine": "google"
             })
-            
+
             # Execute STT
             transcript_text, segments = transcribe_audio_google_with_segments(
                 gcs_path, language_code="ja-JP"

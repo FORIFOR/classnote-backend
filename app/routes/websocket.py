@@ -689,11 +689,19 @@ async def ws_stream(websocket: WebSocket, session_id: str):
                         if "sampleRateHertz" in client_config:
                             sample_rate = int(client_config["sampleRateHertz"])
 
-                        # Start STT
+                        # [EMERGENCY DISABLE 2026-05-12] Cloud Speech V2 fully disabled.
+                        # Frontend does not consume server-side STT results; all
+                        # transcription is now performed on-device (device_sherpa /
+                        # device-side ASR). We keep the WebSocket open so the client
+                        # can still upload audio chunks for backup, but never open a
+                        # Google Cloud Speech V2 streaming session. This eliminates
+                        # all Cloud Speech API billing (previously ~¥415 / 10 days
+                        # was incurred even by device-mode sessions that started a
+                        # streaming session before falling back to on-device).
                         if stt_task is None:
                             started = True
-                            audio_started_at = time.time() # [NEW] Track when audio input is expected
-                            stt_task = asyncio.create_task(run_stt(language_code, sample_rate))
+                            audio_started_at = time.time()  # [NEW] Track when audio input is expected
+                            # stt_task intentionally remains None: no recognize_stream is opened.
                             await websocket.send_json({"event": "connected"})
 
                             # [Drain] Notify client if server is in drain mode
