@@ -135,11 +135,16 @@ def run_task_now(task_id: str, current_user: CurrentUser = Depends(get_current_u
     if task is None:
         raise HTTPException(status_code=404, detail="task_not_found")
     # Override `nextRunAt` (which `_dispatch` reads as `run_slot` for the
-    # idempotency_key) so this manual fire never collides with a
-    # cron-scheduled run. Uses a `manual-` prefix so it's easy to grep
-    # in notification_events when debugging.
+    # idempotency_key). Must be a ``datetime`` — downstream
+    # ``scheduled_tasks.build_run_slot_key`` calls ``.microsecond`` and
+    # ``.isoformat()`` on this value (a previous string override caused
+    # ``'str' object has no attribute 'microsecond'`` 500s). Using the
+    # current UTC datetime at microsecond resolution makes each manual
+    # fire produce a unique idempotency key, so re-pressing the button
+    # always emits a fresh notification and never collides with the
+    # cron-scheduled run for the same task.
     manual_task = dict(task)
-    manual_task["nextRunAt"] = f"manual-{uuid.uuid4().hex[:12]}"
+    manual_task["nextRunAt"] = datetime.now(timezone.utc)
     try:
         _dispatch(account_id, manual_task)
     except Exception as e:
