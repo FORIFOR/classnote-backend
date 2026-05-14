@@ -196,8 +196,10 @@ def redeem_license(
         if not snap.exists:
             raise LicenseNotFound()
         acc_snap = account_ref.get(transaction=txn)
+        user_snap = user_ref.get(transaction=txn)
 
         data = snap.to_dict() or {}
+        prior_user_data = user_snap.to_dict() or {}
         status = data.get("status", "unused")
         existing_user = data.get("userId")
 
@@ -271,17 +273,18 @@ def redeem_license(
         txn.set(account_ref, acc_update, merge=True)
 
         # Mirror plan on the user doc so legacy reads see the new tier.
-        txn.set(
-            user_ref,
-            {
-                "plan": plan,
-                "licenseId": snap.id,
-                "licenseStatus": "active",
-                "planUpdatedAt": now_utc,
-                "updatedAt": now_utc,
-            },
-            merge=True,
-        )
+        # Stash previousPlan only the first time we elevate (re-redeem must
+        # not overwrite the original prior plan with "business" again).
+        user_payload: dict[str, Any] = {
+            "plan": plan,
+            "licenseId": snap.id,
+            "licenseStatus": "active",
+            "planUpdatedAt": now_utc,
+            "updatedAt": now_utc,
+        }
+        if prior_user_data.get("plan") not in (None, plan):
+            user_payload["previousPlan"] = prior_user_data.get("plan")
+        txn.set(user_ref, user_payload, merge=True)
 
         return {
             "license_id": snap.id,
