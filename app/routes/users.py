@@ -1181,7 +1181,21 @@ async def get_me(
     raw_plan = account_data.get("plan", "free")
     final_plan = "free"  # Default to free, upgrade only if entitlement verifies
 
-    if raw_plan == "free":
+    # ── Business license short-circuit (PR1 bulk-license) ──────────────
+    # When the account was elevated via POST /v1/licenses:redeem we store
+    # `accounts.entitlements.businessLicense.active = true` on the account
+    # doc (NOT as a row in the `entitlements` collection that Apple uses).
+    # Without this short-circuit the "Paid plan claimed - MUST verify
+    # against entitlement" branch below would look for an Apple Production
+    # entitlement, find none, and downgrade `business` → `free` plus
+    # background-repair `accounts.plan = "free"` — silently reverting every
+    # redeem on the next /me call.
+    business_license = (
+        (account_data.get("entitlements") or {}).get("businessLicense") or {}
+    )
+    if raw_plan == "business" and business_license.get("active") is True:
+        final_plan = "business"
+    elif raw_plan == "free":
         # No paid plan claimed, but still check for orphaned Production entitlements
         # (User may have subscribed but account.plan wasn't updated)
         best_ent, best_ent_id = _find_best_production_entitlement(account_id, now)
@@ -1260,10 +1274,13 @@ async def get_me(
                 final_plan = "free"
                 background_tasks.add_task(_repair_account_plan, account_id, "free", "no_valid_production_entitlement")
 
-    # Normalize plan names
+    # Normalize plan names. `business` (bulk-license redeem) is kept as
+    # its own tier so /me reflects the real entitlement instead of
+    # collapsing it into `basic`; everything else outside the known
+    # ladder collapses to `free`.
     if final_plan == "standard":
         final_plan = "basic"
-    elif final_plan not in ("free", "basic"):
+    elif final_plan not in ("free", "basic", "business"):
         final_plan = "free"
 
     # [OPTIONAL] Anti-abuse logging (phone ownership mismatch - informational only)

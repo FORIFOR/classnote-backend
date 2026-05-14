@@ -46,8 +46,13 @@ def _safe_dict(snap) -> dict:
 
 
 def _normalize_plan(plan: str) -> str:
-    """Normalize plan name to canonical form."""
-    if plan in ("basic", "standard"):
+    """Normalize plan name to canonical form.
+
+    `business` is the bulk-license-redeem tier (PR1) and gets the same
+    cost-guard treatment as `basic` until/unless a business-specific
+    budget is introduced.
+    """
+    if plan in ("basic", "standard", "business"):
         return "basic"
     return "free"
 
