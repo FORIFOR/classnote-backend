@@ -751,8 +751,9 @@ async def _check_session_creation_limits(user_uid: str, transcription_mode: str 
     user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
     plan = user_data.get("plan", "free")
 
-    # Normalize: standard -> basic
-    if plan == "standard":
+    # Normalize: standard / business -> basic for paid-tier gating.
+    # "business" comes from POST /v1/licenses:redeem (Phase 1 bulk license).
+    if plan in ("standard", "business"):
         plan = "basic"
 
     # [BASIC] Higher limits - early return with cloud entitled
@@ -778,7 +779,7 @@ def _create_session_transaction(transaction, session_ref, user_ref, session_data
     # [FIX] Handle case where document doesn't exist (to_dict() returns None)
     user_data = (user_snap.to_dict() if user_snap.exists else {}) or {}
     plan = user_data.get("plan", "free")
-    if plan == "standard":
+    if plan in ("standard", "business"):
         plan = "basic"
 
     # 1. Cloud Entitlement Logic (Free only)
@@ -3055,8 +3056,8 @@ async def create_job(
     user_doc = db.collection("users").document(current_user.uid).get()
     user_data = user_doc.to_dict() if user_doc.exists else {}
     plan = user_data.get("plan", "free")
-    # Normalize standard -> basic
-    if plan in ("basic", "standard"):
+    # Normalize paid tiers (standard / business) -> basic for LLM gates.
+    if plan in ("basic", "standard", "business"):
         plan = "basic"
     else:
         plan = "free"

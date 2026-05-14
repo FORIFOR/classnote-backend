@@ -67,7 +67,10 @@ def _today_key() -> str:
 
 def _resolve_plan(u_data: dict) -> str:
     plan = u_data.get("plan", "free")
-    if plan in ("basic", "standard"):
+    # PR1 business-license: "business" is a paid tier provisioned via
+    # POST /v1/licenses:redeem. Treat it as basic-equivalent for AI credit
+    # accounting until/unless a business-specific cap is introduced.
+    if plan in ("basic", "standard", "business"):
         return "basic"
     return "free"
 

@@ -680,7 +680,7 @@ async def alias_users_bootstrap(
         pass
 
     raw_plan = account_data.get("plan") or user_data.get("plan") or "free"
-    if raw_plan in ("basic", "standard"):
+    if raw_plan in ("basic", "standard", "business"):
         plan = "basic"
     elif raw_plan == "premium":
         plan = "premium"

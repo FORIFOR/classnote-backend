@@ -756,8 +756,8 @@ async def get_me_lite(
     suspended = False
     if acc_data:
         raw_plan = acc_data.get("plan", "free")
-        # Normalize plan
-        if raw_plan in ("basic", "standard"):
+        # Normalize plan ("business" from /v1/licenses:redeem ≡ paid tier).
+        if raw_plan in ("basic", "standard", "business"):
             plan = "basic"
         else:
             plan = "free"

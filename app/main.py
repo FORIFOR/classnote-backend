@@ -46,6 +46,9 @@ def _check_env_vars():
 _check_env_vars()
 
 from app.routes import sessions, tasks, websocket, auth, users, billing, share, google, search, reactions, admin, imports, universal_links, debug_appstore, ads, account, account_merge, phone, app_config, jobs, todos, ops, watch, translate, chat, compat_aliases, entity_review
+# [Business License — PR1] User-facing redeem + me/license; admin batches / reports
+from app.routes import licenses as licenses_routes
+from app.routes import admin_licenses as admin_licenses_routes
 from app.routes.assets import router as assets_router
 # try:
 #     from google.cloud import speech
@@ -376,6 +379,11 @@ app.include_router(invites.router, tags=["Invites"])
 
 # [NEW] AI Chat (session-aware conversational AI)
 app.include_router(chat.router, tags=["AI Chat"])
+
+# [NEW] Business License — bulk license keys, redeem, monthly partner reports.
+# See deepnote-contracts/product/business-license.md.
+app.include_router(licenses_routes.router)
+app.include_router(admin_licenses_routes.router)
 
 # [NEW] Translation API (Cloud Translation v2)
 app.include_router(translate.router, tags=["Translation"])
