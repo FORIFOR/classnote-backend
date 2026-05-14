@@ -216,14 +216,12 @@ def redeem_license(
         today_jst = _today_jst()
 
         free_months = int(data.get("freeMonths", 2))
-        application_date = data.get("applicationDate") or today_jst
-        if isinstance(application_date, datetime):
-            application_date = application_date.date()
-        billing_start = data.get("billingStartDate") or calculate_billing_start_date(
+        # Stored values may be strings (re-redeem case — we wrote ISO strings
+        # the first time), datetime (older code paths), or date. Normalise.
+        application_date = _to_date(data.get("applicationDate")) or today_jst
+        billing_start = _to_date(data.get("billingStartDate")) or calculate_billing_start_date(
             application_date, free_months=free_months
         )
-        if isinstance(billing_start, datetime):
-            billing_start = billing_start.date()
 
         license_updates: dict[str, Any] = {
             "status": "activated",
