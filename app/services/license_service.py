@@ -189,9 +189,13 @@ def redeem_license(
 
     @gcf.transactional
     def _txn(txn: gcf.Transaction) -> dict[str, Any]:
+        # IMPORTANT: Firestore transactions require ALL reads before ANY
+        # writes. Read both license + account up front; do all writes
+        # afterwards. Violating this raises ReadAfterWriteError at commit.
         snap = doc_ref.get(transaction=txn)
         if not snap.exists:
             raise LicenseNotFound()
+        acc_snap = account_ref.get(transaction=txn)
 
         data = snap.to_dict() or {}
         status = data.get("status", "unused")
@@ -237,14 +241,14 @@ def redeem_license(
         if not data.get("issuedAt"):
             license_updates["issuedAt"] = now_utc
 
-        txn.update(doc_ref, license_updates)
-
         plan = data.get("plan") or "business"
+
+        # ── all writes from here on (no further reads) ─────────────────
+        txn.update(doc_ref, license_updates)
 
         # Elevate account.plan and stash the previous one, but only the
         # first time we promote to business (so re-redeem doesn't lose
         # the original previousPlan).
-        acc_snap = account_ref.get(transaction=txn)
         acc_data = acc_snap.to_dict() or {}
         acc_update: dict[str, Any] = {
             "entitlements.businessLicense": {
@@ -478,6 +482,9 @@ def cancel_license(
 
     @gcf.transactional
     def _txn(txn: gcf.Transaction) -> dict[str, Any]:
+        # IMPORTANT: Firestore transactions require ALL reads before ANY
+        # writes. Read license + (if held) user + account up front; do
+        # all writes afterwards.
         snap = lic_ref.get(transaction=txn)
         if not snap.exists:
             raise LicenseNotFound()
@@ -485,9 +492,25 @@ def cancel_license(
         if data.get("status") in ("cancelled", "disabled", "expired"):
             return data
 
+        user_id = data.get("userId")
+        user_ref = None
+        user_data: dict[str, Any] = {}
+        acc_ref = None
+        acc_data: dict[str, Any] = {}
+        if user_id:
+            user_ref = db.collection("users").document(user_id)
+            user_snap = user_ref.get(transaction=txn)
+            user_data = user_snap.to_dict() or {}
+            account_id = user_data.get("accountId")
+            if account_id:
+                acc_ref = db.collection("accounts").document(account_id)
+                acc_snap = acc_ref.get(transaction=txn)
+                acc_data = acc_snap.to_dict() or {}
+
         now_utc = _now_utc()
         eff_date = (cancelled_date or _today_jst()).isoformat()
 
+        # ── all writes from here on (no further reads) ─────────────────
         txn.update(
             lic_ref,
             {
@@ -500,16 +523,8 @@ def cancel_license(
             },
         )
 
-        user_id = data.get("userId")
-        if user_id:
-            user_ref = db.collection("users").document(user_id)
-            user_snap = user_ref.get(transaction=txn)
-            user_data = user_snap.to_dict() or {}
-            account_id = user_data.get("accountId")
-            if account_id:
-                acc_ref = db.collection("accounts").document(account_id)
-                acc_snap = acc_ref.get(transaction=txn)
-                acc_data = acc_snap.to_dict() or {}
+        if user_ref is not None:
+            if acc_ref is not None:
                 prev = acc_data.get("previousPlan") or "free"
                 txn.set(
                     acc_ref,
